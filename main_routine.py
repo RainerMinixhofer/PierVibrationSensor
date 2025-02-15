@@ -203,21 +203,24 @@ class Vibrationsensor:
                 else:
                     self.accel = [0, 0, 0]
                 self.accel = [(-1 if i[0] == "-" else 1) * self.accel[ord(i[-1]) - 120] for i in ["-z", "x", "y"]]
-#                self.speed = [self.outer_instance.vx_ring_buffer.read(), self.outer_instance.vy_ring_buffer.read()]
+                if self.outer_instance.vx_ring_buffer.t_first_write is not None:
+                    self.speed = [self.outer_instance.vx_ring_buffer.read(), self.outer_instance.vy_ring_buffer.read()]
+                else:
+                    self.speed = [0, 0]
 #                print(self.speed)
-                self.outer_instance.irq_ads1256(False)
-                cur_ch = self.outer_instance.ads1256.current_channel()
-                idx = 0 if cur_ch == ADS1256.CH0 else 1
+#                self.outer_instance.irq_ads1256(False)
+#                cur_ch = self.outer_instance.ads1256.current_channel()
+#                idx = 0 if cur_ch == ADS1256.CH0 else 1
 
-                self.data = self.outer_instance.ads1256.cycle_channel(ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7)
-                self.speed[idx] = int(self.data.hex(), 16)
-                if self.speed[idx] & 0x800000:
-                    self.speed[idx] += -0x1000000
-                self.data = self.outer_instance.ads1256.cycle_channel(cur_ch)
-                self.outer_instance.irq_ads1256(True)
-                self.speed[1-idx] = int(self.data.hex(), 16)
-                if self.speed[1-idx] & 0x800000:
-                    self.speed[1-idx] += -0x1000000
+#                self.data = self.outer_instance.ads1256.cycle_channel(ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7)
+#                self.speed[idx] = int(self.data.hex(), 16)
+#                if self.speed[idx] & 0x800000:
+#                    self.speed[idx] += -0x1000000
+#                self.data = self.outer_instance.ads1256.cycle_channel(cur_ch)
+#                self.outer_instance.irq_ads1256(True)
+#                self.speed[1-idx] = int(self.data.hex(), 16)
+#                if self.speed[1-idx] & 0x800000:
+#                    self.speed[1-idx] += -0x1000000
                 self.v = [self.vlsb * s for s in self.speed]
                 self.connection.write(json.dumps({"network":self.outer_instance.network,
                                                   "mac":self.outer_instance.mac,
@@ -350,7 +353,7 @@ class Vibrationsensor:
         # The oversampling is corrected for after the ringbuffer is full by using rescale_array
         adc.write_reg(ADS1256.DRATE,ADS1256.DR100)
         reg = adc.read_reg(ADS1256.DRATE)[0]
-        assert (reg == ADS1256.DR100), f"ADS1256 DRATE register should read DR500, got {reg}"
+        assert (reg == ADS1256.DR100), f"ADS1256 DRATE register should read DR100, got {reg}"
         adc.write_reg(ADS1256.MUX,ADS1256.CH0)
         reg = adc.read_reg(ADS1256.MUX)[0]
         assert (reg == ADS1256.CH0), f"ADS1256 MUX register should read CH0, got {reg}"

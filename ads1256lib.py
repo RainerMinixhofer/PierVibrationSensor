@@ -90,6 +90,12 @@ class ADS1256:
         self.drdy=drdy
         self.sync_pwdn=sync_pwdn
         self.pga = pga
+        #define command sequences
+        self.cmd_write_mux = bytearray([0x50|0x01,0x00])
+        self.cmd_sync = bytearray([0xFC])
+        self.cmd_wakeup = bytearray([0xFF])
+        self.cmd_rdata = bytearray([0x01])
+
         #Define data buffers
         self.outbuff=bytearray(1)
         self.conversion=bytearray(3)
@@ -250,15 +256,17 @@ class ADS1256:
         while self.drdy.value() and not ignore_drdy:
             pass
         #Step1
-        self.spi.write(bytearray([0x50|0x01,0x00])) #Write into MUX register
-        self.spi.write(bytearray([ch]))
+        channel = bytearray(1)
+        channel[0] = ch
+        self.spi.write(self.cmd_write_mux) #Write into MUX register
+        self.spi.write(channel)
         utime.sleep_us(1) #Delay t11=0.52us
         #Step2
-        self.spi.write(bytearray([0xFC])) #SYNC
+        self.spi.write(self.cmd_sync) #SYNC
         utime.sleep_us(4) #Delay t11=3.12us
-        self.spi.write(bytearray([0xFF])) #WAKEUP
+        self.spi.write(self.cmd_wakeup) #WAKEUP
         #Step3
-        self.spi.write(bytearray([0x01])) #RDATA
+        self.spi.write(self.cmd_rdata) #RDATA
         utime.sleep_us(7) #Delay t6=6.5us
         self.spi.readinto(self.conversion,0xFF) #Read 3bytes
         self.deselect()

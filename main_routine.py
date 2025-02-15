@@ -13,7 +13,7 @@ from math import floor
 # import uasyncio as asyncio
 # pylint: disable=import-error
 import network
-from machine import I2C, SoftSPI, Pin, SPI, RTC
+from machine import I2C, Pin, SPI, RTC
 import rp2
 # pylint: enable=import-error
 import mpu6500
@@ -198,21 +198,26 @@ class Vibrationsensor:
             try:
                 if self.outer_instance.ax_ring_buffer.t_first_write is not None:
                     self.accel = list(self.outer_instance.mpu6500.raw_to_acceleration([self.outer_instance.ax_ring_buffer.read(),
-                                                                                    self.outer_instance.ay_ring_buffer.read(),
-                                                                                    self.outer_instance.az_ring_buffer.read()]))
+                                                                                       self.outer_instance.ay_ring_buffer.read(),
+                                                                                       self.outer_instance.az_ring_buffer.read()]))
                 else:
                     self.accel = [0, 0, 0]
                 self.accel = [(-1 if i[0] == "-" else 1) * self.accel[ord(i[-1]) - 120] for i in ["-z", "x", "y"]]
 #                self.speed = [self.outer_instance.vx_ring_buffer.read(), self.outer_instance.vy_ring_buffer.read()]
 #                print(self.speed)
-                self.data = self.outer_instance.ads1256.cycle_channel(ADS1256.CH7)
-                self.speed[0] = int(self.data.hex(), 16)
-                if self.speed[0] & 0x800000:
-                    self.speed[0] += -0x1000000
-                self.data = self.outer_instance.ads1256.cycle_channel(ADS1256.CH0)
-                self.speed[1] = int(self.data.hex(), 16)
-                if self.speed[1] & 0x800000:
-                    self.speed[1] += -0x1000000
+                self.outer_instance.irq_ads1256(False)
+                cur_ch = self.outer_instance.ads1256.current_channel()
+                idx = 0 if cur_ch == ADS1256.CH0 else 1
+
+                self.data = self.outer_instance.ads1256.cycle_channel(ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7)
+                self.speed[idx] = int(self.data.hex(), 16)
+                if self.speed[idx] & 0x800000:
+                    self.speed[idx] += -0x1000000
+                self.data = self.outer_instance.ads1256.cycle_channel(cur_ch)
+                self.outer_instance.irq_ads1256(True)
+                self.speed[1-idx] = int(self.data.hex(), 16)
+                if self.speed[1-idx] & 0x800000:
+                    self.speed[1-idx] += -0x1000000
                 self.v = [self.vlsb * s for s in self.speed]
                 self.connection.write(json.dumps({"network":self.outer_instance.network,
                                                   "mac":self.outer_instance.mac,
@@ -334,18 +339,18 @@ class Vibrationsensor:
         """
         # Set the interrupt pin to the <drdy> pin and define as input
         self.ads1256_int_pin = Pin(drdy, mode=Pin.IN, pull=None)
-        adcspi = SPI(1,baudrate=bps, polarity=0, phase=1, bits=8, firstbit=SoftSPI.MSB,
+        adcspi = SPI(1,baudrate=bps, polarity=0, phase=1, bits=8, firstbit=SPI.MSB,
                     sck=Pin(sck, Pin.OUT), mosi=Pin(mosi, Pin.OUT), miso=Pin(miso, Pin.IN, pull=None))
         adc = ADS1256(adcspi, cs=Pin(cs, Pin.OUT, value=1), drdy=self.ads1256_int_pin,
-                      sync_pwdn=Pin(sync, Pin.OUT, value=1), ref_voltage=2.5, pga = ADS1256.PGA1)
+                      sync_pwdn=Pin(sync, Pin.OUT, value=1), ref_voltage=2.5, pga = ADS1256.PGA1, cs_permanent=True)
         adc.reset()
         adc.wakeup()
         print("ADS1256 id: " + hex(adc.whoami()))
         # We have to set a data rate of 500 SPS because we multiplex two channels and need a net data rate of 100Hz per channel
         # The oversampling is corrected for after the ringbuffer is full by using rescale_array
-        adc.write_reg(ADS1256.DRATE,ADS1256.DR100)
+        adc.write_reg(ADS1256.DRATE,ADS1256.DR500)
         reg = adc.read_reg(ADS1256.DRATE)[0]
-        assert (reg == ADS1256.DR100), f"ADS1256 DRATE register should read DR500, got {reg}"
+        assert (reg == ADS1256.DR500), f"ADS1256 DRATE register should read DR500, got {reg}"
         adc.write_reg(ADS1256.MUX,ADS1256.CH0)
         reg = adc.read_reg(ADS1256.MUX)[0]
         assert (reg == ADS1256.CH0), f"ADS1256 MUX register should read CH0, got {reg}"
@@ -491,9 +496,11 @@ class Vibrationsensor:
         Data in ring buffer is stored in the following format: [speedx, speedy]
         """
         cur_ch = self.ads1256.current_channel()
-        data = self.ads1256.cycle_channel(ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7)
+        nxt_ch = ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7
+#        data = self.ads1256.cycle_channel(nxt_ch, ignore_drdy=True)
+
+        data = b'\x00\x00\x00'
         # We have to take signed 32-bit integers since 24-bit signed integers are not supported by the ring buffer
-        #speed = struct.unpack('>l', (b'0x00' if data[2] < 0x80 else b'0xff') + data)[0]
         data = int(data.hex(),16)
         if data & 0x800000:
             data += -0x1000000
@@ -570,7 +577,7 @@ configuration = {
 vibrationsensor = Vibrationsensor(configuration)
 
 vibrationsensor.irq_mpu6500(True)
-vibrationsensor.irq_ads1256(False)
+vibrationsensor.irq_ads1256(True)
 vibrationsensor.start_webserver()
 vibrationsensor.loop_webserver()
 vibrationsensor.stop_webserver()

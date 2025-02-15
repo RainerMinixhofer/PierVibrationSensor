@@ -82,7 +82,7 @@ class ADS1256:
     PGA64    = const(0x06)  # x64
 
 
-    def __init__(self, spi, cs, drdy, sync_pwdn=None, ref_voltage=5.0, pga = PGA1):
+    def __init__(self, spi, cs, drdy, sync_pwdn=None, ref_voltage=5.0, pga = PGA1, cs_permanent=False):
         """Define module pins and SPI interface"""
         self.cs=cs
         self.spi=spi
@@ -93,16 +93,29 @@ class ADS1256:
         #Define data buffers
         self.outbuff=bytearray(1)
         self.conversion=bytearray(3)
-
+        self.cs_permanent=cs_permanent
+        if self.cs_permanent:
+            self.cs.value(0)
         self.set_pga(pga)
+
+    def __del__(self):
+        """Deselect ADS1256 and release pins"""
+        if self.cs is not None:
+            self.cs.value(1)
+        self.cs = None
+        self.spi = None
+        self.drdy = None
+        self.sync_pwdn = None
 
     def select(self):
         """Select ADS slave"""
-        self.cs.value(0)
+        if not(self.cs_permanent) and self.cs is not None:
+            self.cs.value(0)
 
     def deselect(self):
         """Deselect ADS slave"""
-        self.cs.value(1)
+        if not(self.cs_permanent) and self.cs is not None:
+            self.cs.value(1)
 
     def reset(self):
         """
@@ -141,7 +154,7 @@ class ADS1256:
         """Read single register and returns the values of the register"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         #buff is a two-bye command sequence where the first byte is the register address or'd with 0x10 and the second byte
         #is the number of sequential registers to read minus 1. If only one register to read then the 2nd byte is 0x00
         buff=bytearray([0x10|reg_addr,0x00])
@@ -150,17 +163,17 @@ class ADS1256:
         utime.sleep_us(7)
         #Only one register to read thus outbuff has size of 1. DIN is kept to high in the meantime
         self.spi.readinto(self.outbuff,0xFF)
-        self.cs.value(1)
+        self.deselect()
         return self.outbuff
 
     def write_reg(self,reg_addr,data):
         """Write single register, address and data must be 1 byte values"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0x50|reg_addr,0x00]))
         self.spi.write(bytearray([data]))
-        self.cs.value(1)
+        self.deselect()
 
     def read_pga(self):
         """Read programmable gain amplifier register setting"""
@@ -194,12 +207,12 @@ class ADS1256:
         """Perform one-shot conversion and returns conversion value"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0x01])) #RDATA
         utime.sleep_us(7) #wait t6=6.51us
         self.spi.readinto(self.conversion,0xFF)
         utime.sleep_us(2) #wait t10=1.04us
-        self.cs.value(1)
+        self.deselect()
         return self.conversion
 
     def read_continuous(self):
@@ -210,32 +223,31 @@ class ADS1256:
         """
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0x03]))
         utime.sleep_us(7) #wait t6=6.51us
         self.spi.readinto(self.conversion,0xFF) #Read 3bytes
         utime.sleep_us(2) #wait t10=1.04us
-        self.cs.value(1)
+        self.deselect()
         return self.conversion
 
     def read_conversion(self):
         """Read last conversion. This function does not perform a conversion"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         #self.conversion=self.spi.read(3)
         self.spi.readinto(self.conversion,0xFF)
-        self.cs.value(1)
+        self.deselect()
         return self.conversion
 
-    def cycle_channel(self, ch):
+    def cycle_channel(self, ch, ignore_drdy=False):
         """
         Cycle to channel ch and returns the conversion of the previous channel
         Cycling through channels has 3 steps (see page 21 of ADS1256 datasheet)
-        Even with interrupt driven call we must wait for drdy to go (or be) low before sending the next command
         """
         self.select()
-        while self.drdy.value():
+        while self.drdy.value() and not ignore_drdy:
             pass
         #Step1
         self.spi.write(bytearray([0x50|0x01,0x00])) #Write into MUX register
@@ -260,46 +272,46 @@ class ADS1256:
         """
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0xF0]))
         utime.sleep_us(2) #wait t10=1.04us
-        self.cs.value(1)
+        self.deselect()
 
     def self_ocal(self):
         """Performs a self offset calibration. The OFC register is updated after this operation"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0xF1]))
         utime.sleep_us(2) #wait t10=1.04us
-        self.cs.value(1)
+        self.deselect()
 
     def self_gcal(self):
         """Performs a self gain calibration. The FSC register is updated with new values after this operation"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0xF2]))
         utime.sleep_us(2) #wait t10=1.04us
-        self.cs.value(1)
+        self.deselect()
 
     def sys_ocal(self):
         """Performs a system offset calibration. The OFC register is updated after this operation"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0xF3]))
         utime.sleep_us(2) #wait t10=1.04us
-        self.cs.value(1)
+        self.deselect()
 
     def sys_gcal(self):
         """Performs a system gain calibration. The FSC register is updated after this operation"""
         while self.drdy.value():
             pass
-        self.cs.value(0)
+        self.select()
         self.spi.write(bytearray([0xF4]))
         utime.sleep_us(2) #wait t10=1.04us
-        self.cs.value(1)
+        self.deselect()
 
     def standby(self):
         """This command puts the ADC into a low-power Standby mode."""

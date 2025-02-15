@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket Client</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.highcharts.com/highcharts.js"></script>
+<style>
+/* WebKit */
+.styled meter {
+  width: 45%;
+}
+
+.vstyled meter {
+  width: 90%;
+}
+
+.styled meter::-webkit-meter-bar {
+  background: #EEE;
+  box-shadow: 0 2px 3px rgba(0,0,0,0.2) inset;
+  border-radius: 3px;
+}
+
+.styled meter::-webkit-meter-optimum-value,
+.styled meter::-webkit-meter-suboptimum-value,
+.styled meter::-webkit-meter-even-less-good-value {
+  border-radius: 3px;
+}
+
+.styled meter::-webkit-meter-optimum-value {
+  background: #86CC00;
+}
+
+.styled meter::-webkit-meter-suboptimum-value {
+  background: #FFDB1A;
+}
+
+.styled meter::-webkit-meter-even-less-good-value  {
+  background: #CC4600;
+}
+
+
+/* Firefox */
+.styled meter::-moz-meter-bar {
+  border-radius: 3px;
+}
+
+.styled meter:-moz-meter-optimum::-moz-meter-bar {
+  background: #86CC00;
+}
+
+.styled meter:-moz-meter-sub-optimum::-moz-meter-bar {
+  background: #FFDB1A;
+}
+
+.styled meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+  background: #CC4600;
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card" style="width: 100rem;">
+    <div class="card-body">
+      <h5 class="card-title">Network</h5>
+      <p class="styled">Connection Type:
+        <span id="network">WLAN</span>(<span id="mac">00:00:00:00:00:00</span>)
+      </p>
+      <form id="udp-form">
+        <label for="ip">IP:</label>
+        <input type="text" id="ip" name="ip" value="10.0.0.141">
+        <label for="port">Port:</label>
+        <input type="text" id="port" name="port" value="10000">
+        <button type="button" id="udp-toggle" onclick="toggleUDPStream()">Start UDP Stream</button>
+      </form>
+    </div>
+  </div>
+  <div class="card" style="width: 100rem;">
+    <div class="card-body">
+      <h5 class="card-title">Accelerometer Readings</h5>
+      <p class="styled">x-axis:
+        <meter id="metermax" title="m/s²" value="0" min="0" max="10" style="transform: rotate(180deg);"></meter>
+        |
+        <meter id="meterpax" title="m/s²" value="0" min="0" max="10"></meter>
+        <span id="axval">0 m/s²</span>
+      </p>
+      <p class="styled">y-axis:
+        <meter id="metermay" title="m/s²" value="0" min="0" max="10" style="transform: rotate(180deg);"></meter>
+        |
+        <meter id="meterpay" title="m/s²" value="0" min="0" max="10"></meter>
+        <span id="ayval">0 m/s²</span>
+      </p>
+      <p class="styled">z-axis:
+        <meter id="metermaz" title="m/s²" value="0" min="0" max="10" style="transform: rotate(180deg);"></meter>
+        |
+        <meter id="meterpaz" title="m/s²" value="0" min="0" max="10"></meter>
+        <span id="azval">0 m/s²</span>
+      </p>
+    </div>
+  </div>
+  <div class="card" style="width: 100rem;">
+    <div class="card-body">
+      <h5 class="card-title">Geophone Readings</h5>
+      <p class="vstyled">x-axis:
+        <meter id="metervx" title="&mu;m/s" value="0" min="-10000000" max="10000000" optimum="0"></meter>
+        <span id="vxval">0 &mu;m/s</span>
+      </p>
+      <p class="vstyled">y-axis:
+        <meter id="metervy" title="&mu;m/s" value="0" min="-10000000" max="10000000" optimum="0"></meter>
+        <span id="vyval">0 &mu;m/s</span>
+      </p>
+    </div>
+  </div>
+  <div class="card" style="width: 100rem;">
+    <div class="card-body">
+      <h5 class="card-title">Accelerations Plot</h5>
+      <div id="chart-accels" class="container"></div>
+    </div>
+  </div>
+  <div class="card" style="width: 100rem;">
+      <div class="card-body">
+        <h5 class="card-title">Vibrations Plot</h5>
+        <div id="chart-speeds" class="container"></div>
+      </div>
+    </div>
+</div>
+
+<script>
+  let udpStreamOn = false;
+  var ws = new WebSocket("ws://" + location.hostname + ":3000");
+
+  function toggleUDPStream() {
+    udpStreamOn = !udpStreamOn;
+    document.getElementById('udp-toggle').innerText = udpStreamOn ? 'Stop UDP Stream' : 'Start UDP Stream';
+    var ip = document.getElementById('ip');
+    var port = document.getElementById('port');
+    // send message to Vibration sensor to start/stop the UDP stream
+    var obj = new Object();
+    obj.ip  = ip.value;
+    obj.port = port.value;
+    if (udpStreamOn) {
+      //console.log(`UDP stream started to ${obj.ip}:${obj.port}`);
+      obj.udpstream = true;
+      ip.disabled = true;
+      port.disabled = true;
+    } else {
+      //console.log('UDP stream stopped');
+      obj.udpstream = false;
+      ip.disabled = false;
+      port.disabled = false;
+    }
+    var message= JSON.stringify(obj);
+    ws.send(message);
+  }
+
+  var chartv = new Highcharts.Chart({
+    chart:{ renderTo : 'chart-speeds' },
+    title: { text: 'Vibration Speed Readings' },
+    series: [{
+      name: 'vx',
+      color: '#FF0000',
+      data: []
+    },
+    {
+      name: 'vy',
+      color: '#0000FF',
+      data: []
+    }],
+    plotOptions: {
+      line: { animation: false,
+        dataLabels: { enabled: true }
+      },
+      series: { color: '#059e8a' }
+    },
+    xAxis: { type: 'datetime',
+      dateTimeLabelFormats: { second: '%H:%M:%S' }
+    },
+    yAxis: {
+      title: { text: 'Speed [&mu;m/s]' }
+    },
+    credits: { enabled: false }
+  });
+
+  var charta = new Highcharts.Chart({
+    chart:{ renderTo : 'chart-accels' },
+    title: { text: 'Vibration Acceleration Readings' },
+    series: [{
+      name: 'ax',
+      color: '#FF0000',
+      data: []
+    },
+    {
+      name: 'ay',
+      color: '#00FF00',
+      data: []
+    },
+    {
+      name: 'az',
+      color: '#0000FF',
+      data: []
+    }],
+    plotOptions: {
+      line: { animation: false,
+        dataLabels: { enabled: true }
+      },
+      series: { color: '#059e8a' }
+    },
+    xAxis: { type: 'datetime',
+      dateTimeLabelFormats: { second: '%H:%M:%S' }
+    },
+    yAxis: {
+      title: { text: 'Acceleration [m/s²]' }
+    },
+    credits: { enabled: false }
+  });
+
+  var network = document.getElementById("network");
+  var mac = document.getElementById("mac");
+  var barmx = document.querySelector("#metermax");
+  var barpx = document.querySelector("#meterpax");
+  var barmy = document.querySelector("#metermay");
+  var barpy = document.querySelector("#meterpay");
+  var barmz = document.querySelector("#metermaz");
+  var barpz = document.querySelector("#meterpaz");
+  var axval = document.getElementById("axval");
+  var ayval = document.getElementById("ayval");
+  var azval = document.getElementById("azval");
+  var barvx = document.querySelector("#metervx");
+  var vxval = document.getElementById("vxval");
+  var barvy = document.querySelector("#metervy");
+  var vyval = document.getElementById("vyval");
+  ws.onmessage = function (evt) {
+      const readings = JSON.parse(event.data)
+      network.innerHTML = readings.network;
+      mac.innerHTML = readings.mac;
+      if (readings.ax <0) {
+          barmx.value = -readings.ax;
+          barpx.value = 0;
+      } else {
+          barpx.value = readings.ax;
+          barmx.value = 0;
+      }
+      axval.innerHTML = readings.ax + " m/s²";
+      
+      if (readings.ay <0) {
+          barmy.value = -readings.ay;
+          barpy.value = 0;
+      } else {
+          barpy.value = readings.ay;
+          barmy.value = 0;
+      }
+      ayval.innerHTML = readings.ay + " m/s²";
+      
+      if (readings.az <0) {
+          barmz.value = -readings.az;
+          barpz.value = 0;
+      } else {
+          barpz.value = readings.az;
+          barmz.value = 0;
+      }
+      azval.innerHTML = readings.az + " m/s²";
+      
+      var date = new Date()
+      var t = date.getTime() - (date.getTimezoneOffset() * 60000)
+          y = parseFloat(readings.ax);
+      if(charta.series[0].data.length > 40) {
+        charta.series[0].addPoint([t, y], true, true, true);
+      } else {
+        charta.series[0].addPoint([t, y], true, false, true);
+      }
+      y = parseFloat(readings.ay);
+      if(charta.series[1].data.length > 40) {
+        charta.series[1].addPoint([t, y], true, true, true);
+      } else {
+        charta.series[1].addPoint([t, y], true, false, true);
+      }
+      y = parseFloat(readings.az);
+      if(charta.series[2].data.length > 40) {
+        charta.series[2].addPoint([t, y], true, true, true);
+      } else {
+        charta.series[2].addPoint([t, y], true, false, true);
+      }
+
+      if (readings.vmin != barvx.min) {
+          barvx.min = readings.vmin;
+          barvy.min = readings.vmin;
+      }
+      if (readings.vmax != barvx.max) {
+          barvx.max = readings.vmax;
+          barvy.max = readings.vmax;
+      }
+
+      barvx.value = readings.vx;
+      vxval.innerHTML = readings.vx + " &mu;m/s";
+      
+      barvy.value = readings.vy;
+      vyval.innerHTML = readings.vy + " &mu;m/s";
+      
+      var y = parseFloat(readings.vx);
+      if(chartv.series[0].data.length > 40) {
+        chartv.series[0].addPoint([t, y], true, true, true);
+      } else {
+        chartv.series[0].addPoint([t, y], true, false, true);
+      }
+      y = parseFloat(readings.vy);
+      if(chartv.series[1].data.length > 40) {
+        chartv.series[1].addPoint([t, y], true, true, true);
+      } else {
+        chartv.series[1].addPoint([t, y], true, false, true);
+      }
+  };
+
+</script>
+</body>
+</html>

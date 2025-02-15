@@ -348,9 +348,9 @@ class Vibrationsensor:
         print("ADS1256 id: " + hex(adc.whoami()))
         # We have to set a data rate of 500 SPS because we multiplex two channels and need a net data rate of 100Hz per channel
         # The oversampling is corrected for after the ringbuffer is full by using rescale_array
-        adc.write_reg(ADS1256.DRATE,ADS1256.DR500)
+        adc.write_reg(ADS1256.DRATE,ADS1256.DR100)
         reg = adc.read_reg(ADS1256.DRATE)[0]
-        assert (reg == ADS1256.DR500), f"ADS1256 DRATE register should read DR500, got {reg}"
+        assert (reg == ADS1256.DR100), f"ADS1256 DRATE register should read DR500, got {reg}"
         adc.write_reg(ADS1256.MUX,ADS1256.CH0)
         reg = adc.read_reg(ADS1256.MUX)[0]
         assert (reg == ADS1256.CH0), f"ADS1256 MUX register should read CH0, got {reg}"
@@ -497,9 +497,9 @@ class Vibrationsensor:
         """
         cur_ch = self.ads1256.current_channel()
         nxt_ch = ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7
-#        data = self.ads1256.cycle_channel(nxt_ch, ignore_drdy=True)
+        data = self.ads1256.cycle_channel(nxt_ch, ignore_drdy=True)
 
-        data = b'\x00\x00\x00'
+#        data = b'\x00\x00\x00'
         # We have to take signed 32-bit integers since 24-bit signed integers are not supported by the ring buffer
         data = int(data.hex(),16)
         if data & 0x800000:

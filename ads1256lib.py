@@ -252,13 +252,14 @@ class ADS1256:
         #Step1
         self.spi.write(bytearray([0x50|0x01,0x00])) #Write into MUX register
         self.spi.write(bytearray([ch]))
+        utime.sleep_us(1) #Delay t11=0.52us
         #Step2
         self.spi.write(bytearray([0xFC])) #SYNC
-        utime.sleep_us(4) #Delay t11
+        utime.sleep_us(4) #Delay t11=3.12us
         self.spi.write(bytearray([0xFF])) #WAKEUP
         #Step3
         self.spi.write(bytearray([0x01])) #RDATA
-        utime.sleep_us(7) #wait t6=6.51us
+        utime.sleep_us(7) #Delay t6=6.5us
         self.spi.readinto(self.conversion,0xFF) #Read 3bytes
         self.deselect()
         return self.conversion

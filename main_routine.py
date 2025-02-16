@@ -8,6 +8,7 @@ import json
 import socket
 import struct
 import array
+import _thread
 from secrets import WiFi
 from math import floor
 # import uasyncio as asyncio
@@ -162,6 +163,7 @@ class Vibrationsensor:
                                              config["Network"]["CONNECTION_TIMEOUT"])
         self.rtc = self.set_rtc()
         self.server = self.AppServer(self, "readings.html", self.iface)
+        self.s_lock = _thread.allocate_lock()
 
     class ValueGenerator(WebSocketClient):
         """
@@ -207,20 +209,6 @@ class Vibrationsensor:
                     self.speed = [self.outer_instance.vx_ring_buffer.read(), self.outer_instance.vy_ring_buffer.read()]
                 else:
                     self.speed = [0, 0]
-#                print(self.speed)
-#                self.outer_instance.irq_ads1256(False)
-#                cur_ch = self.outer_instance.ads1256.current_channel()
-#                idx = 0 if cur_ch == ADS1256.CH0 else 1
-
-#                self.data = self.outer_instance.ads1256.cycle_channel(ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7)
-#                self.speed[idx] = int(self.data.hex(), 16)
-#                if self.speed[idx] & 0x800000:
-#                    self.speed[idx] += -0x1000000
-#                self.data = self.outer_instance.ads1256.cycle_channel(cur_ch)
-#                self.outer_instance.irq_ads1256(True)
-#                self.speed[1-idx] = int(self.data.hex(), 16)
-#                if self.speed[1-idx] & 0x800000:
-#                    self.speed[1-idx] += -0x1000000
                 self.v = [self.vlsb * s for s in self.speed]
                 self.connection.write(json.dumps({"network":self.outer_instance.network,
                                                   "mac":self.outer_instance.mac,
@@ -266,6 +254,7 @@ class Vibrationsensor:
         """
         try:
             while True:
+                self.s_lock.acquire()
                 self.server.process_all()
                 print("time: ", round(time.time()-self.server_start_time,1), " s")
                 print("MPU6500 Ringbuffer: i=", self.ax_ring_buffer.index, " ri=", self.ax_ring_buffer.retrieve_index,
@@ -279,6 +268,7 @@ class Vibrationsensor:
                     print("ADS1256 Sample Data rate (vx): ", self.vx_ring_buffer.samples_per_second())
                     print("ADS1256 Sample Data rate (vy): ", self.vy_ring_buffer.samples_per_second())
                 time.sleep(1)
+                self.s_lock.release()
         except KeyboardInterrupt:
             pass
 
@@ -344,6 +334,7 @@ class Vibrationsensor:
         self.ads1256_int_pin = Pin(drdy, mode=Pin.IN, pull=None)
         adcspi = SPI(1,baudrate=bps, polarity=0, phase=1, bits=8, firstbit=SPI.MSB,
                     sck=Pin(sck, Pin.OUT), mosi=Pin(mosi, Pin.OUT), miso=Pin(miso, Pin.IN, pull=None))
+        # Since we have only one SPI device on SPI bus 1 we can set the CS pin to permanent mode
         adc = ADS1256(adcspi, cs=Pin(cs, Pin.OUT, value=1), drdy=self.ads1256_int_pin,
                       sync_pwdn=Pin(sync, Pin.OUT, value=1), ref_voltage=2.5, pga = ADS1256.PGA1, cs_permanent=True)
         adc.reset()
@@ -351,9 +342,9 @@ class Vibrationsensor:
         print("ADS1256 id: " + hex(adc.whoami()))
         # We have to set a data rate of 500 SPS because we multiplex two channels and need a net data rate of 100Hz per channel
         # The oversampling is corrected for after the ringbuffer is full by using rescale_array
-        adc.write_reg(ADS1256.DRATE,ADS1256.DR100)
+        adc.write_reg(ADS1256.DRATE,ADS1256.DR500)
         reg = adc.read_reg(ADS1256.DRATE)[0]
-        assert (reg == ADS1256.DR100), f"ADS1256 DRATE register should read DR100, got {reg}"
+        assert (reg == ADS1256.DR500), f"ADS1256 DRATE register should read DR500, got {reg}"
         adc.write_reg(ADS1256.MUX,ADS1256.CH0)
         reg = adc.read_reg(ADS1256.MUX)[0]
         assert (reg == ADS1256.CH0), f"ADS1256 MUX register should read CH0, got {reg}"
@@ -498,20 +489,15 @@ class Vibrationsensor:
         Interrupt is driven by the ads1256 DRDY pin and is triggered on falling edge
         Data in ring buffer is stored in the following format: [speedx, speedy]
         """
-        cur_ch = self.ads1256.current_channel()
-        nxt_ch = ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7
-        data = self.ads1256.cycle_channel(nxt_ch, ignore_drdy=True)
-
-#        data = b'\x00\x00\x00'
-        # We have to take signed 32-bit integers since 24-bit signed integers are not supported by the ring buffer
-        data = int(data.hex(),16)
-        if data & 0x800000:
-            data += -0x1000000
-        if cur_ch == ADS1256.CH0:
-            self.vx_ring_buffer.add(data)
-        else:
-            self.vy_ring_buffer.add(data)
-
+        if self.ads1256.drdy.value() == 0:
+            cur_ch = self.ads1256.current_channel()
+            nxt_ch = ADS1256.CH0 if cur_ch == ADS1256.CH7 else ADS1256.CH7
+            data = self.ads1256.raw_to_signed(self.ads1256.cycle_channel(nxt_ch, ignore_drdy=True))
+            # We have to take signed 32-bit integers since 24-bit signed integers are not supported by the ring buffer
+            if cur_ch == ADS1256.CH0:
+                self.vx_ring_buffer.add(data)
+            else:
+                self.vy_ring_buffer.add(data)
 
     def read_sensor(self):
         """
@@ -582,7 +568,8 @@ vibrationsensor = Vibrationsensor(configuration)
 vibrationsensor.irq_mpu6500(True)
 vibrationsensor.irq_ads1256(True)
 vibrationsensor.start_webserver()
-vibrationsensor.loop_webserver()
+
+_thread.start_new_thread(vibrationsensor.loop_webserver(), ())
 vibrationsensor.stop_webserver()
 vibrationsensor.irq_mpu6500(False)
 vibrationsensor.irq_ads1256(False)

@@ -25,6 +25,7 @@ Micropython driver for ADS1256
 # pylint: disable=import-error
 import utime
 from micropython import const
+from machine import enable_irq, disable_irq
 # pylint: disable=import-error
 
 class ADS1256:
@@ -271,6 +272,14 @@ class ADS1256:
         self.spi.readinto(self.conversion,0xFF) #Read 3bytes
         self.deselect()
         return self.conversion
+
+    def raw_to_signed(self, raw):
+        """Convert raw value to signed value"""
+        signed = int(raw.hex(),16)
+        if signed & 0x800000:
+            signed += -0x1000000
+        return signed
+
 
     def self_cal(self):
         """

@@ -149,6 +149,8 @@ class Vibrationsensor:
         self.udppacketsize = 25
         self.server_start_time = 0
 
+        # Initialize the LED pin for providing heartbeat of webserver
+        self.led = Pin(config["Pico"]["LED"], Pin.OUT)
         self.mpu6500 = self.init_mpu6500(config["MPU6500"]["I2C"],config["MPU6500"]["SCL"],config["MPU6500"]["SDA"],config["MPU6500"]["INT"])
         self.ads1256 = self.init_ads1256(config["ADS1256"]["BPS"],config["ADS1256"]["SCK"],config["ADS1256"]["MOSI"],config["ADS1256"]["MISO"],
                                          config["ADS1256"]["CS"],config["ADS1256"]["SYNC"],config["ADS1256"]["DRDY"])
@@ -190,7 +192,7 @@ class Vibrationsensor:
                 print("Got websocket message:", message)
                 message = json.loads(message)
                 self.outer_instance.udpip = message["ip"]
-                self.outer_instance.udpport = message["port"]
+                self.outer_instance.udpport = int(message["port"])
                 self.outer_instance.udpstream = message["udpstream"]
                 if self.outer_instance.udpstream:
                     self.outer_instance.udpsocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -254,20 +256,23 @@ class Vibrationsensor:
         """
         try:
             while True:
+                # Run webserver on 2nd core
                 self.s_lock.acquire()
                 self.server.process_all()
-                print("time: ", round(time.time()-self.server_start_time,1), " s")
-                print("MPU6500 Ringbuffer: i=", self.ax_ring_buffer.index, " ri=", self.ax_ring_buffer.retrieve_index,
-                      " u=", self.ax_ring_buffer.unread, " f=", self.ax_ring_buffer.is_full, " s=", self.ax_ring_buffer.size)
-                print("ADS1256 Ringbuffer: i=", self.vy_ring_buffer.index, " ri=", self.vy_ring_buffer.retrieve_index,
-                      " u=", self.vx_ring_buffer.unread, " f=", self.vx_ring_buffer.is_full, " s=", self.vx_ring_buffer.size)
-                if self.ax_ring_buffer.samples_per_second() is not None:
-                    print("MPU6500 Sample Data rate (ax): ", self.ax_ring_buffer.samples_per_second())
-                    print("MPU6500 Sample Data rate (ay): ", self.ay_ring_buffer.samples_per_second())
-                    print("MPU6500 Sample Data rate (az): ", self.az_ring_buffer.samples_per_second())
-                    print("ADS1256 Sample Data rate (vx): ", self.vx_ring_buffer.samples_per_second())
-                    print("ADS1256 Sample Data rate (vy): ", self.vy_ring_buffer.samples_per_second())
+                self.led.toggle()
+#                print("time: ", round(time.time()-self.server_start_time,1), " s")
+#                print("MPU6500 Ringbuffer: i=", self.ax_ring_buffer.index, " ri=", self.ax_ring_buffer.retrieve_index,
+#                      " u=", self.ax_ring_buffer.unread, " f=", self.ax_ring_buffer.is_full, " s=", self.ax_ring_buffer.size)
+#                print("ADS1256 Ringbuffer: i=", self.vy_ring_buffer.index, " ri=", self.vy_ring_buffer.retrieve_index,
+#                      " u=", self.vx_ring_buffer.unread, " f=", self.vx_ring_buffer.is_full, " s=", self.vx_ring_buffer.size)
+#                if self.ax_ring_buffer.samples_per_second() is not None:
+#                    print("MPU6500 Sample Data rate (ax): ", self.ax_ring_buffer.samples_per_second())
+#                    print("MPU6500 Sample Data rate (ay): ", self.ay_ring_buffer.samples_per_second())
+#                    print("MPU6500 Sample Data rate (az): ", self.az_ring_buffer.samples_per_second())
+#                    print("ADS1256 Sample Data rate (vx): ", self.vx_ring_buffer.samples_per_second())
+#                    print("ADS1256 Sample Data rate (vy): ", self.vy_ring_buffer.samples_per_second())
                 time.sleep(1)
+                # Release lock on core 2
                 self.s_lock.release()
         except KeyboardInterrupt:
             pass
@@ -290,9 +295,6 @@ class Vibrationsensor:
         datapipe = []
 
         for data in datapacket:
-            data = int(data.hex(),16)
-            if data & 0x800000:
-                data += -0x1000000
             datapipe.append(data)
         datapipestr = ','.join(map(str, datapipe))
         packet = f"{{'{channel:s}', {timestamp:.3f} {datapipestr}}}"
@@ -464,12 +466,17 @@ class Vibrationsensor:
             self.ax_ring_buffer.add(data[0])
             self.ay_ring_buffer.add(data[1])
             self.az_ring_buffer.add(data[2])
-            if self.ax_ring_buffer.unread == self.udppacketsize and self.udpstream and self.udpsocket is not None:
+            if self.ax_ring_buffer.unread >= self.udppacketsize and self.udpstream and self.udpsocket is not None:
                 self.send_udp(self.ax_ring_buffer.get(self.udppacketsize), channel = 'ENN', ip = self.udpip, port = self.udpport)
-            if self.ay_ring_buffer.unread == self.udppacketsize and self.udpstream and self.udpsocket is not None:
+            if self.ay_ring_buffer.unread >= self.udppacketsize and self.udpstream and self.udpsocket is not None:
                 self.send_udp(self.ay_ring_buffer.get(self.udppacketsize), channel = 'ENE', ip = self.udpip, port = self.udpport)
-            if self.az_ring_buffer.unread == self.udppacketsize and self.udpstream and self.udpsocket is not None:
+            if self.az_ring_buffer.unread >= self.udppacketsize and self.udpstream and self.udpsocket is not None:
                 self.send_udp(self.az_ring_buffer.get(self.udppacketsize), channel = 'ENZ', ip = self.udpip, port = self.udpport)
+            if self.vx_ring_buffer.unread >= self.udppacketsize and self.udpstream and self.udpsocket is not None:
+                self.send_udp(self.vx_ring_buffer.get(self.udppacketsize), channel = 'EHN', ip = self.udpip, port = self.udpport)
+            if self.vy_ring_buffer.unread >= self.udppacketsize and self.udpstream and self.udpsocket is not None:
+                self.send_udp(self.vy_ring_buffer.get(self.udppacketsize), channel = 'EHE', ip = self.udpip, port = self.udpport)
+
 
     def irq_ads1256(self, enable):
         """
@@ -560,6 +567,9 @@ configuration = {
         "PASSWORD": WiFi.password,
         "CONNECTION_TIMEOUT": 10,
         "NTPSERVER": 'pool.ntp.org'
+    },
+    "Pico": {
+        "LED": "LED"
     }
 }
 

@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Sensor Data Live Chart</title>
+  <script src="https://code.highcharts.com/highcharts.js"></script>
+  <meta http-equiv="refresh" content="3600">
+  <style>
+    body {
+      font-family: Arial;
+      margin: 20px;
+      background: #f4f4f4;
+    }
+
+    #chart-container {
+      width: 90vw;
+      max-width: 900px;
+    }
+
+    .stream-btn {
+      margin: 5px;
+      padding: 8px 16px;
+      font-size: 1em;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .enabled {
+      background: #4caf50;
+      color: white;
+    }
+
+    .disabled {
+      background: #ccc;
+      color: #333;
+    }
+
+    .chart-box {
+      margin-bottom: 40px;
+    }
+
+    #mac-field {
+      margin: 10px 0 20px 0;
+      font-size: 1.1em;
+      font-weight: bold;
+      color: #333;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>ADS1256 & MPU6500 Live Data</h2>
+  <div id="mac-field">
+    MAC: <span id="mac">--:--:--:--:--:--</span>
+    &nbsp;|&nbsp;
+    Network: <span id="nettype">unknown</span>
+    &nbsp;|&nbsp;
+    Display Mode: <span id="current-mode">3</span><br>
+    Spectrogram Scale: <span id="spectrogram-scale">---</span>
+  </div>
+  <div style="display: flex; align-items: flex-start;">
+    <div style="margin-right: 20px;">
+      <button id="unitToggleBtn" class="stream-btn enabled" onclick="toggleUnit()">
+        Show: SI Units
+      </button>
+      <div style="margin-top: 20px;">
+        <h3 style="margin: 5px 0;">Display Mode</h3>
+        <button id="mode-1" class="stream-btn disabled" onclick="setMode(-1)">-1: Off</button><br>
+        <button id="mode0" class="stream-btn disabled" onclick="setMode(0)">0: Text</button><br>
+        <button id="mode1" class="stream-btn disabled" onclick="setMode(1)">1: Waveform</button><br>
+        <button id="mode2" class="stream-btn disabled" onclick="setMode(2)">2: FFT</button><br>
+        <button id="mode3" class="stream-btn enabled" onclick="setMode(3)">3: Spectrogram</button>
+      </div>
+      <div style="margin-top: 20px;">
+        <h3 style="margin: 5px 0;">Display Velocity Component</h3>
+        <button id="axisX" class="stream-btn enabled" onclick="setAxis('X')">vx</button><br>
+        <button id="axisY" class="stream-btn disabled" onclick="setAxis('Y')">vy</button>
+      </div>
+      <div style="margin-top: 20px;">
+        <h3 style="margin: 5px 0;">Touch Calibration</h3>
+        <label for="calibPoints">Points:</label>
+        <select id="calibPoints" style="margin-bottom: 5px;">
+          <option value="5">5 Points</option>
+          <option value="9">9 Points</option>
+          <option value="25">25 Points</option>
+        </select><br>
+        <button class="stream-btn" onclick="startCalibration()">Calibrate Touch</button><br>
+        <button id="calibDataBtn" class="stream-btn" onclick="toggleCalibrationData()">Show Calibration Data</button>
+      </div>
+      <div id="calibDataDisplay" style="margin-top: 10px; display: none; max-width: 400px;">
+        <h4 style="margin: 5px 0;">Calibration Data:</h4>
+        <pre id="calibDataContent"
+          style="background: #f0f0f0; padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto; font-size: 11px;"></pre>
+      </div>
+    </div>
+    <div style="flex: 1;">
+      <div>
+        <button id="velocXBtn" class="stream-btn disabled" onclick="toggleStream('velocX')">UDP velocX: OFF</button>
+        <button id="velocYBtn" class="stream-btn disabled" onclick="toggleStream('velocY')">UDP velocY: OFF</button>
+        <button id="accelXBtn" class="stream-btn disabled" onclick="toggleStream('accelX')">UDP accelX: OFF</button>
+        <button id="accelYBtn" class="stream-btn disabled" onclick="toggleStream('accelY')">UDP accelY: OFF</button>
+        <button id="accelZBtn" class="stream-btn disabled" onclick="toggleStream('accelZ')">UDP accelZ: OFF</button>
+      </div>
+      <div id="chart-container">
+        <div class="chart-box">
+          <div id="velocChart" style="width:100%;height:300px;"></div>
+        </div>
+        <div class="chart-box">
+          <div id="accelChart" style="width:100%;height:300px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    Highcharts.setOptions({
+      global: {
+        useUTC: false
+      }
+    });
+
+    let udpStreams = {
+      velocX: false,
+      velocY: false,
+      accelX: false,
+      accelY: false,
+      accelZ: false
+    };
+
+    let showSIUnits = true;
+
+    function toggleUnit() {
+      showSIUnits = !showSIUnits;
+      document.getElementById('unitToggleBtn').textContent = showSIUnits ? 'Show: SI Units' : 'Show: Raw Value';
+      // Update y-axis labels
+      velocChart.yAxis[0].setTitle({ text: showSIUnits ? 'Velocity [m/s]' : 'Raw Value [1]' });
+      accelChart.yAxis[0].setTitle({ text: showSIUnits ? 'Acceleration [m/s&#178;]' : 'Raw Value [1]' });
+      // Optionally clear and redraw charts for clarity
+      clearCharts();
+    }
+
+    function clearCharts() {
+      velocChart.series[0].setData([]);
+      velocChart.series[1].setData([]);
+      accelChart.series[0].setData([]);
+      accelChart.series[1].setData([]);
+      accelChart.series[2].setData([]);
+    }
+
+    function toggleStream(channel) {
+      udpStreams[channel] = !udpStreams[channel];
+      const btn = document.getElementById(channel + "Btn");
+      if (udpStreams[channel]) {
+        btn.classList.remove("disabled");
+        btn.classList.add("enabled");
+        btn.textContent = "UDP " + channel + ": ON";
+      } else {
+        btn.classList.remove("enabled");
+        btn.classList.add("disabled");
+        btn.textContent = "UDP " + channel + ": OFF";
+      }
+      fetch('/udpstream?channel=' + channel + '&enable=' + (udpStreams[channel] ? 1 : 0));
+    }
+
+    function setMode(newMode) {
+      fetch('/setmode?mode=' + newMode)
+        .then(response => response.text())
+        .then(result => {
+          console.log('Mode set result:', result);
+          document.getElementById('current-mode').textContent = newMode;
+        })
+        .catch(error => {
+          console.error('Error setting mode:', error);
+        });
+    }
+
+    function setAxis(axis) {
+      fetch('/setaxis?axis=' + axis)
+        .then(response => response.text())
+        .then(result => {
+          console.log('Axis set result:', result);
+          updateAxisButtons(axis);
+        })
+        .catch(error => {
+          console.error('Error setting axis:', error);
+        });
+    }
+
+    function updateAxisButtons(currentAxis) {
+      document.getElementById('axisX').className = currentAxis === 'X' ? 'stream-btn enabled' : 'stream-btn disabled';
+      document.getElementById('axisY').className = currentAxis === 'Y' ? 'stream-btn enabled' : 'stream-btn disabled';
+    }
+
+    function startCalibration() {
+      const points = document.getElementById('calibPoints').value;
+      fetch(`/touchcalibrate?points=${points}`)
+        .then(response => response.text())
+        .then(data => {
+          alert('Touch calibration started with ' + points + ' points. Please follow the on-screen instructions on the TFT display.');
+          console.log('Calibration response:', data);
+        })
+        .catch(error => {
+          console.error('Error starting calibration:', error);
+          alert('Failed to start calibration: ' + error);
+        });
+    }
+
+    function toggleCalibrationData() {
+      const displayDiv = document.getElementById('calibDataDisplay');
+      const btn = document.getElementById('calibDataBtn');
+
+      if (displayDiv.style.display === 'none' || displayDiv.style.display === '') {
+        // Show calibration data
+        fetch('/touchcalibdata')
+          .then(response => response.text())
+          .then(data => {
+            document.getElementById('calibDataContent').textContent = data;
+            displayDiv.style.display = 'block';
+            btn.textContent = 'Hide Calibration Data';
+            console.log('Calibration data:', data);
+          })
+          .catch(error => {
+            console.error('Error fetching calibration data:', error);
+            document.getElementById('calibDataContent').textContent = 'Error: ' + error;
+            displayDiv.style.display = 'block';
+            btn.textContent = 'Hide Calibration Data';
+          });
+      } else {
+        // Hide calibration data
+        displayDiv.style.display = 'none';
+        btn.textContent = 'Show Calibration Data';
+      }
+    }
+
+    // Highcharts setup for velocity
+    const velocChart = Highcharts.chart('velocChart', {
+      chart: {
+        type: 'line'
+      },
+      title: {
+        text: 'Velocity Data'
+      },
+      xAxis: {
+        type: 'datetime',
+        tickPixelInterval: 150
+      },
+      yAxis: {
+        title: {
+          text: 'Velocity [&#181;m/s]'
+        }
+      },
+      legend: {
+        enabled: true
+      },
+      plotOptions: {
+        line: {
+          marker: {
+            enabled: false
+          }
+        }
+      },
+      series: [
+        { name: 'Veloc X', data: [], color: 'blue' },
+        { name: 'Veloc Y', data: [], color: 'purple' }
+      ]
+    });
+
+    // Highcharts setup for acceleration
+    const accelChart = Highcharts.chart('accelChart', {
+      chart: {
+        type: 'line'
+      },
+      title: {
+        text: 'Acceleration Data'
+      },
+      xAxis: {
+        type: 'datetime',
+        tickPixelInterval: 150
+      },
+      yAxis: {
+        title: {
+          text: 'Acceleration [m/s&#178;]'
+        }
+      },
+      legend: {
+        enabled: true
+      },
+      plotOptions: {
+        line: {
+          marker: {
+            enabled: false
+          }
+        }
+      },
+      series: [
+        { name: 'Accel X', data: [], color: 'red' },
+        { name: 'Accel Y', data: [], color: 'green' },
+        { name: 'Accel Z', data: [], color: 'orange' }
+      ]
+    });
+
+    function fetchData() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(d => {
+          // Use client-side timestamp for better resolution (200ms updates, server only has 1s resolution)
+          const now = (new Date()).getTime();
+          // Use SI or raw values based on toggle
+          const vX = showSIUnits ? d.velocX : d.velocXraw;
+          const vY = showSIUnits ? d.velocY : d.velocYraw;
+          const aX = showSIUnits ? d.accelX : d.accelXraw;
+          const aY = showSIUnits ? d.accelY : d.accelYraw;
+          const aZ = showSIUnits ? d.accelZ : d.accelZraw;
+
+          velocChart.series[0].addPoint([now, vX], false, velocChart.series[0].data.length >= 60);
+          velocChart.series[1].addPoint([now, vY], false, velocChart.series[1].data.length >= 60);
+          velocChart.redraw();
+
+          accelChart.series[0].addPoint([now, aX], false, accelChart.series[0].data.length >= 60);
+          accelChart.series[1].addPoint([now, aY], false, accelChart.series[1].data.length >= 60);
+          accelChart.series[2].addPoint([now, aZ], false, accelChart.series[2].data.length >= 60);
+          accelChart.redraw();
+
+          // Update MAC field if present in JSON
+          if (d.mac) {
+            document.getElementById('mac').textContent = d.mac;
+          }
+          // Update nettype field if present in JSON
+          if (d.nettype) {
+            document.getElementById('nettype').textContent = d.nettype;
+          }
+          // Update mode field if present in JSON
+          if (d.mode !== undefined) {
+            document.getElementById('current-mode').textContent = d.mode;
+            // Update mode button highlighting
+            updateModeButtons(d.mode);
+
+            // Update spectrogram scale only when in mode 3
+            if (d.mode === 3 && d.spectrogramMax !== undefined) {
+              document.getElementById('spectrogram-scale').textContent =
+                `Max: ${d.spectrogramMax}`;
+            } else {
+              document.getElementById('spectrogram-scale').textContent = '---';
+            }
+          }
+          // Update axis field if present in JSON
+          if (d.axis) {
+            updateAxisButtons(d.axis);
+          }
+        });
+    }
+
+    function updateModeButtons(currentMode) {
+      // Clear all buttons
+      document.getElementById('mode-1').className = 'stream-btn disabled';
+      document.getElementById('mode0').className = 'stream-btn disabled';
+      document.getElementById('mode1').className = 'stream-btn disabled';
+      document.getElementById('mode2').className = 'stream-btn disabled';
+      document.getElementById('mode3').className = 'stream-btn disabled';
+
+      // Highlight the current mode button
+      const modeId = 'mode' + currentMode;
+      const modeBtn = document.getElementById(modeId);
+      if (modeBtn) {
+        modeBtn.className = 'stream-btn enabled';
+      }
+    }
+
+    setInterval(fetchData, 200);
+    fetchData();
+  </script>
+</body>
+
+</html>

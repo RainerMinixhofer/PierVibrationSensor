@@ -1,0 +1,1 @@
+The pico_pdm_spectrogram.ino c++ file is holding an example code for doing a spectrogram with the pico 2 w. The Github repository is under https://github.com/dpwe/pico_pdm_spectrogram/tree/main

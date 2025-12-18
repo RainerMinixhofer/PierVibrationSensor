@@ -1,0 +1,70 @@
+#include <Arduino.h>
+#include "SdFatConfig.h" // Include SdFatConfig.h for SD card support
+#include <SdFat.h>
+#include <unity.h>
+
+// Define SD card pins (these should match the ones in your main.cpp)
+#define SD_CS_PIN 10
+
+void setUp(void) {
+    // Set up code here, runs before each test
+    if (!SdFat.begin(SD_CS_PIN)) {
+        Serial.println("SD card initialization failed!");
+    }
+}
+
+void tearDown(void) {
+    // Clean up code here, runs after each test
+    SD.end();
+}
+
+void test_sd_card_initialization(void) {
+    TEST_ASSERT_TRUE(SD.begin(SD_CS_PIN));
+}
+
+void test_sd_card_file_creation(void) {
+    File testFile = SD.open("/test.txt", FILE_WRITE);
+    TEST_ASSERT_NOT_NULL(testFile);
+    testFile.close();
+    TEST_ASSERT_TRUE(SD.exists("/test.txt"));
+}
+
+void test_sd_card_file_write_read(void) {
+    File testFile = SD.open("/test.txt", FILE_WRITE);
+    TEST_ASSERT_NOT_NULL(testFile);
+    testFile.println("Hello, SD card!");
+    testFile.close();
+
+    testFile = SD.open("/test.txt", FILE_READ);
+    TEST_ASSERT_NOT_NULL(testFile);
+
+    String content = testFile.readStringUntil('\n');
+    testFile.close();
+    TEST_ASSERT_EQUAL_STRING("Hello, SD card!", content.c_str());
+}
+
+void test_sd_card_file_deletion(void) {
+    TEST_ASSERT_TRUE(SD.remove("/test.txt"));
+    TEST_ASSERT_FALSE(SD.exists("/test.txt"));
+}
+
+void setup() {
+    // Initialize serial communication
+    Serial.begin(115200);
+    while (!Serial) {
+        delay(10); // Wait for Serial to initialize
+    }
+
+    UNITY_BEGIN();
+
+    RUN_TEST(test_sd_card_initialization);
+    RUN_TEST(test_sd_card_file_creation);
+    RUN_TEST(test_sd_card_file_write_read);
+    RUN_TEST(test_sd_card_file_deletion);
+
+    UNITY_END();
+}
+
+void loop() {
+    // Nothing to do here
+}

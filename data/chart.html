@@ -58,7 +58,15 @@
     Network: <span id="nettype">unknown</span>
     &nbsp;|&nbsp;
     Display Mode: <span id="current-mode">3</span><br>
-    Spectrogram Scale: <span id="spectrogram-scale">---</span>
+    Spectrogram Scale: <span id="spectrogram-scale">---</span><br>
+    Log Level:
+    <select id="loglevel-select" onchange="setLogLevel()" style="margin-left:8px;">
+      <option value="0">None</option>
+      <option value="1">Error</option>
+      <option value="2">Warn</option>
+      <option value="3" selected>Info</option>
+      <option value="4">Debug</option>
+    </select>
   </div>
   <div style="display: flex; align-items: flex-start;">
     <div style="margin-right: 20px;">
@@ -348,6 +356,18 @@
           if (d.axis) {
             updateAxisButtons(d.axis);
           }
+        });
+    }
+
+    function setLogLevel() {
+      const level = document.getElementById('loglevel-select').value;
+      fetch('/setloglevel?level=' + level)
+        .then(response => response.text())
+        .then(result => {
+          console.log('Log level set:', result);
+        })
+        .catch(error => {
+          console.error('Error setting log level:', error);
         });
     }
 

@@ -11,11 +11,18 @@
 // #define USE_WIFI // comment out to disable WiFi support
 #define USE_WIZNET // comment out to disable WIZNET5K support
 // #define WAIT_FOR_TOUCH // comment out to disable waiting for touch input
-// #define FORCE_TOUCH_CALIBRATION // comment out to force touch calibration
-// #define PRINT_TOUCH_CALIB_FILE // comment out to disable printing touch calibration file to serial
 #define USE_HARDWARE_SPI // comment out to use software SPI for TFT display
-// #define DEBUG_TOUCH_EVENTS // comment out to disable touch event debug logging
-// #define LOG_THRESHOLD_EVENTS // comment out to disable speed threshold event logging
+
+// --- Logging and Debug Output ---
+enum LogLevel
+{
+  LOG_NONE = 0,
+  LOG_ERROR = 1,
+  LOG_WARN = 2,
+  LOG_INFO = 3,
+  LOG_DEBUG = 4
+};
+int logVerbosity = LOG_INFO; // Set global log verbosity here
 
 #include <Arduino.h>
 #include "pico/stdlib.h" // <-- Add this include for Pico SDK functions
@@ -43,11 +50,7 @@
 #include "arm_math.h"
 #include "Adafruit_GFX.h"
 #include "Adafruit_ILI9341.h"
-#ifdef USE_HARDWARE_SPI
 #include <XPT2046_Touchscreen.h>
-#else
-#include <XPT2046_Bitbang.h>
-#endif
 #include "SdFatConfig.h" // Include SdFatConfig.h for SD card support
 #include <SdFat.h>
 #include <Adafruit_ICM20X.h>
@@ -112,19 +115,11 @@ Adafruit_ICM20948 icm;
 #define TFT_LED 3       // GP3, Set to -1 if not used
 #define TFT_ROTATION 1  // Set the default rotation for the display
 #define TFT_TEXT_SIZE 1 // Set the default text size for the display
-#ifdef USE_HARDWARE_SPI
-// Hardware SPI configuration
+
 #define TFT_SPI_PORT spi0      // Using SPI0
 #define TFT_SPI_BPS 10000000   // 20 MHz SPI clock for all devices (TFT, Touch, SD)
 #define TOUCH_SPI_BPS 10000000 // Same speed as TFT for consistent SPI bus performance
-
-// Create TFT display object using hardware SPI (3-wire constructor)
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
-#else
-// Software SPI configuration
-// Create TFT display object using software SPI
-Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST, TFT_MISO);
-#endif
 
 // Custom color constants (RGB565 format)
 #define COLOR_GREY 0x7BEF // Medium grey for UI elements
@@ -137,12 +132,8 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_
 #define TOUCH_IRQ 27       // GP27, Set to -1 if not used
 
 // Create TFT touchscreen object using XPT2046 driver
-#ifdef USE_HARDWARE_SPI
 #define TOUCH_SPI_PORT spi0 // Using SPI0
 XPT2046_Touchscreen touchscreen(TOUCH_CS, TOUCH_IRQ);
-#else
-XPT2046_Bitbang touchscreen(TOUCH_DIN, TOUCH_DO, TOUCH_CLK, TOUCH_CS);
-#endif
 
 // XPT2046 touch controller resolution constants
 // XPT2046 uses 12-bit ADC (0-4095 range)
@@ -163,21 +154,9 @@ const uint16_t XPT2046_XMAX_VALUE = (1 << (XPT2046_RESOLUTION_BITS - 1)) - 1; //
 #define SD_MISO TFT_MISO // GP0 (shared with TFT and Touch MISO)
 #define SD_CS 26         // GP26
 
-#ifdef USE_HARDWARE_SPI
-// Hardware SPI configuration for SD card
 #define SD_SPI_PORT TFT_SPI_PORT // Using same SPI0 as TFT
 #define SD_SPI_BPS 20000000      // 20 MHz for SD card (same as TFT and Touch)
 #define SD_CONFIG SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(20))
-#else
-// Software SPI configuration for SD card
-#if SPI_DRIVER_SELECT == 2 // Must be set in SdFat/SdFatConfig.h
-SoftSpiDriver<SD_MISO, SD_MOSI, SD_SCK> softSpi;
-// Speed argument is ignored for software SPI.
-#define SD_CONFIG SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(0), &softSpi)
-#else
-#error SPI_DRIVER_SELECT must be two in SdFat/SdFatConfig.h when USE_HARDWARE_SPI is not defined
-#endif // SPI_DRIVER_SELECT
-#endif // USE_HARDWARE_SPI
 
 #if SD_FAT_TYPE == 0
 SdFat sd;
@@ -253,13 +232,10 @@ int NUM_CALIB_POINTS = 5;                                                 // Cha
 volatile bool trigger_touch_calibration = false;                          // Trigger for remote calibration
 
 // --- Touch Event Handling ---
+static volatile bool forceTouchCalibration = false; //Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
 static volatile bool touch_event_flag = false;
-static volatile int irq_save = 0; // Save the IRQ state for touch events
-#ifndef USE_HARDWARE_SPI
-TouchPoint touch_event_point = {0, 0, 0, 0, 0, 0}; // Initialize touch point structure
-#else
+static volatile int irq_save = 0;       // Save the IRQ state for touch events
 TS_Point touch_event_point = {0, 0, 0}; // Initialize touch point structure for XPT2046_Touchscreen
-#endif
 
 // --- Sensor Data and Flags ---
 volatile bool ads1256_data_ready = false;  ///< Flag set by ADS1256 DRDY interrupt
@@ -335,6 +311,32 @@ const int mag_spec_len = 512;
 // FUNCTION DECLARATIONS AND INTERRUPT HANDLERS
 // ============================================================================
 
+// Handler for setting log level via HTTP
+void serveSetLogLevel(Stream &client, const String &req)
+{
+  int levelIdx = req.indexOf("level=");
+  int newLevel = -1;
+  if (levelIdx != -1)
+  {
+    String levelStr = req.substring(levelIdx + 6);
+    // Only take first digit (0-4)
+    int endIdx = 0;
+    while (endIdx < levelStr.length() && isdigit(levelStr.charAt(endIdx)))
+      endIdx++;
+    levelStr = levelStr.substring(0, endIdx);
+    newLevel = levelStr.toInt();
+    if (newLevel >= 0 && newLevel <= 4)
+    {
+      logVerbosity = newLevel;
+    }
+  }
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/plain");
+  client.println("Connection: close");
+  client.println();
+  client.printf("OK logVerbosity=%d\n", logVerbosity);
+}
+
 // Interrupt handler for ADS1256 DRDY pin
 void ads1256_drdy_isr(uint gpio, uint32_t events)
 {
@@ -352,25 +354,17 @@ void drawMenuIndicator(int scroll_offset = 0);
 void drawModeMenu();
 
 // Helper functions to get raw touch coordinates (compatible with both libraries)
+
 inline uint16_t getTouchRawX()
 {
-#ifdef USE_HARDWARE_SPI
   return touch_event_point.x; // XPT2046_Touchscreen: x is already the raw ADC value
-#else
-  return touch_event_point.xRaw; // XPT2046_Bitbang: use xRaw field
-#endif
 }
 
 inline uint16_t getTouchRawY()
 {
-#ifdef USE_HARDWARE_SPI
   return touch_event_point.y; // XPT2046_Touchscreen: y is already the raw ADC value
-#else
-  return touch_event_point.yRaw; // XPT2046_Bitbang: use yRaw field
-#endif
 }
 
-#ifdef USE_HARDWARE_SPI
 // Helper function to set SPI clock speed for display operations
 inline void setDisplaySPISpeed()
 {
@@ -382,26 +376,15 @@ inline void setTouchSPISpeed()
 {
   spi_set_baudrate(TFT_SPI_PORT, TOUCH_SPI_BPS);
 }
-#endif
 
 // Interrupt handler for TFT touch controller (XPT2046)
 void touch_irq_isr(uint gpio, uint32_t events)
 {
   // Set a volatile flag for main loop processing
   gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false); // disable IRQ to prevent triggering during processing
-#ifdef USE_HARDWARE_SPI
   // For hardware SPI, just set the flag - don't read in IRQ context
   // Reading will be done in main loop after flag is detected
   touch_event_flag = true;
-#else
-  // For software SPI, reading in IRQ context works fine
-  touch_event_point = touchscreen.getTouch();
-  touch_event_flag = touch_event_point.z > 0; // Set flag if touch is detected
-  if (!touch_event_flag)
-  {
-    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true); // enable IRQ if no touch detected
-  }
-#endif
 }
 
 void initSDCard()
@@ -416,8 +399,6 @@ void initSDCard()
   }
   Serial.println("LittleFS mounted successfully.");
 
-#ifdef USE_HARDWARE_SPI
-  // Initialize hardware SPI for SD card (shared with TFT on SPI0)
   Serial.println("Using hardware SPI for SD card");
   spi_init(SD_SPI_PORT, SD_SPI_BPS);
   gpio_set_function(SD_SCK, GPIO_FUNC_SPI);
@@ -428,9 +409,6 @@ void initSDCard()
   gpio_init(SD_CS);
   gpio_set_dir(SD_CS, GPIO_OUT);
   gpio_put(SD_CS, 1); // Start with CS high (inactive)
-#else
-  Serial.println("Using software SPI for SD card");
-#endif
 
   // Initialize SD card
   if (!sd.begin(SD_CONFIG))
@@ -598,40 +576,33 @@ void tftPrint(const char *msg, bool resetline = false)
   }
 }
 
-// Helper function to print to Serial and optionally to TFT in mode 0
-void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN)
+// Logging helpers with verbosity control
+void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN, int level = LOG_INFO)
 {
+  if (logVerbosity < level)
+    return;
   Serial.print(msg);
   if (mode == 0 && text_mode_initialized)
   {
-    // Also display on TFT in text mode
-    static int tft_line = 3; // Start at line 3 to avoid menu indicator (16 pixels tall = 2 lines)
+    static int tft_line = 3;
     static const int font_height = 8 * TFT_TEXT_SIZE;
     int disp_height = tft.height();
     int max_lines = disp_height / font_height;
-
-    // Split msg into lines
     const char *p = msg;
     while (*p)
     {
       const char *line_end = strchr(p, '\n');
       int len = line_end ? (line_end - p) : strlen(p);
-
-      // If at bottom, wrap to top (but skip lines 0-2 for menu indicator)
       if (tft_line >= max_lines)
       {
-        // Clear screen except for menu indicator area (first 3 lines = 24 pixels)
         tft.fillRect(0, 3 * font_height, tft.width(), disp_height - 3 * font_height, ILI9341_BLACK);
         tft_line = 3;
       }
-
-      // Print the line
       tft.setCursor(0, tft_line * font_height);
       tft.setTextColor(color);
       tft.setTextSize(TFT_TEXT_SIZE);
       for (int i = 0; i < len; ++i)
         tft.write(p[i]);
-
       if (line_end)
       {
         tft_line++;
@@ -665,8 +636,10 @@ void debugPrintfColor(uint16_t color, const char *format, ...)
   debugPrint(buffer, color);
 }
 
-void debugPrintln(const char *msg)
+void debugPrintln(const char *msg, int level = LOG_INFO)
 {
+  if (logVerbosity < level)
+    return;
   char buffer[256];
   snprintf(buffer, sizeof(buffer), "%s\n", msg);
   debugPrint(buffer);
@@ -717,7 +690,6 @@ void initTFTDisplay()
   // Note: Don't disable touch controller here - let XPT2046_Touchscreen library manage CS pin
   disableSDCard();
 
-#ifdef USE_HARDWARE_SPI
   // Initialize hardware SPI for TFT display
   spi_init(TFT_SPI_PORT, TFT_SPI_BPS);
 
@@ -731,11 +703,6 @@ void initTFTDisplay()
   Serial.printf("SPI Port: spi0, Speed: %d Hz\n", TFT_SPI_BPS);
   Serial.printf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
   Serial.printf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RST);
-#else
-  Serial.println("Software SPI initialized for TFT display");
-  Serial.printf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
-  Serial.printf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RST);
-#endif
 
   setBacklight(0.0); // Turn off backlight initially
   tft.begin();
@@ -768,7 +735,7 @@ void initTouchController()
 {
   // Optionally calibrate or test touch here
   tftPrint("Initializing XPT2046 touch controller...\n");
-#ifdef USE_HARDWARE_SPI
+
   // Note: XPT2046 shares SPI bus (spi0) with display but requires slower clock (max 2.5 MHz)
   // SPI speed is dynamically switched before each touchscreen access
   touchscreen.begin();                   // Uses spi0 which was initialized in initTFTDisplay()
@@ -778,16 +745,7 @@ void initTouchController()
   gpio_set_dir(TOUCH_IRQ, GPIO_IN);
   gpio_pull_up(TOUCH_IRQ); // Enable pull-up resistor
   // Note: CS pin is managed by the XPT2046_Touchscreen library
-#else
-  touchscreen.begin();
-  // Initialize the IRQ pin
-  gpio_init(TOUCH_IRQ);
-  gpio_set_dir(TOUCH_IRQ, GPIO_IN);
-  gpio_pull_up(TOUCH_IRQ); // Enable pull-up resistor
-  // Note: CS pin is managed by the XPT2046_Bitbang library
-#endif
 
-#ifdef WAIT_FOR_TOUCH
   gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, &touch_irq_isr);
   tftPrint("Touch to continue...\n");
   // Wait for touch event
@@ -798,9 +756,6 @@ void initTouchController()
   }
   Serial.printf("Touch event detected!\n");
   Serial.printf("Touch position: x=%d, y=%d, z=%d\n", touch_event_point.x, touch_event_point.y, touch_event_point.z);
-#else
-  gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false, &touch_irq_isr); // Disable IRQ to prevent further triggering
-#endif
   touch_event_flag = false; // Reset flag after first touch event
   tftPrint("Touch controller initialized...\n");
   tftPrint("---------------------------------------------\n");
@@ -1075,7 +1030,6 @@ void calibrateTouchController()
     Serial.printf("Waiting for touch at point %d...\n", i + 1);
     bool touch_detected = false;
 
-#ifdef USE_HARDWARE_SPI
     while (!touch_detected)
     {
       if (touchscreen.touched())
@@ -1097,19 +1051,6 @@ void calibrateTouchController()
     {
       delay(10);
     }
-#else
-    // Software SPI - use IRQ
-    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true);
-    while (!touch_event_flag)
-    {
-      tight_loop_contents();
-    }
-    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false);
-    touch_event_flag = false;
-    touch_event_point = touchscreen.getTouch();
-    Serial.printf("Touch detected: x=%d, y=%d, z=%d\n",
-                  touch_event_point.xRaw, touch_event_point.yRaw, touch_event_point.z);
-#endif
 
     drawCalibrationCross(lcd_x[i], lcd_y[i], ILI9341_GREEN); // Draw green cross to indicate touch was registered
 
@@ -1181,7 +1122,6 @@ void calibrateTouchController()
     tft.printf("Touch test point %d/3", i + 1);
     drawCalibrationCross(test_lcd_x[i], test_lcd_y[i], ILI9341_YELLOW);
 
-#ifdef USE_HARDWARE_SPI
     bool touch_detected = false;
     while (!touch_detected)
     {
@@ -1200,16 +1140,6 @@ void calibrateTouchController()
     {
       delay(10);
     }
-#else
-    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true);
-    while (!touch_event_flag)
-    {
-      tight_loop_contents();
-    }
-    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false);
-    touch_event_flag = false;
-    touch_event_point = touchscreen.getTouch();
-#endif
 
     // Store raw coordinates without rotation - MMSE matrix handles the transformation
     test_touch_x[i] = getTouchRawX();
@@ -2852,14 +2782,13 @@ bool handleTouchInput(volatile int &current_mode)
   static bool touch_was_pressed = false;
   const unsigned long DEBOUNCE_MS = 200;
 
-#ifdef DEBUG_TOUCH_EVENTS
+  // Debug polling (was DEBUG_TOUCH_EVENTS)
   static unsigned long last_poll_debug = 0;
-  if (millis() - last_poll_debug > 5000)
+  if (logVerbosity >= LOG_DEBUG && millis() - last_poll_debug > 5000)
   {
-    Serial.println("handleTouchInput: polling...");
+    debugPrintln("handleTouchInput: polling...", LOG_DEBUG);
     last_poll_debug = millis();
   }
-#endif
 
   // Check if enough time has passed since last touch (debounce)
   if (millis() - last_touch_time < DEBOUNCE_MS)
@@ -2868,7 +2797,6 @@ bool handleTouchInput(volatile int &current_mode)
   }
 
   // Get touch input
-#ifdef USE_HARDWARE_SPI
   setTouchSPISpeed(); // Set SPI to touchscreen speed before reading
 
   // Check if touchscreen is being touched first
@@ -2885,22 +2813,15 @@ bool handleTouchInput(volatile int &current_mode)
   }
 
   setDisplaySPISpeed(); // Restore SPI to display speed
-#else
-  TouchPoint tp = touchscreen.getTouch();
-  bool is_touched = (tp.z > 0);
-#endif
 
-#ifdef DEBUG_TOUCH_EVENTS
   // Log raw touch data for debugging
   static unsigned long last_debug_time = 0;
   static int debug_counter = 0;
-  if (millis() - last_debug_time > 1000)
+  if (logVerbosity >= LOG_DEBUG && millis() - last_debug_time > 1000)
   {
-    Serial.printf("Touch poll #%d: touched=%d, x=%d, y=%d, z=%d\n",
-                  debug_counter++, is_touched, tp.x, tp.y, tp.z);
+    debugPrintf("Touch poll #%d: touched=%d, x=%d, y=%d, z=%d\n", debug_counter++, is_touched, tp.x, tp.y, tp.z);
     last_debug_time = millis();
   }
-#endif
 
   // Check for touch press (rising edge detection)
   if (tp.z > 0)
@@ -2915,30 +2836,22 @@ bool handleTouchInput(volatile int &current_mode)
       int display_x, display_y;
       applyMMSECalibration(tp.x, tp.y, display_x, display_y);
 
-#ifdef DEBUG_TOUCH_EVENTS
-      Serial.print("Touch event detected at display coordinates: x=");
-      Serial.print(display_x);
-      Serial.print(", y=");
-      Serial.println(display_y);
-#endif
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugPrintf("Touch event detected at display coordinates: x=%d, y=%d\n", display_x, display_y);
+      }
 
       // Check if touch is in the menu toggle area (top-left corner)
       if (!menu_visible && display_x < 80 && display_y < 20)
       {
-#ifdef DEBUG_TOUCH_EVENTS
-        Serial.println("Menu symbol pressed - showing menu");
-#endif
-        // Show menu
+        if (logVerbosity >= LOG_DEBUG)
+          debugPrintln("Menu symbol pressed - showing menu", LOG_DEBUG);
         drawModeMenu();
         return false;
       }
 
-#ifdef DEBUG_TOUCH_EVENTS
-      if (!menu_visible)
-      {
-        Serial.println("Touch outside menu symbol area");
-      }
-#endif
+      if (!menu_visible && logVerbosity >= LOG_DEBUG)
+        debugPrintln("Touch outside menu symbol area", LOG_DEBUG);
 
       // If menu is visible, check button touches
       if (menu_visible)
@@ -2947,13 +2860,8 @@ bool handleTouchInput(volatile int &current_mode)
         {
           if (isTouchInButton(display_x, display_y, menu_buttons[i]))
           {
-#ifdef DEBUG_TOUCH_EVENTS
-            Serial.print("Menu button pressed: ");
-            Serial.print(menu_buttons[i].label);
-            Serial.print(" (mode ");
-            Serial.print(menu_buttons[i].mode_value);
-            Serial.println(")");
-#endif
+            if (logVerbosity >= LOG_DEBUG)
+              debugPrintf("Menu button pressed: %s (mode %d)\n", menu_buttons[i].label, menu_buttons[i].mode_value);
             // Mode button pressed
             int new_mode = menu_buttons[i].mode_value;
             if (new_mode != current_mode)
@@ -2970,9 +2878,8 @@ bool handleTouchInput(volatile int &current_mode)
             }
           }
         }
-#ifdef DEBUG_TOUCH_EVENTS
-        Serial.println("Touch in menu area but outside buttons");
-#endif
+        if (logVerbosity >= LOG_DEBUG)
+          debugPrintln("Touch in menu area but outside buttons", LOG_DEBUG);
       }
     }
   }
@@ -3012,31 +2919,32 @@ void setup()
   LittleFS.begin(); // Initialize LittleFS filesystem
   tftPrint("Filesystem initialized...\n");
 
-#ifdef PRINT_TOUCH_CALIB_FILE
-  // Print touch calibration file content to serial for backup
-  File f = LittleFS.open("/touch_calib.txt", "r");
-  if (f)
+  if (logVerbosity >= LOG_DEBUG)
   {
-    Serial.println("\n=== touch_calib.txt content ===");
-    while (f.available())
+    // Print touch calibration file content to serial for backup
+    File f = LittleFS.open("/touch_calib.txt", "r");
+    if (f)
     {
-      Serial.write(f.read());
+      Serial.println("\n=== touch_calib.txt content ===");
+      while (f.available())
+      {
+        Serial.write(f.read());
+      }
+      Serial.println("\n=== End of file ===");
+      f.close();
     }
-    Serial.println("\n=== End of file ===");
-    f.close();
+    else
+    {
+      Serial.println("touch_calib.txt not found!");
+    }
   }
-  else
-  {
-    Serial.println("touch_calib.txt not found!");
-  }
-#endif
   tftPrint("---------------------------------------------\n");
   tftPrint("Initializing XPT2046 touch controller...\n");
   tftPrint("Start touch controller calibration...\n");
 
   bool calibrationPerformed = false;
 
-  if (!loadTouchCalibration())
+  if (!loadTouchCalibration() || forceTouchCalibration)
   {
     tftPrint("No touch calibration found, starting calibration...\n");
     // calibrateTouchController() will initialize the touchscreen
@@ -3045,11 +2953,6 @@ void setup()
   }
   else
   {
-#ifdef FORCE_TOUCH_CALIBRATION
-    tftPrint("Forcing touch calibration...\n");
-    calibrateTouchController();
-    calibrationPerformed = true;
-#else
     tftPrint("Touch calibration loaded from /touch_calib.txt...\n");
     // Initialize touchscreen the same way as calibrateTouchController() does
     Serial.println("Initializing touchscreen with loaded calibration...");
@@ -3060,21 +2963,16 @@ void setup()
     // Reset hardware scrolling to ensure correct coordinate mapping
     tft.scrollTo(0);
 
-#ifdef USE_HARDWARE_SPI
     // Set SPI speed to touchscreen speed before initialization
     Serial.println("Setting SPI speed for touchscreen...");
     setTouchSPISpeed();
-#endif
 
     // Initialize touch controller - begin() will handle CS pin setup
     touchscreen.begin();
-#ifdef USE_HARDWARE_SPI
     touchscreen.setRotation(TFT_ROTATION);
-#endif
 
     tftPrint("Touch controller initialized...\n");
     tft.setCursor(0, 0);
-#endif
   }
 
   initADS1256();
@@ -3124,7 +3022,6 @@ void setup()
   tftPrint("System initialized.\n");
 
   // Re-initialize touchscreen after all other peripherals to ensure it's in correct state
-#ifdef USE_HARDWARE_SPI
   setTouchSPISpeed();
   touchscreen.begin();
   touchscreen.setRotation(TFT_ROTATION);
@@ -3136,7 +3033,6 @@ void setup()
     touchscreen.getPoint();
     delay(10);
   }
-#endif
 
   tftPrint("Starting Main Loop...\n");
   Serial.println("Main loop started - collecting sensor data");
@@ -3367,6 +3263,10 @@ void loop()
         {
           serveTouchCalibData(client, req);
         }
+        else if (req.indexOf("GET /setloglevel") == 0)
+        {
+          serveSetLogLevel(client, req);
+        }
         else if (req.indexOf("GET /data") == 0)
         {
           serveSensorData(client);
@@ -3420,7 +3320,11 @@ void loop()
         }
         else if (req.indexOf("GET /touchcalibdata") == 0)
         {
-          serveTouchCalibData(client);
+          serveTouchCalibData(client, req);
+        }
+        else if (req.indexOf("GET /setloglevel") == 0)
+        {
+          serveSetLogLevel(client, req);
         }
         else if (req.indexOf("GET /data") == 0)
         {
@@ -3510,12 +3414,13 @@ void loop()
           sumsq += (long long)sample * sample;
         }
 
-#ifdef LOG_THRESHOLD_EVENTS
-        // Output statistics with timing information (in yellow)
-        debugPrintfColor(ILI9341_YELLOW, "Event: out=%lums in=%lums\n", crossing_time_out, crossing_time_in);
-        debugPrintfColor(ILI9341_YELLOW, "Duration=%lums samples=%d\n", crossing_time_in - crossing_time_out, n);
-        debugPrintfColor(ILI9341_YELLOW, "Mean=%d RMS=%d\n", sum / n, (int)sqrtf(((float)sumsq) / n));
-#endif
+        // Output statistics with timing information (in yellow) if log level is DEBUG
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugPrintfColor(ILI9341_YELLOW, "Event: out=%lums in=%lums\n", crossing_time_out, crossing_time_in);
+          debugPrintfColor(ILI9341_YELLOW, "Duration=%lums samples=%d\n", crossing_time_in - crossing_time_out, n);
+          debugPrintfColor(ILI9341_YELLOW, "Mean=%d RMS=%d\n", sum / n, (int)sqrtf(((float)sumsq) / n));
+        }
       }
     }
 

@@ -84,7 +84,8 @@
       <div style="margin-top: 20px;">
         <h3 style="margin: 5px 0;">Display Velocity Component</h3>
         <button id="axisX" class="stream-btn enabled" onclick="setAxis('X')">vx</button><br>
-        <button id="axisY" class="stream-btn disabled" onclick="setAxis('Y')">vy</button>
+        <button id="axisY" class="stream-btn disabled" onclick="setAxis('Y')">vy</button><br>
+        <button id="axisR" class="stream-btn disabled" onclick="setAxis('R')">vr</button>
       </div>
       <div style="margin-top: 20px;">
         <h3 style="margin: 5px 0;">Touch Calibration</h3>
@@ -188,7 +189,10 @@
         .then(response => response.text())
         .then(result => {
           console.log('Axis set result:', result);
-          updateAxisButtons(axis);
+          // Try to extract axis from backend response, fallback to requested axis
+          let match = result.match(/axis=([A-Z])/i);
+          let axisFromBackend = match ? match[1].toUpperCase() : axis;
+          updateAxisButtons(axisFromBackend);
         })
         .catch(error => {
           console.error('Error setting axis:', error);
@@ -198,6 +202,7 @@
     function updateAxisButtons(currentAxis) {
       document.getElementById('axisX').className = currentAxis === 'X' ? 'stream-btn enabled' : 'stream-btn disabled';
       document.getElementById('axisY').className = currentAxis === 'Y' ? 'stream-btn enabled' : 'stream-btn disabled';
+      document.getElementById('axisR').className = currentAxis === 'R' ? 'stream-btn enabled' : 'stream-btn disabled';
     }
 
     function startCalibration() {

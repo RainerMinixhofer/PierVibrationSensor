@@ -97,6 +97,14 @@ ADS1256 ads(ADS1256_DRDY, ADS1256_SPI_RST, ADS1256_SYNC, ADS1256_SPI_CS, 2.500, 
 #define ICM20948_ADDR 0x69 // AD0 pin high
 Adafruit_ICM20948 icm;
 
+// Ring buffer sensor selection constants
+#define RINGBUFFER_VELOCX_RAW 0
+#define RINGBUFFER_VELOCY_RAW 1
+#define RINGBUFFER_VELOCR_RAW 2
+#define RINGBUFFER_ACCELX_RAW 3
+#define RINGBUFFER_ACCELY_RAW 4
+#define RINGBUFFER_ACCELZ_RAW 5
+
 // Constants for TFT display with ILI9341 driver
 // Hardware pins mapping (Display <-> Raspberry Pi Pico 2 W):
 // SDO(MISO) <-> GP0
@@ -116,9 +124,8 @@ Adafruit_ICM20948 icm;
 #define TFT_ROTATION 1  // Set the default rotation for the display
 #define TFT_TEXT_SIZE 1 // Set the default text size for the display
 
-#define TFT_SPI_PORT spi0      // Using SPI0
-#define TFT_SPI_BPS 10000000   // 20 MHz SPI clock for all devices (TFT, Touch, SD)
-#define TOUCH_SPI_BPS 10000000 // Same speed as TFT for consistent SPI bus performance
+#define TFT_SPI_PORT spi0 // Using SPI0
+#define SPI0_BPS 10000000 // 20 MHz SPI clock for all devices (TFT, Touch, SD)
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 
 // Custom color constants (RGB565 format)
@@ -217,6 +224,15 @@ enum NetworkMode
 };
 NetworkMode netMode = NET_NONE;
 
+/* DSP/FFT Implementation:
+ * - The code supports both fixed-point and floating-point DSP pipelines for FFT and signal processing.
+ * - To enable fixed-point DSP (using CMSIS-DSP q15_t types), define USE_FIXEDPOINT.
+ * - By default, floating-point DSP is used for higher accuracy and easier debugging.
+ * - Fixed-point DSP is more efficient on MCUs without FPU but requires careful scaling and management of numerical ranges.
+ */
+
+// #define USE_FIXEDPOINT // Uncomment to use fixed-point DSP (q15_t), comment out to use floating-point DSP (float)
+
 // ============================================================================
 // GLOBAL VARIABLES
 // ============================================================================
@@ -232,7 +248,7 @@ int NUM_CALIB_POINTS = 5;                                                 // Cha
 volatile bool trigger_touch_calibration = false;                          // Trigger for remote calibration
 
 // --- Touch Event Handling ---
-static volatile bool forceTouchCalibration = false; //Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
+static volatile bool forceTouchCalibration = false; // Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
 static volatile bool touch_event_flag = false;
 static volatile int irq_save = 0;       // Save the IRQ state for touch events
 TS_Point touch_event_point = {0, 0, 0}; // Initialize touch point structure for XPT2046_Touchscreen
@@ -254,7 +270,9 @@ volatile bool udpStreamEnable[5] = {false, false, false, false, false};
 
 // --- Display Mode and State ---
 volatile int mode = 3;         // -1 = off 0 = text 1 = waveform, 2 = fft, 3 = sgram
-volatile int display_axis = 0; // 0 = X axis, 1 = Y axis
+volatile int display_axis = 0; // 0 = X axis, 1 = Y axis, 2 = radial velocity
+// --- Radial velocity calculation ---
+float velocR = 0.0; // Latest radial velocity value in m/s
 bool text_mode_initialized = false;
 bool waveform_initialized = false;
 bool mode23_screen_cleared = false;
@@ -289,6 +307,13 @@ int ring_buffer[RING_BUFFER_SIZE];
 volatile int ring_buffer_tail = 0;
 
 // --- Real-time Crossing Detection ---
+enum CrossingDirection
+{
+  CROSSING_POSITIVE = 0, // Positive-going crossing only
+  CROSSING_NEGATIVE = 1, // Negative-going crossing only
+  CROSSING_BOTH = 2      // Either direction
+};
+
 volatile bool crossing_detected = false;
 volatile unsigned long crossing_time_out = 0; // When signal went outside
 volatile unsigned long crossing_time_in = 0;  // When signal came back inside
@@ -307,35 +332,43 @@ const int FFT_SIZE = 1024;
 // --- Magnitude Spectrum ---
 const int mag_spec_len = 512;
 
+// --- Menu Button Definition ---
+struct MenuButton
+{
+  int x;
+  int y;
+  int w;
+  int h;
+  const char *label;
+  int mode_value;
+  uint16_t color;
+};
+
+/* Define menu buttons for mode selection
+ *
+ * Each button has position (x, y), size (w, h), label text, associated mode value,
+ * and a color for visual distinction.
+ */
+MenuButton menu_buttons[NUM_MENU_BUTTONS] = {
+    {10, 40, 60, 40, "OFF", -1, ILI9341_RED},
+    {10, 90, 60, 40, "TEXT", 0, ILI9341_BLUE},
+    {10, 140, 60, 40, "WAVE", 1, ILI9341_GREEN},
+    {10, 190, 60, 40, "FFT", 2, ILI9341_CYAN},
+    {10, 240, 60, 40, "SGRAM", 3, ILI9341_MAGENTA}};
+
+unsigned long menu_show_time = 0;
+const unsigned long MENU_TIMEOUT_MS = 5000; // Menu auto-hides after 5 seconds
+
 // ============================================================================
-// FUNCTION DECLARATIONS AND INTERRUPT HANDLERS
+// FORWARD DECLARATIONS
 // ============================================================================
 
-// Handler for setting log level via HTTP
-void serveSetLogLevel(Stream &client, const String &req)
-{
-  int levelIdx = req.indexOf("level=");
-  int newLevel = -1;
-  if (levelIdx != -1)
-  {
-    String levelStr = req.substring(levelIdx + 6);
-    // Only take first digit (0-4)
-    int endIdx = 0;
-    while (endIdx < levelStr.length() && isdigit(levelStr.charAt(endIdx)))
-      endIdx++;
-    levelStr = levelStr.substring(0, endIdx);
-    newLevel = levelStr.toInt();
-    if (newLevel >= 0 && newLevel <= 4)
-    {
-      logVerbosity = newLevel;
-    }
-  }
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/plain");
-  client.println("Connection: close");
-  client.println();
-  client.printf("OK logVerbosity=%d\n", logVerbosity);
-}
+void drawMenuIndicator(int scroll_offset = 0);
+void drawModeMenu();
+
+// ============================================================================
+// INTERRUPT HANDLERS
+// ============================================================================
 
 // Interrupt handler for ADS1256 DRDY pin
 void ads1256_drdy_isr(uint gpio, uint32_t events)
@@ -349,34 +382,6 @@ void icm20948_int_isr(uint gpio, uint32_t events)
   icm20948_data_ready = true;
 }
 
-// Forward declarations
-void drawMenuIndicator(int scroll_offset = 0);
-void drawModeMenu();
-
-// Helper functions to get raw touch coordinates (compatible with both libraries)
-
-inline uint16_t getTouchRawX()
-{
-  return touch_event_point.x; // XPT2046_Touchscreen: x is already the raw ADC value
-}
-
-inline uint16_t getTouchRawY()
-{
-  return touch_event_point.y; // XPT2046_Touchscreen: y is already the raw ADC value
-}
-
-// Helper function to set SPI clock speed for display operations
-inline void setDisplaySPISpeed()
-{
-  spi_set_baudrate(TFT_SPI_PORT, TFT_SPI_BPS);
-}
-
-// Helper function to set SPI clock speed for touchscreen operations
-inline void setTouchSPISpeed()
-{
-  spi_set_baudrate(TFT_SPI_PORT, TOUCH_SPI_BPS);
-}
-
 // Interrupt handler for TFT touch controller (XPT2046)
 void touch_irq_isr(uint gpio, uint32_t events)
 {
@@ -386,6 +391,10 @@ void touch_irq_isr(uint gpio, uint32_t events)
   // Reading will be done in main loop after flag is detected
   touch_event_flag = true;
 }
+
+// ============================================================================
+// SD CARD FUNCTIONS
+// ============================================================================
 
 void initSDCard()
 {
@@ -448,6 +457,22 @@ void initSDCard()
   root.close();
   Serial.println("SD card initialized and files listed successfully.");
 }
+
+void disableSDCard()
+{
+  Serial.println("Disabling SD card...");
+  // Set CS of SD card high to disable it
+  if (SD_CS != -1)
+  {
+    gpio_init(SD_CS);
+    gpio_set_dir(SD_CS, GPIO_OUT);
+    gpio_put(SD_CS, 1); // Disable SD card
+  }
+}
+
+// ============================================================================
+// TFT DISPLAY FUNCTIONS
+// ============================================================================
 
 void setBacklight(float brightness)
 {
@@ -576,7 +601,74 @@ void tftPrint(const char *msg, bool resetline = false)
   }
 }
 
-// Logging helpers with verbosity control
+void initTFTDisplay()
+{
+  Serial.println("TFT display driver initialization");
+  // Note: Don't disable touch controller here - let XPT2046_Touchscreen library manage CS pin
+  disableSDCard();
+
+  // Initialize hardware SPI for TFT display
+  spi_init(TFT_SPI_PORT, SPI0_BPS);
+
+  // Configure SPI pins
+  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI); // GP0 - MISO
+  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI); // GP2 - SCK
+  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI); // GP7 - MOSI
+  // Note: CS is handled by the library as a GPIO pin
+
+  Serial.println("Hardware SPI initialized for TFT display:");
+  Serial.printf("SPI Port: spi0, Speed: %d Hz\n", SPI0_BPS);
+  Serial.printf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
+  Serial.printf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RST);
+
+  setBacklight(0.0); // Turn off backlight initially
+  tft.begin();
+  setBacklight(0.25); // Turn on backlight after initialization
+  tft_read_display_id_and_status();
+  tft_read_test();               // Read and print display diagnostics
+  delay(1000);                   // Allow time for display to stabilize
+  tft.setRotation(TFT_ROTATION); // Set the display rotation
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(TFT_TEXT_SIZE);
+  tft.setScrollMargins(0, 0); // Set scroll margins to 0
+  tft.setCursor(0, 0);
+  tftPrint("TFT display driver initialized...\n");
+  tftPrint("---------------------------------------------\n");
+}
+
+// ============================================================================
+// Logging and Debug Output Functions
+// ============================================================================
+
+/*
+Handler for setting log level via HTTP
+*/
+void serveSetLogLevel(Stream &client, const String &req)
+{
+  int levelIdx = req.indexOf("level=");
+  int newLevel = -1;
+  if (levelIdx != -1)
+  {
+    String levelStr = req.substring(levelIdx + 6);
+    // Only take first digit (0-4)
+    int endIdx = 0;
+    while (endIdx < levelStr.length() && isdigit(levelStr.charAt(endIdx)))
+      endIdx++;
+    levelStr = levelStr.substring(0, endIdx);
+    newLevel = levelStr.toInt();
+    if (newLevel >= 0 && newLevel <= 4)
+    {
+      logVerbosity = newLevel;
+    }
+  }
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/plain");
+  client.println("Connection: close");
+  client.println();
+  client.printf("OK logVerbosity=%d\n", logVerbosity);
+}
+
 void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN, int level = LOG_INFO)
 {
   if (logVerbosity < level)
@@ -645,121 +737,9 @@ void debugPrintln(const char *msg, int level = LOG_INFO)
   debugPrint(buffer);
 }
 
-void disableTouchController()
-{
-  Serial.println("Disabling touch controller...");
-  // Set CS of Touch high to disable it
-  if (TOUCH_CS != -1)
-  {
-    gpio_init(TOUCH_CS);
-    gpio_set_dir(TOUCH_CS, GPIO_OUT);
-    gpio_put(TOUCH_CS, 1); // Disable touch controller
-  }
-}
-
-void disableSDCard()
-{
-  Serial.println("Disabling SD card...");
-  // Set CS of SD card high to disable it
-  if (SD_CS != -1)
-  {
-    gpio_init(SD_CS);
-    gpio_set_dir(SD_CS, GPIO_OUT);
-    gpio_put(SD_CS, 1); // Disable SD card
-  }
-}
-
-void resetTFTDisplay()
-{
-  Serial.println("Resetting TFT display...");
-  disableTouchController();
-  disableSDCard();
-  tft.begin();
-  setBacklight(0.25);            // Turn on backlight after initialization
-  tft.setRotation(TFT_ROTATION); // Set the display rotation: 0 means portrait with J4 on top, 1 means landscape with J4 on left clockwise rotated from 0 (default), 2 means portrait with J4 on bottom, 3 means landscape with J4 on right
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setTextSize(TFT_TEXT_SIZE);
-  tft.setScrollMargins(0, 0); // Set scroll margins to 0
-  tft.setCursor(0, 0);
-}
-
-void initTFTDisplay()
-{
-  Serial.println("TFT display driver initialization");
-  // Note: Don't disable touch controller here - let XPT2046_Touchscreen library manage CS pin
-  disableSDCard();
-
-  // Initialize hardware SPI for TFT display
-  spi_init(TFT_SPI_PORT, TFT_SPI_BPS);
-
-  // Configure SPI pins
-  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI); // GP0 - MISO
-  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI); // GP2 - SCK
-  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI); // GP7 - MOSI
-  // Note: CS is handled by the library as a GPIO pin
-
-  Serial.println("Hardware SPI initialized for TFT display");
-  Serial.printf("SPI Port: spi0, Speed: %d Hz\n", TFT_SPI_BPS);
-  Serial.printf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
-  Serial.printf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RST);
-
-  setBacklight(0.0); // Turn off backlight initially
-  tft.begin();
-  setBacklight(0.25); // Turn on backlight after initialization
-  tft_read_display_id_and_status();
-  tft_read_test();               // Read and print display diagnostics
-  delay(1000);                   // Allow time for display to stabilize
-  tft.setRotation(TFT_ROTATION); // Set the display rotation
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setTextSize(TFT_TEXT_SIZE);
-  tft.setScrollMargins(0, 0); // Set scroll margins to 0
-  tft.setCursor(0, 0);
-  tftPrint("TFT display driver initialized...\n");
-  tftPrint("---------------------------------------------\n");
-}
-
-void setupTFTDisplayForSpectrogram()
-{
-  Serial.println("ILI9341 initialization for spectrogram...");
-
-  tft.begin();
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setRotation(1);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setTextSize(1);
-}
-
-void initTouchController()
-{
-  // Optionally calibrate or test touch here
-  tftPrint("Initializing XPT2046 touch controller...\n");
-
-  // Note: XPT2046 shares SPI bus (spi0) with display but requires slower clock (max 2.5 MHz)
-  // SPI speed is dynamically switched before each touchscreen access
-  touchscreen.begin();                   // Uses spi0 which was initialized in initTFTDisplay()
-  touchscreen.setRotation(TFT_ROTATION); // Match TFT rotation if supported
-  // Initialize the IRQ pin for hardware SPI library
-  gpio_init(TOUCH_IRQ);
-  gpio_set_dir(TOUCH_IRQ, GPIO_IN);
-  gpio_pull_up(TOUCH_IRQ); // Enable pull-up resistor
-  // Note: CS pin is managed by the XPT2046_Touchscreen library
-
-  gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, &touch_irq_isr);
-  tftPrint("Touch to continue...\n");
-  // Wait for touch event
-  while (!touch_event_flag)
-  {
-    // Wait for touch event
-    tight_loop_contents();
-  }
-  Serial.printf("Touch event detected!\n");
-  Serial.printf("Touch position: x=%d, y=%d, z=%d\n", touch_event_point.x, touch_event_point.y, touch_event_point.z);
-  touch_event_flag = false; // Reset flag after first touch event
-  tftPrint("Touch controller initialized...\n");
-  tftPrint("---------------------------------------------\n");
-}
+// ============================================================================
+// XPT2046 FUNCTIONS
+// ============================================================================
 
 void drawCalibrationCross(int x, int y, uint16_t color = ILI9341_RED)
 {
@@ -893,7 +873,13 @@ bool calculateMMSECalibration(int numPoints,
   return true;
 }
 
-// Apply MMSE calibration to convert touch coordinates to display coordinates
+/* Apply MMSE calibration to convert touch coordinates to display coordinates
+ *
+ * @param touch_x Raw touch X coordinate from touchscreen
+ * @param touch_y Raw touch Y coordinate from touchscreen
+ * @param display_x Output calibrated display X coordinate
+ * @param display_y Output calibrated display Y coordinate
+ */
 void applyMMSECalibration(uint16_t touch_x, uint16_t touch_y, int &display_x, int &display_y)
 {
   // Apply MMSE calibration matrix directly to raw touch coordinates
@@ -1055,8 +1041,8 @@ void calibrateTouchController()
     drawCalibrationCross(lcd_x[i], lcd_y[i], ILI9341_GREEN); // Draw green cross to indicate touch was registered
 
     // Store raw coordinates without rotation - let MMSE algorithm handle the transformation
-    touch_x[i] = getTouchRawX();
-    touch_y[i] = getTouchRawY();
+    touch_x[i] = touch_event_point.x;
+    touch_y[i] = touch_event_point.y;
 
     Serial.printf("Calibration point %d: Expected LCD(%d,%d) <-> Raw Touch(%d,%d)\n",
                   i, lcd_x[i], lcd_y[i], touch_x[i], touch_y[i]);
@@ -1142,8 +1128,8 @@ void calibrateTouchController()
     }
 
     // Store raw coordinates without rotation - MMSE matrix handles the transformation
-    test_touch_x[i] = getTouchRawX();
-    test_touch_y[i] = getTouchRawY();
+    test_touch_x[i] = touch_event_point.x;
+    test_touch_y[i] = touch_event_point.y;
 
     // Calculate calibration accuracy for this point
     int calibrated_x, calibrated_y;
@@ -1330,7 +1316,13 @@ bool loadTouchCalibration()
   }
 }
 
-// Initialize ADS1256 ADC with SPI1 support
+// ============================================================================
+// ADS1256 FUNCTIONS
+// ============================================================================
+
+/*
+Initialize ADS1256 ADC with SPI1 support
+*/
 void initADS1256()
 {
   tftPrint("Initializing ADC... \n");
@@ -1381,6 +1373,10 @@ float readADS1256_channel(uint8_t channel)
   ads.setMUX(channel << 4 | 0b00001111); // Set the MUX to the specified single-ended channel
   return ads.readSingle();
 }
+
+// ============================================================================
+// ICM20948 FUNCTIONS
+// ============================================================================
 
 uint8_t ICM20948_read_whoami()
 {
@@ -1580,6 +1576,11 @@ void readICM20948()
   //
   //  delayMicroseconds(measurement_delay_us);
 }
+
+// ============================================================================
+// NETWORKING FUNCTIONS
+// ============================================================================
+
 /**
  * @brief Get MAC address for WIZNET (from chip if possible, else fallback).
  * @param mac Pointer to 6-byte array to fill.
@@ -1840,6 +1841,29 @@ bool setTimeFromNTP()
   return true;
 }
 
+/**
+ * @brief Set the local timezone for the system.
+ * @param tz POSIX timezone string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3" for Central Europe
+ */
+void setLocalTimezone(const char *tz)
+{
+  setenv("TZ", tz, 1);
+  tzset();
+}
+
+/** Helper to format MAC address as string
+ * out must be at least 18 bytes to hold the formatted string.
+ */
+void formatMACString(byte *mac, char *out)
+{
+  snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// ============================================================================
+// WEBSERVER FUNCTIONS
+// ============================================================================
+
 void serveChartPage(Stream &client)
 {
   // Open the HTML file from the LittleFS filesystem first
@@ -1942,7 +1966,9 @@ void serveSensorData(Stream &client)
   client.print(",\"mode\":");
   client.print(mode);
   client.print(",\"axis\":\"");
-  client.print(display_axis == 0 ? 'X' : 'Y');
+  char axisChar = (display_axis == 0) ? 'X' : (display_axis == 1) ? 'Y'
+                                                                  : 'R';
+  client.print(axisChar);
   client.print("\"");
   client.print(",\"spectrogramMin\":");
   client.print(spectrogram_min);
@@ -1967,26 +1993,16 @@ void sendSensorUDPStream(const char *channel, const float *data, size_t count)
   }
   snprintf(packet + len, sizeof(packet) - len, "\n");
 
-#if defined(USE_WIFI)
-  if (netMode == NET_WIFI)
+  if (netMode == NET_WIZNET || netMode == NET_WIFI)
   {
     udpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
     udpStream.write((const uint8_t *)packet, strlen(packet));
     udpStream.endPacket();
   }
-#endif
-#if defined(USE_WIZNET)
-  if (netMode == NET_WIZNET)
-  {
-    udpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    udpStream.write((const uint8_t *)packet, strlen(packet));
-    udpStream.endPacket();
-  }
-#endif
 }
 
-// Overloaded for int data
 void sendSensorUDPStream(const char *channel, const int *data, size_t count)
+// Overloaded for int data
 {
   if (count == 0)
     return;
@@ -2002,22 +2018,12 @@ void sendSensorUDPStream(const char *channel, const int *data, size_t count)
   }
   snprintf(packet + len, sizeof(packet) - len, "\n");
 
-#if defined(USE_WIFI)
-  if (netMode == NET_WIFI)
+  if (netMode == NET_WIZNET || netMode == NET_WIFI)
   {
     udpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
     udpStream.write((const uint8_t *)packet, strlen(packet));
     udpStream.endPacket();
   }
-#endif
-#if defined(USE_WIZNET)
-  if (netMode == NET_WIZNET)
-  {
-    udpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    udpStream.write((const uint8_t *)packet, strlen(packet));
-    udpStream.endPacket();
-  }
-#endif
 }
 
 void serveUDPStreamControl(Stream &client, const String &req)
@@ -2114,13 +2120,23 @@ void serveAxisControl(Stream &client, const String &req)
       mode23_screen_cleared = false;
       debugPrintln("Display axis changed to Y");
     }
+    else if (axisStr == "R")
+    {
+      display_axis = 2;
+      text_mode_initialized = false;
+      waveform_initialized = false;
+      mode23_screen_cleared = false;
+      debugPrintln("Display axis changed to R (radial)");
+    }
   }
 
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: text/plain");
   client.println("Connection: close");
   client.println();
-  client.printf("OK axis=%c\n", display_axis == 0 ? 'X' : 'Y');
+  char axisChar = (display_axis == 0) ? 'X' : (display_axis == 1) ? 'Y'
+                                                                  : 'R';
+  client.printf("OK axis=%c\n", axisChar);
 }
 
 void serveTouchCalibrate(Stream &client, const String &req)
@@ -2194,22 +2210,9 @@ void serveTouchCalibData(Stream &client, const String &req)
   }
 }
 
-// Helper to format MAC address as string
-void formatMACString(byte *mac, char *out)
-{
-  snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-/**
- * @brief Set the local timezone for the system.
- * @param tz POSIX timezone string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3" for Central Europe
- */
-void setLocalTimezone(const char *tz)
-{
-  setenv("TZ", tz, 1);
-  tzset();
-}
+// ============================================================================
+// PLOT FUNCTIONS
+// ============================================================================
 
 void setup_waveform()
 {
@@ -2295,8 +2298,17 @@ void waveform_display(short *samples, int n_samples, int color, bool draw_trigge
   int last_old_y = last_y;
 
   // Calculate scale factor so CROSSING_THRESHOLD is at 1/8 from top/bottom
-  // 3*waveform_h/8 = 90 pixels from center should correspond to CROSSING_THRESHOLD
-  const float scale = (3.0f * waveform_h / 8.0f) / CROSSING_THRESHOLD; // ~0.009
+  // For vr (radial), the max value is always positive and can be much higher, so use a different scale
+  float scale;
+  if (display_axis == 2)
+  {
+    // Estimate max expected vr (e.g., sqrt(2) * threshold for two maxed channels)
+    scale = (3.0f * waveform_h / 8.0f) / (CROSSING_THRESHOLD * 1.5f);
+  }
+  else
+  {
+    scale = (3.0f * waveform_h / 8.0f) / CROSSING_THRESHOLD;
+  }
 
   // Calculate trigger level positions for redrawing
   int trigger_offset = 3 * waveform_h / 8;
@@ -2336,58 +2348,47 @@ void waveform_display(short *samples, int n_samples, int color, bool draw_trigge
   drawMenuIndicator();
 }
 
-// ------- spectrogram plot -----------
-
+// ============================================================================
+// FFT FOR SPECTROGRAM PLOT
 // from https://github.com/ArmDeveloperEcosystem/audio-spectrogram-example-for-pico
+// ============================================================================
 
-// import numpy as np
-// import matplotlib as mpl
-//
-// cmap = mpl.colormaps['magma']
-// s = ''
-// for i in range(256):
-//   r, g, b, a = cmap(i / 256, bytes=True)
-//   val565 = ((r & 0xF8) << (11 - 3)) | ((g & 0xFC) << (5 - 2)) | ((b & 0xF8) >> 3)
-//   s += '0x%x, ' % val565
-//   if (i + 1) % 9 == 0:
-//     print(s)
-//     s = ''
-// print(s)
-
-// Magma colormap - compact 16-entry lookup table with linear interpolation (RGB565 format)
-// Replaces 257-line COLOR_MAP array, saves ~500 bytes of code space
-const uint16_t MAGMA_LUT[16] PROGMEM = {
-    0x0000, // 0:   Black
-    0x0823, // 16:  Dark purple
-    0x190e, // 32:  Purple
-    0x2994, // 48:  Deep purple
-    0x423c, // 64:  Purple-red
-    0x5325, // 80:  Red-purple
-    0x6c0d, // 96:  Dark red
-    0x7d35, // 112: Red
-    0x8e7d, // 128: Orange-red
-    0x9fc3, // 144: Orange
-    0xb0c6, // 160: Light orange
-    0xc1c8, // 176: Yellow-orange
-    0xd2c7, // 192: Yellow
-    0xe3e3, // 208: Light yellow
-    0xf4fc, // 224: Pale yellow
-    0xfff7  // 240: White-yellow
-};
-
-// Fast magma colormap lookup with linear interpolation
+/*
+Fast magma colormap lookup with linear interpolation
+*/
 inline uint16_t getMagmaColor(uint8_t value)
 {
+  // Magma colormap - compact 16-entry lookup table with linear interpolation (RGB565 format)
+  // Replaces 257-line COLOR_MAP array, saves ~500 bytes of code space
+  static const uint16_t MAGMA_LUT[16] = {
+      0x0000, // 0:   Black
+      0x0823, // 16:  Dark purple
+      0x190e, // 32:  Purple
+      0x2994, // 48:  Deep purple
+      0x423c, // 64:  Purple-red
+      0x5325, // 80:  Red-purple
+      0x6c0d, // 96:  Dark red
+      0x7d35, // 112: Red
+      0x8e7d, // 128: Orange-red
+      0x9fc3, // 144: Orange
+      0xb0c6, // 160: Light orange
+      0xc1c8, // 176: Yellow-orange
+      0xd2c7, // 192: Yellow
+      0xe3e3, // 208: Light yellow
+      0xf4fc, // 224: Pale yellow
+      0xfff7  // 240: White-yellow
+  };
+
   // Determine which two LUT entries to interpolate between
   uint8_t index = value >> 4;  // Divide by 16 to get LUT index (0-15)
   uint8_t frac = value & 0x0F; // Remainder for interpolation (0-15)
 
   if (index >= 15)
-    return pgm_read_word(&MAGMA_LUT[15]); // Clamp to max
+    return MAGMA_LUT[15]; // Clamp to max
 
-  // Read two adjacent colors from PROGMEM
-  uint16_t c1 = pgm_read_word(&MAGMA_LUT[index]);
-  uint16_t c2 = pgm_read_word(&MAGMA_LUT[index + 1]);
+  // Read two adjacent colors
+  uint16_t c1 = MAGMA_LUT[index];
+  uint16_t c2 = MAGMA_LUT[index + 1];
 
   // Extract RGB565 components
   uint8_t r1 = (c1 >> 11) & 0x1F;
@@ -2406,9 +2407,6 @@ inline uint16_t getMagmaColor(uint8_t value)
   // Pack back to RGB565
   return (r << 11) | (g << 5) | b;
 }
-
-// Forward declaration
-void drawMenuIndicator(int scroll_offset);
 
 void add_display_column(short *values, int n_values)
 {
@@ -2438,7 +2436,6 @@ void add_display_column(short *values, int n_values)
   spectrogram_min = running_min;
   spectrogram_max = running_max;
 
-  // Prevent division by zero
   int range = running_max - running_min;
   if (range < 1)
     range = 1;
@@ -2497,13 +2494,6 @@ void buffer_feed(int sample)
   ring_buffer[ring_buffer_tail++] = sample;
   ring_buffer_tail &= RING_BUFFER_SIZE - 1;
 }
-
-enum CrossingDirection
-{
-  CROSSING_POSITIVE = 0, // Positive-going crossing only
-  CROSSING_NEGATIVE = 1, // Negative-going crossing only
-  CROSSING_BOTH = 2      // Either direction
-};
 
 int find_crossing(int min_size, int threshold, CrossingDirection direction)
 {
@@ -2575,9 +2565,6 @@ void buffer_get_latest(short *buffer, int n_samples, int scalebits)
     from &= RING_BUFFER_SIZE - 1;
   }
 }
-
-// ----- dsp ------
-// #define USE_FIXEDPOINT
 
 #ifdef USE_FIXEDPOINT
 
@@ -2675,29 +2662,17 @@ int magnitude_spectrum(SAMPLE_ *in_buf, SAMPLE_ *out_buf, int len)
   return n_out_points;
 }
 
-// ------- Touch Menu System -------
+// ============================================================================
+// TOUCH MENU SYSTEM
+// ============================================================================
 
-// Menu button definitions
-struct MenuButton
-{
-  int x, y, w, h;
-  const char *label;
-  int mode_value;
-  uint16_t color;
-};
-
-// Define menu buttons for mode selection
-MenuButton menu_buttons[NUM_MENU_BUTTONS] = {
-    {10, 40, 60, 40, "OFF", -1, ILI9341_RED},
-    {10, 90, 60, 40, "TEXT", 0, ILI9341_BLUE},
-    {10, 140, 60, 40, "WAVE", 1, ILI9341_GREEN},
-    {10, 190, 60, 40, "FFT", 2, ILI9341_CYAN},
-    {10, 240, 60, 40, "SGRAM", 3, ILI9341_MAGENTA}};
-
-unsigned long menu_show_time = 0;
-const unsigned long MENU_TIMEOUT_MS = 5000; // Menu auto-hides after 5 seconds
-
-// Draw the mode selection menu
+/**
+ * @brief Draws the mode selection menu on the TFT display.
+ *
+ * This function renders a semi-transparent background, a title, and buttons for each mode option.
+ * The buttons are drawn with their respective colors and labels.
+ * The menu visibility state and show time are updated accordingly.
+ */
 void drawModeMenu()
 {
   // Draw semi-transparent background (simulate with black box)
@@ -2727,8 +2702,15 @@ void drawModeMenu()
   menu_show_time = millis();
 }
 
-// Draw a small menu indicator in the top-left corner
-// scroll_offset: current scroll position to account for scrolling
+/**
+ * @brief Draws a menu indicator ("hamburger" icon) on the TFT display, adjusting for screen rotation and scroll offset.
+ *
+ * This function renders a small menu indicator icon at a position determined by the current scroll offset and
+ * the TFT display's rotation setting. It clears the background area to prevent artifacts from scrolling,
+ * then draws a three-line "hamburger" menu icon with a border.
+ *
+ * @param scroll_offset The current scroll offset, used to position the menu indicator appropriately based on rotation.
+ */
 void drawMenuIndicator(int scroll_offset)
 {
   // Account for different rotation settings
@@ -2767,15 +2749,32 @@ void drawMenuIndicator(int scroll_offset)
   tft.drawRect(x_base, y_base, 16, 16, COLOR_GREY);
 }
 
-// Check if a touch point is within a button
+/**
+ * @brief Checks if the given touch coordinates are within the bounds of a button.
+ *
+ * @param touch_x The x-coordinate of the touch event.
+ * @param touch_y The y-coordinate of the touch event.
+ * @param btn Reference to the MenuButton object to check against.
+ * @return true if the touch is inside the button's area, false otherwise.
+ */
 bool isTouchInButton(int touch_x, int touch_y, MenuButton &btn)
 {
   return (touch_x >= btn.x && touch_x <= (btn.x + btn.w) &&
           touch_y >= btn.y && touch_y <= (btn.y + btn.h));
 }
 
-// Handle touch input for menu and mode selection
-// Returns true if mode was changed
+/**
+ * @brief Handles touchscreen input and manages mode switching via a menu.
+ *
+ * This function polls the touchscreen, applies debouncing, and detects touch events.
+ * If a touch is detected, it checks if the touch is within the menu toggle area or on a menu button.
+ * When a menu button is pressed, it updates the current mode and hides the menu.
+ * The function also manages menu visibility and auto-hides the menu after a timeout.
+ * Debug information is printed based on the log verbosity level.
+ *
+ * @param current_mode Reference to the current mode variable; may be updated if a menu button is pressed.
+ * @return true if the mode was changed by a menu button press, false otherwise.
+ */
 bool handleTouchInput(volatile int &current_mode)
 {
   static unsigned long last_touch_time = 0;
@@ -2796,9 +2795,6 @@ bool handleTouchInput(volatile int &current_mode)
     return false;
   }
 
-  // Get touch input
-  setTouchSPISpeed(); // Set SPI to touchscreen speed before reading
-
   // Check if touchscreen is being touched first
   bool is_touched = touchscreen.touched();
   TS_Point tp;
@@ -2811,8 +2807,6 @@ bool handleTouchInput(volatile int &current_mode)
     // When not touched, still call getPoint() to keep touchscreen active
     tp = touchscreen.getPoint();
   }
-
-  setDisplaySPISpeed(); // Restore SPI to display speed
 
   // Log raw touch data for debugging
   static unsigned long last_debug_time = 0;
@@ -2904,6 +2898,10 @@ bool handleTouchInput(volatile int &current_mode)
   return false;
 }
 
+// ============================================================================
+// SETUP AT START
+// ============================================================================
+
 void setup()
 {
   arduino::String resultStr;
@@ -2963,10 +2961,6 @@ void setup()
     // Reset hardware scrolling to ensure correct coordinate mapping
     tft.scrollTo(0);
 
-    // Set SPI speed to touchscreen speed before initialization
-    Serial.println("Setting SPI speed for touchscreen...");
-    setTouchSPISpeed();
-
     // Initialize touch controller - begin() will handle CS pin setup
     touchscreen.begin();
     touchscreen.setRotation(TFT_ROTATION);
@@ -3014,15 +3008,11 @@ void setup()
   resultStr = "UDP packet size: " + String(UDP_PACKET_SIZE) + "\n";
   tftPrint(resultStr.c_str());
   tftPrint("---------------------------------------------\n");
-  // setupTFTDisplayForSpectrogram();
-  // setup_waveform();
   setup_dsp();
 
   tftPrint("---------------------------------------------\n");
   tftPrint("System initialized.\n");
 
-  // Re-initialize touchscreen after all other peripherals to ensure it's in correct state
-  setTouchSPISpeed();
   touchscreen.begin();
   touchscreen.setRotation(TFT_ROTATION);
   delay(1000); // Wait for chip to stabilize
@@ -3038,12 +3028,9 @@ void setup()
   Serial.println("Main loop started - collecting sensor data");
 }
 
-// Ring buffer sensor selection constants
-#define RINGBUFFER_VELOCX_RAW 0
-#define RINGBUFFER_VELOCY_RAW 1
-#define RINGBUFFER_ACCELX_RAW 2
-#define RINGBUFFER_ACCELY_RAW 3
-#define RINGBUFFER_ACCELZ_RAW 4
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
 
 void loop()
 {
@@ -3086,6 +3073,7 @@ void loop()
   velocYraw_block[block_idx] = adcValue7;
   velocX_block[block_idx] = velocX;
   velocY_block[block_idx] = velocY;
+  velocR = sqrtf(velocX * velocX + velocY * velocY);
   accelX_block[block_idx] = accelData.acceleration.x;
   accelY_block[block_idx] = accelData.acceleration.y;
   accelZ_block[block_idx] = accelData.acceleration.z;
@@ -3104,7 +3092,7 @@ void loop()
   {
     int current_sample = 0;
     // Use display_axis to determine which sensor to feed into ring buffer
-    int sensor_select = (display_axis == 0) ? RINGBUFFER_VELOCX_RAW : RINGBUFFER_VELOCY_RAW;
+    int sensor_select = display_axis;
     switch (sensor_select)
     {
     case RINGBUFFER_VELOCX_RAW:
@@ -3113,6 +3101,10 @@ void loop()
       break;
     case RINGBUFFER_VELOCY_RAW:
       current_sample = adcValue7;
+      buffer_feed(current_sample);
+      break;
+    case RINGBUFFER_VELOCR_RAW:
+      current_sample = (int16_t)sqrtf((float)(adcValue0 * adcValue0 + adcValue7 * adcValue7));
       buffer_feed(current_sample);
       break;
     case RINGBUFFER_ACCELX_RAW:
@@ -3222,69 +3214,14 @@ void loop()
     block_idx = 0;
   }
 
-#if defined(USE_WIZNET)
-  if (netMode == NET_WIZNET)
+  if (netMode == NET_WIZNET || netMode == NET_WIFI)
   {
+#if defined(USE_WIZNET)
     EthernetClient client = server.accept();
-    if (client)
-    {
-      while (client.connected() && !client.available())
-        tight_loop_contents();
-      String req = "";
-      if (client.available())
-      {
-        req = client.readStringUntil('\r');
-        // Consume the rest of the HTTP headers
-        while (client.available())
-        {
-          String line = client.readStringUntil('\n');
-          if (line.length() <= 1)
-            break; // Empty line marks end of headers
-          tight_loop_contents();
-        }
-
-        if (req.indexOf("GET /udpstream") == 0)
-        {
-          serveUDPStreamControl(client, req);
-        }
-        else if (req.indexOf("GET /setmode") == 0)
-        {
-          serveModeControl(client, req);
-        }
-        else if (req.indexOf("GET /setaxis") == 0)
-        {
-          serveAxisControl(client, req);
-        }
-        else if (req.indexOf("GET /touchcalibrate") == 0)
-        {
-          serveTouchCalibrate(client, req);
-        }
-        else if (req.indexOf("GET /touchcalibdata") == 0)
-        {
-          serveTouchCalibData(client, req);
-        }
-        else if (req.indexOf("GET /setloglevel") == 0)
-        {
-          serveSetLogLevel(client, req);
-        }
-        else if (req.indexOf("GET /data") == 0)
-        {
-          serveSensorData(client);
-        }
-        else
-        {
-          serveChartPage(client);
-        }
-      }
-      delay(1);
-      client.stop();
-    }
-  }
 #endif
 #if defined(USE_WIFI)
-  if (netMode == NET_WIFI)
-  {
     WiFiClient client = server.accept();
+#endif
     if (client)
     {
       while (client.connected() && !client.available())
@@ -3339,7 +3276,6 @@ void loop()
       client.stop();
     }
   }
-#endif
 
   // Handle touch input for mode selection menu
   bool mode_changed = handleTouchInput(mode);

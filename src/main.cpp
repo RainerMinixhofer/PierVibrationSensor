@@ -8,8 +8,8 @@
  * - SPI clock speed is dynamically switched before each touchscreen access
  */
 
-// #define USE_WIFI // comment out to disable WiFi support
-#define USE_WIZNET // comment out to disable WIZNET5K support
+#define USE_WIFI // comment out to disable WiFi support
+// #define USE_WIZNET // comment out to disable WIZNET5K support
 // #define WAIT_FOR_TOUCH // comment out to disable waiting for touch input
 #define USE_HARDWARE_SPI // comment out to use software SPI for TFT display
 
@@ -392,23 +392,68 @@ void touch_irq_isr(uint gpio, uint32_t events)
   touch_event_flag = true;
 }
 
+#ifdef DEBUG_BUILD
+inline void debugSerialPrint(const char* msg) { Serial.print(msg); }
+inline void debugSerialPrint(int val) { Serial.print(val); }
+inline void debugSerialPrint(unsigned int val) { Serial.print(val); }
+inline void debugSerialPrint(long val) { Serial.print(val); }
+inline void debugSerialPrint(unsigned long val) { Serial.print(val); }
+inline void debugSerialPrint(float val) { Serial.print(val); }
+inline void debugSerialPrint(double val) { Serial.print(val); }
+inline void debugSerialPrint(char val) { Serial.print(val); }
+inline void debugSerialPrintln() { Serial.println(); }
+inline void debugSerialPrintln(const char* msg) { Serial.println(msg); }
+inline void debugSerialPrintln(int val) { Serial.println(val); }
+inline void debugSerialPrintln(unsigned int val) { Serial.println(val); }
+inline void debugSerialPrintln(long val) { Serial.println(val); }
+inline void debugSerialPrintln(unsigned long val) { Serial.println(val); }
+inline void debugSerialPrintln(float val) { Serial.println(val); }
+inline void debugSerialPrintln(double val) { Serial.println(val); }
+inline void debugSerialPrintln(char val) { Serial.println(val); }
+inline void debugSerialPrintf(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    Serial.printf(fmt, args);
+    va_end(args);
+}
+#else
+inline void debugSerialPrint(const char*) {}
+inline void debugSerialPrint(int) {}
+inline void debugSerialPrint(unsigned int) {}
+inline void debugSerialPrint(long) {}
+inline void debugSerialPrint(unsigned long) {}
+inline void debugSerialPrint(float) {}
+inline void debugSerialPrint(double) {}
+inline void debugSerialPrint(char) {}
+inline void debugSerialPrintln() {}
+inline void debugSerialPrintln(const char*) {}
+inline void debugSerialPrintln(int) {}
+inline void debugSerialPrintln(unsigned int) {}
+inline void debugSerialPrintln(long) {}
+inline void debugSerialPrintln(unsigned long) {}
+inline void debugSerialPrintln(float) {}
+inline void debugSerialPrintln(double) {}
+inline void debugSerialPrintln(char) {}
+inline void debugSerialPrintf(const char*, ...) {}
+#endif
+
+
 // ============================================================================
 // SD CARD FUNCTIONS
 // ============================================================================
 
 void initSDCard()
 {
-  Serial.println("Initializing SD card...");
+  debugSerialPrint("Initializing SD card...");
 
   // Initialize LittleFS
   if (!LittleFS.begin())
   {
-    Serial.println("Failed to mount LittleFS!");
+    debugSerialPrint("Failed to mount LittleFS!");
     return;
   }
-  Serial.println("LittleFS mounted successfully.");
-
-  Serial.println("Using hardware SPI for SD card");
+  debugSerialPrint("LittleFS mounted successfully.");
+  debugSerialPrint("Using hardware SPI for SD card");
   spi_init(SD_SPI_PORT, SD_SPI_BPS);
   gpio_set_function(SD_SCK, GPIO_FUNC_SPI);
   gpio_set_function(SD_MOSI, GPIO_FUNC_SPI);
@@ -422,45 +467,45 @@ void initSDCard()
   // Initialize SD card
   if (!sd.begin(SD_CONFIG))
   {
-    Serial.println("SD card initialization failed!");
+    debugSerialPrint("SD card initialization failed!");
     return;
   }
-  Serial.println("SD card initialized successfully.");
+  debugSerialPrint("SD card initialized successfully.");
 
   // Check if the root directory exists
   if (!sd.exists("/"))
   {
-    Serial.println("Root directory does not exist, creating...");
+    debugSerialPrint("Root directory does not exist, creating...");
     if (!sd.mkdir("/"))
     {
-      Serial.println("Failed to create root directory!");
+      debugSerialPrint("Failed to create root directory!");
       return;
     }
   }
-  Serial.println("Root directory exists.");
+  debugSerialPrint("Root directory exists.");
   // List files in the root directory
   FsFile root = sd.open("/");
   if (!root)
   {
-    Serial.println("Failed to open root directory!");
+    debugSerialPrint("Failed to open root directory!");
     return;
   }
-  Serial.println("Listing files in root directory:");
+  debugSerialPrint("Listing files in root directory:");
   FsFile file = root.openNextFile();
   while (file)
   {
     char fname[64] = {0};
     file.getName(fname, sizeof(fname));
-    Serial.printf("File: %s, Size: %d bytes\n", fname, file.fileSize());
+    debugSerialPrintf("File: %s, Size: %d bytes\n", fname, file.fileSize());
     file = root.openNextFile();
   }
   root.close();
-  Serial.println("SD card initialized and files listed successfully.");
+  debugSerialPrint("SD card initialized and files listed successfully.");
 }
 
 void disableSDCard()
 {
-  Serial.println("Disabling SD card...");
+  debugSerialPrint("Disabling SD card...");
   // Set CS of SD card high to disable it
   if (SD_CS != -1)
   {
@@ -517,7 +562,7 @@ void tft_read_display_id_and_status()
   uint8_t id3 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDID, 2); // ID3 Status Register
 
   // print the IDs for debug
-  Serial.printf("ILI9341 ID bytes: 0x%02X 0x%02X 0x%02X\n", id1, id2, id3);
+  debugSerialPrintf("ILI9341 ID bytes: 0x%02X 0x%02X 0x%02X\n", id1, id2, id3);
 
   tft.begin();
 
@@ -526,30 +571,30 @@ void tft_read_display_id_and_status()
   uint8_t stat3 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 2); // #4 D[10:8] status bits
   uint8_t stat4 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 3); // #5 D[7:5] status bits
   // print the IDs for debug
-  Serial.printf("ILI9341 Status bytes: 0x%02X 0x%02X 0x%02X 0x%02X\n", stat1, stat2, stat3, stat4);
+  debugSerialPrintf("ILI9341 Status bytes: 0x%02X 0x%02X 0x%02X 0x%02X\n", stat1, stat2, stat3, stat4);
 }
 
 void tft_read_test()
 {
   // read diagnostics (optional but can help debug problems)
   uint8_t x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDMODE);
-  Serial.printf("Display Power Mode: 0x%02X\n", x);
+  debugSerialPrintf("Display Power Mode: 0x%02X\n", x);
   x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDMADCTL);
-  Serial.printf("MADCTL Mode: 0x%02X\n", x);
+  debugSerialPrintf("MADCTL Mode: 0x%02X\n", x);
   x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDPIXFMT);
-  Serial.printf("Pixel Format: 0x%02X\n", x);
+  debugSerialPrintf("Pixel Format: 0x%02X\n", x);
   x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDIMGFMT);
-  Serial.printf("Image Format: 0x%02X\n", x);
+  debugSerialPrintf("Image Format: 0x%02X\n", x);
   x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDSELFDIAG);
-  Serial.printf("Self Diagnostic: 0x%02X\n", x);
+  debugSerialPrintf("Self Diagnostic: 0x%02X\n", x);
   x = tft.readcommand8(ILI9341_GMCTRN1, 13);
-  Serial.printf("Gamma Control Byte: 0x%02X\n", x);
+  debugSerialPrintf("Gamma Control Byte: 0x%02X\n", x);
 }
 
 void tftPrint(const char *msg, bool resetline = false)
 {
   // Print debug messages to Serial
-  Serial.print(msg);
+  debugSerialPrint(msg);
 
   static int tft_line = 0;
   static const int font_height = 8 * TFT_TEXT_SIZE;
@@ -603,7 +648,7 @@ void tftPrint(const char *msg, bool resetline = false)
 
 void initTFTDisplay()
 {
-  Serial.println("TFT display driver initialization");
+  debugSerialPrintln("TFT display driver initialization");
   // Note: Don't disable touch controller here - let XPT2046_Touchscreen library manage CS pin
   disableSDCard();
 
@@ -616,10 +661,10 @@ void initTFTDisplay()
   gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI); // GP7 - MOSI
   // Note: CS is handled by the library as a GPIO pin
 
-  Serial.println("Hardware SPI initialized for TFT display:");
-  Serial.printf("SPI Port: spi0, Speed: %d Hz\n", SPI0_BPS);
-  Serial.printf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
-  Serial.printf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RST);
+  debugSerialPrintln("Hardware SPI initialized for TFT display:");
+  debugSerialPrintf("SPI Port: spi0, Speed: %d Hz\n", SPI0_BPS);
+  debugSerialPrintf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
+  debugSerialPrintf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RST);
 
   setBacklight(0.0); // Turn off backlight initially
   tft.begin();
@@ -673,7 +718,7 @@ void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN, int level = LOG
 {
   if (logVerbosity < level)
     return;
-  Serial.print(msg);
+  debugSerialPrint(msg);
   if (mode == 0 && text_mode_initialized)
   {
     static int tft_line = 3;
@@ -774,7 +819,7 @@ bool calculateMMSECalibration(int numPoints,
 {
   if (numPoints < 3)
   {
-    Serial.println("Error: Need at least 3 calibration points");
+    debugSerialPrintln("Error: Need at least 3 calibration points");
     return false;
   }
 
@@ -837,7 +882,7 @@ bool calculateMMSECalibration(int numPoints,
 
   if (fabs(det) < 0.001f)
   {
-    Serial.println("Error: Singular matrix - calibration points may be collinear");
+    debugSerialPrintln("Error: Singular matrix - calibration points may be collinear");
     return false;
   }
 
@@ -866,9 +911,9 @@ bool calculateMMSECalibration(int numPoints,
   float det_f = b[0] * (a[2] * d[1] - a[1] * d[2]) + b[1] * (a[0] * d[2] - a[2] * d[0]) + b[2] * (a[1] * d[0] - a[0] * d[1]);
   matrix.F = det_f / det;
 
-  Serial.println("MMSE Calibration Matrix:");
-  Serial.printf("A=%.6f, B=%.6f, C=%.6f\n", matrix.A, matrix.B, matrix.C);
-  Serial.printf("D=%.6f, E=%.6f, F=%.6f\n", matrix.D, matrix.E, matrix.F);
+  debugSerialPrintln("MMSE Calibration Matrix:");
+  debugSerialPrintf("A=%.6f, B=%.6f, C=%.6f\n", matrix.A, matrix.B, matrix.C);
+  debugSerialPrintf("D=%.6f, E=%.6f, F=%.6f\n", matrix.D, matrix.E, matrix.F);
 
   return true;
 }
@@ -1013,7 +1058,7 @@ void calibrateTouchController()
     tft.printf("Touch cross %d/%d", i + 1, numPoints);
     drawCalibrationCross(lcd_x[i], lcd_y[i]);
 
-    Serial.printf("Waiting for touch at point %d...\n", i + 1);
+    debugSerialPrintf("Waiting for touch at point %d...\n", i + 1);
     bool touch_detected = false;
 
     while (!touch_detected)
@@ -1024,7 +1069,7 @@ void calibrateTouchController()
         if (touch_event_point.z > 0)
         {
           touch_detected = true;
-          Serial.printf("Touch detected: x=%d, y=%d, z=%d\n",
+          debugSerialPrintf("Touch detected: x=%d, y=%d, z=%d\n",
                         touch_event_point.x, touch_event_point.y, touch_event_point.z);
         }
       }
@@ -1044,7 +1089,7 @@ void calibrateTouchController()
     touch_x[i] = touch_event_point.x;
     touch_y[i] = touch_event_point.y;
 
-    Serial.printf("Calibration point %d: Expected LCD(%d,%d) <-> Raw Touch(%d,%d)\n",
+    debugSerialPrintf("Calibration point %d: Expected LCD(%d,%d) <-> Raw Touch(%d,%d)\n",
                   i, lcd_x[i], lcd_y[i], touch_x[i], touch_y[i]);
     tft.fillScreen(ILI9341_BLACK);
   }
@@ -1071,11 +1116,11 @@ void calibrateTouchController()
       f.printf("%d,%d,%d,%d\n", lcd_x[i], lcd_y[i], touch_x[i], touch_y[i]);
     }
     f.close();
-    Serial.println("MMSE calibration matrix saved to /touch_calib.txt");
+    debugSerialPrintln("MMSE calibration matrix saved to /touch_calib.txt");
   }
   else
   {
-    Serial.println("Failed to save touch calibration!");
+    debugSerialPrintln("Failed to save touch calibration!");
   }
 
   // Verify calibration accuracy with 3 test points
@@ -1158,9 +1203,9 @@ void calibrateTouchController()
   float total_error = 0.0f;
   float max_error = 0.0f;
 
-  Serial.println("\nCalibration Verification Results:");
-  Serial.println("Point | Expected (X,Y) | Raw Touch (X,Y) | Calibrated (X,Y) | Error (pixels)");
-  Serial.println("------|----------------|-----------------|------------------|---------------");
+  debugSerialPrintln("\nCalibration Verification Results:");
+  debugSerialPrintln("Point | Expected (X,Y) | Raw Touch (X,Y) | Calibrated (X,Y) | Error (pixels)");
+  debugSerialPrintln("------|----------------|-----------------|------------------|---------------");
 
   for (int i = 0; i < numTestPoints; ++i)
   {
@@ -1176,7 +1221,7 @@ void calibrateTouchController()
     float error_y = calibrated_y - test_lcd_y[i];
     float error = sqrtf(error_x * error_x + error_y * error_y);
 
-    Serial.printf("  %d   | (%3d, %3d)     | (%4d, %4d)    | (%4d, %4d)      | %.2f\n",
+    debugSerialPrintf("  %d   | (%3d, %3d)     | (%4d, %4d)    | (%4d, %4d)      | %.2f\n",
                   i + 1, test_lcd_x[i], test_lcd_y[i],
                   test_touch_x[i], test_touch_y[i],
                   calibrated_x, calibrated_y, error);
@@ -1188,9 +1233,9 @@ void calibrateTouchController()
 
   float avg_error = total_error / numTestPoints;
 
-  Serial.println("------|----------------|------------------|---------------");
-  Serial.printf("Average error: %.2f pixels\n", avg_error);
-  Serial.printf("Maximum error: %.2f pixels\n", max_error);
+  debugSerialPrintln("------|----------------|------------------|---------------");
+  debugSerialPrintf("Average error: %.2f pixels\n", avg_error);
+  debugSerialPrintf("Maximum error: %.2f pixels\n", max_error);
 
   // Display results on screen
   tft.fillScreen(ILI9341_BLACK);
@@ -1230,7 +1275,7 @@ bool loadTouchCalibration()
   File f = LittleFS.open("/touch_calib.txt", "r");
   if (!f)
   {
-    Serial.println("No touch calibration file found.");
+    debugSerialPrintln("No touch calibration file found.");
     return false;
   }
 
@@ -1248,20 +1293,20 @@ bool loadTouchCalibration()
     if (sscanf(line1.c_str(), "%f,%f,%f", &mmseCalibMatrix.A, &mmseCalibMatrix.B, &mmseCalibMatrix.C) != 3 ||
         sscanf(line2.c_str(), "%f,%f,%f", &mmseCalibMatrix.D, &mmseCalibMatrix.E, &mmseCalibMatrix.F) != 3)
     {
-      Serial.println("Invalid MMSE calibration file format.");
+      debugSerialPrintln("Invalid MMSE calibration file format.");
       LittleFS.remove("/touch_calib.txt");
       return false;
     }
 
-    Serial.println("MMSE calibration matrix loaded:");
-    Serial.printf("A=%.6f, B=%.6f, C=%.6f\n", mmseCalibMatrix.A, mmseCalibMatrix.B, mmseCalibMatrix.C);
-    Serial.printf("D=%.6f, E=%.6f, F=%.6f\n", mmseCalibMatrix.D, mmseCalibMatrix.E, mmseCalibMatrix.F);
+    debugSerialPrintln("MMSE calibration matrix loaded:");
+    debugSerialPrintf("A=%.6f, B=%.6f, C=%.6f\n", mmseCalibMatrix.A, mmseCalibMatrix.B, mmseCalibMatrix.C);
+    debugSerialPrintf("D=%.6f, E=%.6f, F=%.6f\n", mmseCalibMatrix.D, mmseCalibMatrix.E, mmseCalibMatrix.F);
     return true;
   }
   else
   {
     // Legacy 3-point calibration - try to convert
-    Serial.println("Found legacy 3-point calibration, converting to MMSE...");
+    debugSerialPrintln("Found legacy 3-point calibration, converting to MMSE...");
     f.close();
     f = LittleFS.open("/touch_calib.txt", "r");
 
@@ -1287,7 +1332,7 @@ bool loadTouchCalibration()
 
     if (!valid)
     {
-      Serial.println("Invalid legacy calibration file.");
+      debugSerialPrintln("Invalid legacy calibration file.");
       LittleFS.remove("/touch_calib.txt");
       return false;
     }
@@ -1295,7 +1340,7 @@ bool loadTouchCalibration()
     // Convert 3-point to MMSE matrix
     if (calculateMMSECalibration(3, lcd_x, lcd_y, touch_x, touch_y, mmseCalibMatrix))
     {
-      Serial.println("Successfully converted to MMSE calibration.");
+      debugSerialPrintln("Successfully converted to MMSE calibration.");
       // Save as MMSE format
       File fw = LittleFS.open("/touch_calib.txt", "w");
       if (fw)
@@ -1309,7 +1354,7 @@ bool loadTouchCalibration()
     }
     else
     {
-      Serial.println("Failed to convert legacy calibration.");
+      debugSerialPrintln("Failed to convert legacy calibration.");
       LittleFS.remove("/touch_calib.txt");
       return false;
     }
@@ -1339,17 +1384,17 @@ void initADS1256()
   ads.InitializeADC();
 
   // Set a PGA value
-  Serial.println("Setting PGA to 1... ");
+  debugSerialPrintln("Setting PGA to 1... ");
   ads.setPGA(PGA_1); // 0b00000000 - DEC: 0
   //--------------------------------------------
 
   // Set initial input channel
-  Serial.println("Setting MUX to single-ended channel 0... ");
+  debugSerialPrintln("Setting MUX to single-ended channel 0... ");
   ads.setMUX(SING_0); // 0b00001111 - DEC: 15
   //--------------------------------------------
 
   // Set DRATE
-  Serial.println("Setting DRATE to 500 SPS... ");
+  debugSerialPrintln("Setting DRATE to 500 SPS... ");
   ads.setDRATE(ADS1256_DRATE);
   //--------------------------------------------
 
@@ -1554,25 +1599,25 @@ void readICM20948()
 
   // delay(100); // Removed to allow full speed sampling
 
-  //  Serial.print(temp.temperature);
+  //  debugSerialPrint(temp.temperature);
   //
-  //  Serial.print(",");
+  //  debugSerialPrint(",");
   //
-  //  Serial.print(accel.acceleration.x);
-  //  Serial.print(","); Serial.print(accel.acceleration.y);
-  //  Serial.print(","); Serial.print(accel.acceleration.z);
+  //  debugSerialPrint(accel.acceleration.x);
+  //  debugSerialPrint(","); debugSerialPrint(accel.acceleration.y);
+  //  debugSerialPrint(","); debugSerialPrint(accel.acceleration.z);
   //
-  //  Serial.print(",");
-  //  Serial.print(gyro.gyro.x);
-  //  Serial.print(","); Serial.print(gyro.gyro.y);
-  //  Serial.print(","); Serial.print(gyro.gyro.z);
+  //  debugSerialPrint(",");
+  //  debugSerialPrint(gyro.gyro.x);
+  //  debugSerialPrint(","); debugSerialPrint(gyro.gyro.y);
+  //  debugSerialPrint(","); debugSerialPrint(gyro.gyro.z);
   //
-  //  Serial.print(",");
-  //  Serial.print(mag.magnetic.x);
-  //  Serial.print(","); Serial.print(mag.magnetic.y);
-  //  Serial.print(","); Serial.print(mag.magnetic.z);
+  //  debugSerialPrint(",");
+  //  debugSerialPrint(mag.magnetic.x);
+  //  debugSerialPrint(","); debugSerialPrint(mag.magnetic.y);
+  //  debugSerialPrint(","); debugSerialPrint(mag.magnetic.z);
 
-  //  Serial.println();
+  //  debugSerialPrintln();
   //
   //  delayMicroseconds(measurement_delay_us);
 }
@@ -1653,7 +1698,7 @@ void initWiFi()
 {
   if (!loadWiFiCredentials())
   {
-    Serial.println("Failed to load WiFi credentials from /wifi.txt");
+    debugSerialPrintln("Failed to load WiFi credentials from /wifi.txt");
     netMode = NET_NONE;
     return;
   }
@@ -1661,31 +1706,31 @@ void initWiFi()
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, wifi_password);
 
-  Serial.print("Connecting to WiFi");
+  debugSerialPrint("Connecting to WiFi");
   int retry = 0;
   while (WiFi.status() != WL_CONNECTED && retry < 30)
   {
     sleep_ms(500);
-    Serial.print(".");
+    debugSerialPrint(".");
     retry++;
   }
-  Serial.print("\n");
+  debugSerialPrint("\n");
 
   if (WiFi.status() == WL_CONNECTED)
   {
     byte mac[6];
     getWiFiMAC(mac);
-    Serial.printf("WiFi MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+    debugSerialPrintf("WiFi MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    debugSerialPrintf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
     server.begin();
     netMode = NET_WIFI;
   }
   else
   {
-    Serial.print("WiFi connection failed.\n");
+    debugSerialPrint("WiFi connection failed.\n");
     netMode = NET_NONE;
   }
-  Serial.print("WiFi initialized...\n");
+  debugSerialPrint("WiFi initialized...\n");
 }
 #endif
 
@@ -1713,7 +1758,7 @@ void wiznet5k_reset()
 void wiznet5k_int_isr(uint gpio, uint32_t events)
 {
   // Example: Print or set a flag (implement as needed)
-  Serial.printf("WIZNET5K interrupt detected on GPIO %d\n", gpio);
+  debugSerialPrintf("WIZNET5K interrupt detected on GPIO %d\n", gpio);
   // Optionally: set a volatile flag for main loop processing
 }
 
@@ -1789,9 +1834,9 @@ bool setTimeFromNTP()
     }
     delay(10);
   }
+  char resultStr[64];
 #elif defined(USE_WIZNET)
   EthernetUDP ethUdp;
-  char resultStr[64];
   ethUdp.begin(2390);
   ethUdp.beginPacket(ntpServerIP, NTP_PORT);
   ethUdp.write(ntp_packet, sizeof(ntp_packet));
@@ -1811,7 +1856,7 @@ bool setTimeFromNTP()
     delay(10);
   }
 #else
-  Serial.print("NTP requires either WiFi or WIZNET enabled.\n");
+  debugSerialPrint("NTP requires either WiFi or WIZNET enabled.\n");
   return false;
 #endif
 
@@ -2189,19 +2234,21 @@ void serveTouchCalibData(Stream &client, const String &req)
     client.println("\n=== End of file ===");
     f.close();
 
-    // Also print to serial
+    // Also print to serial if in debug mode
+#ifdef DEBUG_BUILD
     debugPrintln("Touch calibration data requested via HTTP");
     f = LittleFS.open("/touch_calib.txt", "r");
     if (f)
     {
-      Serial.println("\n=== touch_calib.txt content ===");
+      debugSerialPrintln("\n=== touch_calib.txt content ===");
       while (f.available())
       {
         Serial.write(f.read());
       }
-      Serial.println("\n=== End of file ===");
+      debugSerialPrintln("\n=== End of file ===");
       f.close();
     }
+#endif
   }
   else
   {
@@ -2505,10 +2552,10 @@ int find_crossing(int min_size, int threshold, CrossingDirection direction)
     static unsigned long last_warn = 0;
     if (millis() - last_warn > 2000)
     {
-      Serial.print("find_crossing: Not enough samples yet. tail=");
-      Serial.print(tail);
-      Serial.print(", need at least ");
-      Serial.println(min_size + 1);
+      debugSerialPrint("find_crossing: Not enough samples yet. tail=");
+      debugSerialPrint(tail);
+      debugSerialPrint(", need at least ");
+      debugSerialPrintln(min_size + 1);
       last_warn = millis();
     }
     return 0; // Not enough data yet
@@ -2905,37 +2952,41 @@ bool handleTouchInput(volatile int &current_mode)
 void setup()
 {
   arduino::String resultStr;
-
+// only wait for Serial in debug builds
+#ifdef DEBUG_BUILD
   Serial.begin(115200);
   while (!Serial)
   {
     delay(10);
   }
   sleep_ms(1000);
+#endif
   initTFTDisplay(); // Initialize TFT display early to show debug messages
   tftPrint("Starting Pier Vibration Sensor...\n");
   LittleFS.begin(); // Initialize LittleFS filesystem
   tftPrint("Filesystem initialized...\n");
 
+#ifdef DEBUG_BUILD
   if (logVerbosity >= LOG_DEBUG)
   {
     // Print touch calibration file content to serial for backup
     File f = LittleFS.open("/touch_calib.txt", "r");
     if (f)
     {
-      Serial.println("\n=== touch_calib.txt content ===");
+      debugSerialPrintln("\n=== touch_calib.txt content ===");
       while (f.available())
       {
         Serial.write(f.read());
       }
-      Serial.println("\n=== End of file ===");
+      debugSerialPrintln("\n=== End of file ===");
       f.close();
     }
     else
     {
-      Serial.println("touch_calib.txt not found!");
+      debugSerialPrintln("touch_calib.txt not found!");
     }
   }
+#endif
   tftPrint("---------------------------------------------\n");
   tftPrint("Initializing XPT2046 touch controller...\n");
   tftPrint("Start touch controller calibration...\n");
@@ -2953,7 +3004,7 @@ void setup()
   {
     tftPrint("Touch calibration loaded from /touch_calib.txt...\n");
     // Initialize touchscreen the same way as calibrateTouchController() does
-    Serial.println("Initializing touchscreen with loaded calibration...");
+    debugSerialPrintln("Initializing touchscreen with loaded calibration...");
 
     // Set display rotation
     tft.setRotation(TFT_ROTATION);
@@ -3001,7 +3052,11 @@ void setup()
 
   server.begin();
   tftPrint("HTTP server started...\n");
+#if defined(USE_WIFI)
+  resultStr = "Serving chart page at http://" + WiFi.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
+#elif defined(USE_WIZNET) {
   resultStr = "Serving chart page at http://" + Ethernet.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
+#endif
   tftPrint(resultStr.c_str());
   resultStr = "UDP stream port: " + String(UDP_STREAM_PORT) + "\n";
   tftPrint(resultStr.c_str());
@@ -3025,7 +3080,7 @@ void setup()
   }
 
   tftPrint("Starting Main Loop...\n");
-  Serial.println("Main loop started - collecting sensor data");
+  debugSerialPrintln("Main loop started - collecting sensor data");
 }
 
 // ============================================================================
@@ -3188,27 +3243,27 @@ void loop()
   {
     if (udpStreamEnable[0])
     {
-      Serial.printf("Sending UDP stream for velocXraw, count: %d\n", UDP_PACKET_SIZE);
+      debugSerialPrintf("Sending UDP stream for velocXraw, count: %d\n", UDP_PACKET_SIZE);
       sendSensorUDPStream("velocX", velocXraw_block, UDP_PACKET_SIZE);
     }
     if (udpStreamEnable[1])
     {
-      Serial.printf("Sending UDP stream for velocYraw, count: %d\n", UDP_PACKET_SIZE);
+      debugSerialPrintf("Sending UDP stream for velocYraw, count: %d\n", UDP_PACKET_SIZE);
       sendSensorUDPStream("velocY", velocYraw_block, UDP_PACKET_SIZE);
     }
     if (udpStreamEnable[2])
     {
-      Serial.printf("Sending UDP stream for accelX, count: %d\n", UDP_PACKET_SIZE);
+      debugSerialPrintf("Sending UDP stream for accelX, count: %d\n", UDP_PACKET_SIZE);
       sendSensorUDPStream("accelX", accelX_block, UDP_PACKET_SIZE);
     }
     if (udpStreamEnable[3])
     {
-      Serial.printf("Sending UDP stream for accelY, count: %d\n", UDP_PACKET_SIZE);
+      debugSerialPrintf("Sending UDP stream for accelY, count: %d\n", UDP_PACKET_SIZE);
       sendSensorUDPStream("accelY", accelY_block, UDP_PACKET_SIZE);
     }
     if (udpStreamEnable[4])
     {
-      Serial.printf("Sending UDP stream for accelZ, count: %d\n", UDP_PACKET_SIZE);
+      debugSerialPrintf("Sending UDP stream for accelZ, count: %d\n", UDP_PACKET_SIZE);
       sendSensorUDPStream("accelZ", accelZ_block, UDP_PACKET_SIZE);
     }
     block_idx = 0;

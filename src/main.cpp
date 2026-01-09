@@ -8,8 +8,9 @@
  * - SPI clock speed is dynamically switched before each touchscreen access
  */
 
-#define USE_WIFI // comment out to disable WiFi support
-// #define USE_WIZNET // comment out to disable WIZNET5K support
+// TODO check why USE_WIFI does not work correctly
+// #define USE_WIFI // comment out to disable WiFi support
+#define USE_WIZNET // comment out to disable WIZNET5K support
 // #define WAIT_FOR_TOUCH // comment out to disable waiting for touch input
 #define USE_HARDWARE_SPI // comment out to use software SPI for TFT display
 
@@ -280,6 +281,8 @@ bool mode23_screen_cleared = false;
 // --- Menu State ---
 const int NUM_MENU_BUTTONS = 5;
 bool menu_visible = false;
+int saved_scroll_offset = 0;     // Remember current scroll offset while menu is shown
+bool text_block_refresh = false; // Request to clear and overwrite text output block
 
 // --- Sample Tracking ---
 int total_samples = 0;
@@ -350,14 +353,14 @@ struct MenuButton
  * and a color for visual distinction.
  */
 MenuButton menu_buttons[NUM_MENU_BUTTONS] = {
-    {10, 40, 60, 40, "OFF", -1, ILI9341_RED},
-    {10, 90, 60, 40, "TEXT", 0, ILI9341_BLUE},
-    {10, 140, 60, 40, "WAVE", 1, ILI9341_GREEN},
-    {10, 190, 60, 40, "FFT", 2, ILI9341_CYAN},
-    {10, 240, 60, 40, "SGRAM", 3, ILI9341_MAGENTA}};
+    {10, 30, 60, 32, "OFF", -1, ILI9341_RED},
+    {10, 66, 60, 32, "TEXT", 0, ILI9341_BLUE},
+    {10, 102, 60, 32, "WAVE", 1, ILI9341_GREEN},
+    {10, 138, 60, 32, "FFT", 2, ILI9341_CYAN},
+    {10, 174, 60, 32, "SGRAM", 3, ILI9341_MAGENTA}};
 
 unsigned long menu_show_time = 0;
-const unsigned long MENU_TIMEOUT_MS = 5000; // Menu auto-hides after 5 seconds
+const unsigned long MENU_TIMEOUT_MS = 15000; // Menu auto-hides after 15 seconds
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -393,7 +396,7 @@ void touch_irq_isr(uint gpio, uint32_t events)
 }
 
 #ifdef DEBUG_BUILD
-inline void debugSerialPrint(const char* msg) { Serial.print(msg); }
+inline void debugSerialPrint(const char *msg) { Serial.print(msg); }
 inline void debugSerialPrint(int val) { Serial.print(val); }
 inline void debugSerialPrint(unsigned int val) { Serial.print(val); }
 inline void debugSerialPrint(long val) { Serial.print(val); }
@@ -402,7 +405,7 @@ inline void debugSerialPrint(float val) { Serial.print(val); }
 inline void debugSerialPrint(double val) { Serial.print(val); }
 inline void debugSerialPrint(char val) { Serial.print(val); }
 inline void debugSerialPrintln() { Serial.println(); }
-inline void debugSerialPrintln(const char* msg) { Serial.println(msg); }
+inline void debugSerialPrintln(const char *msg) { Serial.println(msg); }
 inline void debugSerialPrintln(int val) { Serial.println(val); }
 inline void debugSerialPrintln(unsigned int val) { Serial.println(val); }
 inline void debugSerialPrintln(long val) { Serial.println(val); }
@@ -410,14 +413,15 @@ inline void debugSerialPrintln(unsigned long val) { Serial.println(val); }
 inline void debugSerialPrintln(float val) { Serial.println(val); }
 inline void debugSerialPrintln(double val) { Serial.println(val); }
 inline void debugSerialPrintln(char val) { Serial.println(val); }
-inline void debugSerialPrintf(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    Serial.printf(fmt, args);
-    va_end(args);
+inline void debugSerialPrintf(const char *fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  Serial.printf(fmt, args);
+  va_end(args);
 }
 #else
-inline void debugSerialPrint(const char*) {}
+inline void debugSerialPrint(const char *) {}
 inline void debugSerialPrint(int) {}
 inline void debugSerialPrint(unsigned int) {}
 inline void debugSerialPrint(long) {}
@@ -426,7 +430,7 @@ inline void debugSerialPrint(float) {}
 inline void debugSerialPrint(double) {}
 inline void debugSerialPrint(char) {}
 inline void debugSerialPrintln() {}
-inline void debugSerialPrintln(const char*) {}
+inline void debugSerialPrintln(const char *) {}
 inline void debugSerialPrintln(int) {}
 inline void debugSerialPrintln(unsigned int) {}
 inline void debugSerialPrintln(long) {}
@@ -434,9 +438,8 @@ inline void debugSerialPrintln(unsigned long) {}
 inline void debugSerialPrintln(float) {}
 inline void debugSerialPrintln(double) {}
 inline void debugSerialPrintln(char) {}
-inline void debugSerialPrintf(const char*, ...) {}
+inline void debugSerialPrintf(const char *, ...) {}
 #endif
-
 
 // ============================================================================
 // SD CARD FUNCTIONS
@@ -627,7 +630,7 @@ void tftPrint(const char *msg, bool resetline = false)
     {
       tft.fillRect(0, 0, tft.width(), disp_height, ILI9341_BLACK);
       tft_line = 0;
-      drawMenuIndicator(); // Redraw menu indicator after clearing screen
+      drawMenuIndicator(disp_column); // Redraw menu indicator after clearing screen
     }
 
     // Print the line
@@ -725,6 +728,25 @@ void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN, int level = LOG
     static const int font_height = 8 * TFT_TEXT_SIZE;
     int disp_height = tft.height();
     int max_lines = disp_height / font_height;
+
+    // When requested, clear the text area and start over to overwrite instead of scrolling
+    if (text_block_refresh)
+    {
+      // Avoid erasing the left-side menu overlay if visible; clear only the text region
+      if (menu_visible)
+      {
+        int clear_x = 80; // menu occupies left ~80px
+        int clear_w = tft.width() - clear_x;
+        tft.fillRect(clear_x, 3 * font_height, clear_w, disp_height - 3 * font_height, ILI9341_BLACK);
+      }
+      else
+      {
+        tft.fillRect(0, 3 * font_height, tft.width(), disp_height - 3 * font_height, ILI9341_BLACK);
+      }
+      tft_line = 3;
+      text_block_refresh = false;
+    }
+
     const char *p = msg;
     while (*p)
     {
@@ -1070,7 +1092,7 @@ void calibrateTouchController()
         {
           touch_detected = true;
           debugSerialPrintf("Touch detected: x=%d, y=%d, z=%d\n",
-                        touch_event_point.x, touch_event_point.y, touch_event_point.z);
+                            touch_event_point.x, touch_event_point.y, touch_event_point.z);
         }
       }
       delay(10);
@@ -1090,7 +1112,7 @@ void calibrateTouchController()
     touch_y[i] = touch_event_point.y;
 
     debugSerialPrintf("Calibration point %d: Expected LCD(%d,%d) <-> Raw Touch(%d,%d)\n",
-                  i, lcd_x[i], lcd_y[i], touch_x[i], touch_y[i]);
+                      i, lcd_x[i], lcd_y[i], touch_x[i], touch_y[i]);
     tft.fillScreen(ILI9341_BLACK);
   }
 
@@ -1222,9 +1244,9 @@ void calibrateTouchController()
     float error = sqrtf(error_x * error_x + error_y * error_y);
 
     debugSerialPrintf("  %d   | (%3d, %3d)     | (%4d, %4d)    | (%4d, %4d)      | %.2f\n",
-                  i + 1, test_lcd_x[i], test_lcd_y[i],
-                  test_touch_x[i], test_touch_y[i],
-                  calibrated_x, calibrated_y, error);
+                      i + 1, test_lcd_x[i], test_lcd_y[i],
+                      test_touch_x[i], test_touch_y[i],
+                      calibrated_x, calibrated_y, error);
 
     total_error += error;
     if (error > max_error)
@@ -1814,6 +1836,8 @@ bool setTimeFromNTP()
     return false;
   }
 
+  char resultStr[64];
+
 #if defined(USE_WIFI)
   WiFiUDP udp;
   udp.begin(2390);
@@ -1834,7 +1858,6 @@ bool setTimeFromNTP()
     }
     delay(10);
   }
-  char resultStr[64];
 #elif defined(USE_WIZNET)
   EthernetUDP ethUdp;
   ethUdp.begin(2390);
@@ -2392,7 +2415,7 @@ void waveform_display(short *samples, int n_samples, int color, bool draw_trigge
   }
 
   // Redraw menu indicator after waveform to keep it visible
-  drawMenuIndicator();
+  drawMenuIndicator(disp_column);
 }
 
 // ============================================================================
@@ -2490,22 +2513,7 @@ void add_display_column(short *values, int n_values)
   // When menu is visible, pause scrolling to keep menu fixed
   if (menu_visible)
   {
-    // Don't scroll, just draw at current position
-    int x = waveform_x + disp_column;
-
-    // Only draw outside menu area (x >= 80)
-    if (x >= 80)
-    {
-      for (int i = 0; i < MIN(waveform_h, n_values); ++i)
-      {
-        int y = waveform_y + waveform_h - i;
-        int v = ((long)(values[i] - running_min) * 255) / range;
-        v = MAX(0, MIN(255, v));
-        int color = getMagmaColor(v);
-        tft.drawPixel(x, y, color);
-      }
-    }
-    disp_column = (disp_column + 1) % waveform_w;
+    // Keep the display static while the menu is open
     return;
   }
 
@@ -2722,11 +2730,30 @@ int magnitude_spectrum(SAMPLE_ *in_buf, SAMPLE_ *out_buf, int len)
  */
 void drawModeMenu()
 {
+  // Freeze scrolling and reset origin so the menu is always drawn at the top-left
+  saved_scroll_offset = disp_column;
+  // Do not change scroll position; compensate with offsets instead to avoid shifting content
+
+  // Determine the physical top-left coordinates under current scroll/rotation
+  int origin_x = 0;
+  int origin_y = 0;
+  if (TFT_ROTATION == 1 || TFT_ROTATION == 3)
+  {
+    origin_x = saved_scroll_offset % tft.width();
+  }
+  else
+  {
+    origin_y = saved_scroll_offset % tft.height();
+  }
+
+  // Clear old menu indicator artifacts before drawing the menu
+  tft.fillRect(origin_x, origin_y, 24, 20, ILI9341_BLACK);
+
   // Draw semi-transparent background (simulate with black box)
-  tft.fillRect(0, 20, 80, 280, ILI9341_BLACK);
+  tft.fillRect(origin_x, origin_y + 20, 80, 220, ILI9341_BLACK);
 
   // Draw title
-  tft.setCursor(10, 25);
+  tft.setCursor(origin_x + 10, origin_y + 25);
   tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
   tft.setTextSize(1);
   tft.print("MODE");
@@ -2735,11 +2762,11 @@ void drawModeMenu()
   for (int i = 0; i < NUM_MENU_BUTTONS; i++)
   {
     MenuButton &btn = menu_buttons[i];
-    tft.fillRect(btn.x, btn.y, btn.w, btn.h, btn.color);
-    tft.drawRect(btn.x, btn.y, btn.w, btn.h, ILI9341_WHITE);
+    tft.fillRect(origin_x + btn.x, origin_y + btn.y, btn.w, btn.h, btn.color);
+    tft.drawRect(origin_x + btn.x, origin_y + btn.y, btn.w, btn.h, ILI9341_WHITE);
 
     // Center text in button
-    tft.setCursor(btn.x + 5, btn.y + 15);
+    tft.setCursor(origin_x + btn.x + 5, origin_y + btn.y + 15);
     tft.setTextColor(ILI9341_WHITE, btn.color);
     tft.setTextSize(1);
     tft.print(btn.label);
@@ -2769,19 +2796,24 @@ void drawMenuIndicator(int scroll_offset)
   int x_base = 2;
   int y_base = 0;
 
+  // Use current scroll offset for positioning; when menu is visible use the saved offset so icon stays at physical top-left
+  int effective_offset = menu_visible ? saved_scroll_offset : scroll_offset;
+  int w = tft.width();
+  int h = tft.height();
+
   switch (TFT_ROTATION)
   {
   case 0: // Portrait - scroll affects y
-    y_base = scroll_offset % 320;
+    y_base = effective_offset % h;
     break;
   case 1: // Landscape - scroll affects x
-    x_base = scroll_offset % 320 + 2;
+    x_base = effective_offset % w + 2;
     break;
   case 2: // Portrait inverted - scroll affects y
-    y_base = scroll_offset % 320;
+    y_base = effective_offset % h;
     break;
   case 3: // Landscape inverted - scroll affects x
-    x_base = scroll_offset % 320 + 2;
+    x_base = effective_offset % w + 2;
     break;
   }
 
@@ -2882,6 +2914,18 @@ bool handleTouchInput(volatile int &current_mode)
         debugPrintf("Touch event detected at display coordinates: x=%d, y=%d\n", display_x, display_y);
       }
 
+      // Wake from display-off mode (-1) on any touch: resume to spectrogram (mode 3)
+      if (current_mode == -1)
+      {
+        current_mode = 3;
+        menu_visible = false;
+        tft.scrollTo(saved_scroll_offset);
+        disp_column = saved_scroll_offset % waveform_w;
+        tft.fillScreen(ILI9341_BLACK);
+        debugPrintln("Waking display to mode 3 (spectrogram) via touch");
+        return true;
+      }
+
       // Check if touch is in the menu toggle area (top-left corner)
       if (!menu_visible && display_x < 80 && display_y < 20)
       {
@@ -2910,6 +2954,10 @@ bool handleTouchInput(volatile int &current_mode)
               current_mode = new_mode;
               menu_visible = false;
 
+              // Restore scroll position and keep drawing aligned after closing the menu
+              tft.scrollTo(saved_scroll_offset);
+              disp_column = saved_scroll_offset % waveform_w;
+
               // Clear screen for new mode
               tft.fillScreen(ILI9341_BLACK);
 
@@ -2934,11 +2982,13 @@ bool handleTouchInput(volatile int &current_mode)
   if (menu_visible && (millis() - menu_show_time > MENU_TIMEOUT_MS))
   {
     menu_visible = false;
+    tft.scrollTo(saved_scroll_offset);
+    disp_column = saved_scroll_offset % waveform_w;
     tft.fillScreen(ILI9341_BLACK);
     // Redraw menu indicator after timeout
     if (current_mode > 0)
     {
-      drawMenuIndicator();
+      drawMenuIndicator(disp_column);
     }
   }
 
@@ -3054,7 +3104,7 @@ void setup()
   tftPrint("HTTP server started...\n");
 #if defined(USE_WIFI)
   resultStr = "Serving chart page at http://" + WiFi.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
-#elif defined(USE_WIZNET) {
+#elif defined(USE_WIZNET)
   resultStr = "Serving chart page at http://" + Ethernet.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
 #endif
   tftPrint(resultStr.c_str());
@@ -3421,11 +3471,13 @@ void loop()
       if (!text_mode_initialized)
       {
         tft.fillScreen(ILI9341_BLACK);
-        tft.scrollTo(0); // Reset scroll position
+        disp_column = 0;         // Reset scroll position tracking
+        saved_scroll_offset = 0; // Keep menu/icon anchored
+        tft.scrollTo(0);         // Reset scroll position
         tft.setTextColor(ILI9341_GREEN);
         tft.setTextSize(TFT_TEXT_SIZE);
         tft.setCursor(0, 0);
-        drawMenuIndicator(); // Draw menu access indicator
+        drawMenuIndicator(0); // Draw menu access indicator at top-left
         text_mode_initialized = true;
       }
 
@@ -3434,6 +3486,9 @@ void loop()
       if (millis() - last_stats_update >= 1000)
       {
         char buf[128];
+
+        // Prepare text area to overwrite instead of scrolling
+        text_block_refresh = true;
 
         // Get latest sensor data
         buffer_get_latest(input_shorts_buf, 100, 0);
@@ -3478,8 +3533,8 @@ void loop()
       if (!waveform_initialized)
       {
         setup_waveform();
-        tft.scrollTo(0);     // Reset scroll position
-        drawMenuIndicator(); // Draw menu access indicator
+        tft.scrollTo(0);                // Reset scroll position
+        drawMenuIndicator(disp_column); // Draw menu access indicator
         waveform_initialized = true;
       }
 
@@ -3507,7 +3562,7 @@ void loop()
         {
           draw_fft_frequency_axis(); // Draw frequency labels for FFT mode
         }
-        drawMenuIndicator(); // Draw menu access indicator
+        drawMenuIndicator(disp_column); // Draw menu access indicator
         mode23_screen_cleared = true;
       }
 

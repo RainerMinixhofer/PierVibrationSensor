@@ -3,9 +3,9 @@
  * @brief Main application for Pier Vibration Sensor: Reads ADS1256 and MPU-6500, serves web UI, and streams UDP sensor data.
  *
  * @note SPI Bus Configuration:
- * - Display (ILI9341): spi0 @ 10 MHz (max per datasheet p. 242)
- * - Touchscreen (XPT2046): spi0 @ 2.5 MHz (max per datasheet p. 27: 400ns min clock cycle)
- * - SPI clock speed is dynamically switched before each touchscreen access
+ * - All devices on SPI0: Display (ILI9341), Touchscreen (XPT2046), SD Card @ 10 MHz
+ * - SPI1: ADS1256 @ 1.4 MHz
+ * - Fixed clock speeds have proven to be most stable
  */
 
 // TODO check why USE_WIFI does not work correctly
@@ -57,6 +57,7 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 #include <Adafruit_ICM20X.h>
 #include <Adafruit_ICM20948.h>
 #include <Adafruit_Sensor.h>
+#include "version.h"
 
 #define PERFORM_CALIBRATION // Comment to disable startup calibration
 
@@ -132,12 +133,15 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 // Custom color constants (RGB565 format)
 #define COLOR_GREY 0x7BEF // Medium grey for UI elements
 
-// Constants for XPT2046 TFT touch controller (if used)
-#define TOUCH_CLK TFT_SCLK // GP2 (shared with TFT and SD SCK)
-#define TOUCH_DIN TFT_MOSI // GP7 (shared with TFT and SD MOSI)
-#define TOUCH_DO TFT_MISO  // GP0 (shared with TFT and SD MISO)
-#define TOUCH_CS 22        // GP22, Set to -1 if not used
-#define TOUCH_IRQ 27       // GP27, Set to -1 if not used
+// Constants for XPT2046 TFT touch controller
+// Set FORCETOUCHCALIBRATION to true to force touch calibration at every startup.
+// You can get the resulting calibration parameters from the webpage with 'Show Calibration Data' button.
+#define FORCETOUCHCALIBRATION false // Set to true to force touch calibration at every startup
+#define TOUCH_CLK TFT_SCLK          // GP2 (shared with TFT and SD SCK)
+#define TOUCH_DIN TFT_MOSI          // GP7 (shared with TFT and SD MOSI)
+#define TOUCH_DO TFT_MISO           // GP0 (shared with TFT and SD MISO)
+#define TOUCH_CS 22                 // GP22, Set to -1 if not used
+#define TOUCH_IRQ 27                // GP27, Set to -1 if not used
 
 // Create TFT touchscreen object using XPT2046 driver
 #define TOUCH_SPI_PORT spi0 // Using SPI0
@@ -249,7 +253,7 @@ int NUM_CALIB_POINTS = 5;                                                 // Cha
 volatile bool trigger_touch_calibration = false;                          // Trigger for remote calibration
 
 // --- Touch Event Handling ---
-static volatile bool forceTouchCalibration = false; // Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
+static volatile bool forceTouchCalibration = FORCETOUCHCALIBRATION; // Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
 static volatile bool touch_event_flag = false;
 static volatile int irq_save = 0;       // Save the IRQ state for touch events
 TS_Point touch_event_point = {0, 0, 0}; // Initialize touch point structure for XPT2046_Touchscreen
@@ -1290,6 +1294,9 @@ void calibrateTouchController()
   tft.setTextColor(ILI9341_WHITE);
 
   delay(3000);
+
+  // Clear screen to prevent cluttering of subsequent output
+  tft.fillScreen(ILI9341_BLACK);
 }
 
 bool loadTouchCalibration()
@@ -3013,6 +3020,18 @@ void setup()
 #endif
   initTFTDisplay(); // Initialize TFT display early to show debug messages
   tftPrint("Starting Pier Vibration Sensor...\n");
+  tftPrint("Version: ");
+  tftPrint(GIT_COMMIT_SHORT);
+  tftPrint(" (");
+  tftPrint(GIT_COMMIT_DATE);
+  tftPrint(")\n");
+
+#ifdef DEBUG_BUILD
+  debugSerialPrintln("Git Version: " GIT_COMMIT_SHORT);
+  debugSerialPrintln("Full Commit: " GIT_COMMIT_FULL);
+  debugSerialPrintln("Commit Date: " GIT_COMMIT_DATE);
+#endif
+
   LittleFS.begin(); // Initialize LittleFS filesystem
   tftPrint("Filesystem initialized...\n");
 
@@ -3118,16 +3137,17 @@ void setup()
   tftPrint("---------------------------------------------\n");
   tftPrint("System initialized.\n");
 
+  // Re-initialize touchscreen after all other SPI devices have been configured
+  // This ensures the touchscreen works correctly after WIZNET5K and other devices
+  // have potentially modified the SPI0 bus settings
+  debugSerialPrintln("Re-initializing touchscreen after SPI bus setup...");
+  spi_init(TOUCH_SPI_PORT, SPI0_BPS); // Ensure SPI0 is running at 10MHz for touchscreen
+  gpio_set_function(TOUCH_CLK, GPIO_FUNC_SPI);
+  gpio_set_function(TOUCH_DIN, GPIO_FUNC_SPI);
+  gpio_set_function(TOUCH_DO, GPIO_FUNC_SPI);
   touchscreen.begin();
   touchscreen.setRotation(TFT_ROTATION);
-  delay(1000); // Wait for chip to stabilize
-
-  // Drain any phantom touches
-  for (int i = 0; i < 10; i++)
-  {
-    touchscreen.getPoint();
-    delay(10);
-  }
+  delay(100); // Brief stabilization delay
 
   tftPrint("Starting Main Loop...\n");
   debugSerialPrintln("Main loop started - collecting sensor data");

@@ -3020,11 +3020,9 @@ void setup()
 #endif
   initTFTDisplay(); // Initialize TFT display early to show debug messages
   tftPrint("Starting Pier Vibration Sensor...\n");
-  tftPrint("Version: ");
-  tftPrint(GIT_COMMIT_SHORT);
-  tftPrint(" (");
-  tftPrint(GIT_COMMIT_DATE);
-  tftPrint(")\n");
+  char versionStr[100];
+  sprintf(versionStr, "Version: %s (%s)\n", GIT_COMMIT_SHORT, GIT_COMMIT_DATE);
+  tftPrint(versionStr);
 
 #ifdef DEBUG_BUILD
   debugSerialPrintln("Git Version: " GIT_COMMIT_SHORT);

@@ -8,11 +8,13 @@
  * - Fixed clock speeds have proven to be most stable
  */
 
-// TODO check why USE_WIFI does not work correctly
-// #define USE_WIFI // comment out to disable WiFi support
-#define USE_WIZNET // comment out to disable WIZNET5K support
+// Networking is now runtime-controlled via use_networking global variable
+// WIZNET-first-then-WiFi-fallback logic implemented in initNetworking()
 // #define WAIT_FOR_TOUCH // comment out to disable waiting for touch input
 #define USE_HARDWARE_SPI // comment out to use software SPI for TFT display
+
+// Global networking control variable
+bool use_networking = true; // Set to true to enable networking (WIZNET first, then WiFi fallback)
 
 // --- Logging and Debug Output ---
 enum LogLevel
@@ -34,12 +36,9 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 #include <string.h>
 #include <stdarg.h>
 #include <sys/time.h>
-#ifdef USE_WIZNET
+#include <time.h>
 #include <Ethernet.h>
-#endif
-#ifdef USE_WIFI
 #include <WiFi.h>
-#endif
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 #include <hardware/pwm.h> // Add this include for PWM functions
@@ -197,7 +196,7 @@ struct CalibrationMatrix
 #define LOCAL_TIMEZONE "Europe/Vienna" // Set your local timezone (IANA TZ format)
 #define NTP_SERVER "10.0.0.1"          // Set your local NTP server IP here
 #define NTP_PORT 123
-#define NTP_TIMEOUT_MS 3000
+#define NTP_TIMEOUT_MS 10000
 
 #define HTTP_SERVER_PORT 3000
 #define UDP_STREAM_PORT 10000
@@ -207,15 +206,11 @@ struct CalibrationMatrix
 
 IPAddress ip(10, 0, 3, 177);
 
-#ifdef USE_WIZNET
-EthernetServer server(HTTP_SERVER_PORT);
-EthernetUDP udpStream;
-#endif
-
-#ifdef USE_WIFI
-WiFiServer server(HTTP_SERVER_PORT);
-WiFiUDP udpStream;
-#endif
+// Networking servers and UDP streams
+EthernetServer ethServer(HTTP_SERVER_PORT);
+WiFiServer wifiServer(HTTP_SERVER_PORT);
+EthernetUDP ethUdpStream;
+WiFiUDP wifiUdpStream;
 
 /**
  * @enum NetworkMode
@@ -1661,7 +1656,6 @@ void readICM20948()
  */
 void getWiznetMAC(byte *mac)
 {
-#ifdef USE_WIZNET
   // Read unique 64-bit ID from flash (RP2040)
   uint8_t id[8] = {0};
   uint32_t ints = save_and_disable_interrupts();
@@ -1675,7 +1669,6 @@ void getWiznetMAC(byte *mac)
   mac[3] = id[2];
   mac[4] = id[3];
   mac[5] = id[4];
-#endif
 }
 
 /**
@@ -1684,7 +1677,6 @@ void getWiznetMAC(byte *mac)
  */
 void getWiFiMAC(byte *mac)
 {
-#ifdef USE_WIFI
   String macStr = WiFi.macAddress(); // Format: "AA:BB:CC:DD:EE:FF"
   int values[6];
   if (sscanf(macStr.c_str(), "%x:%x:%x:%x:%x:%x",
@@ -1693,7 +1685,6 @@ void getWiFiMAC(byte *mac)
     for (int i = 0; i < 6; ++i)
       mac[i] = (byte)values[i];
   }
-#endif
 }
 
 /**
@@ -1722,14 +1713,12 @@ bool loadWiFiCredentials()
   return true;
 }
 
-#ifdef USE_WIFI
-void initWiFi()
+NetworkMode initWiFi()
 {
   if (!loadWiFiCredentials())
   {
     debugSerialPrintln("Failed to load WiFi credentials from /wifi.txt");
-    netMode = NET_NONE;
-    return;
+    return NET_NONE;
   }
 
   WiFi.mode(WIFI_STA);
@@ -1737,7 +1726,7 @@ void initWiFi()
 
   debugSerialPrint("Connecting to WiFi");
   int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 30)
+  while ((WiFi.status() != WL_CONNECTED || WiFi.localIP() == IPAddress(0, 0, 0, 0)) && retry < 30)
   {
     sleep_ms(500);
     debugSerialPrint(".");
@@ -1747,37 +1736,47 @@ void initWiFi()
 
   if (WiFi.status() == WL_CONNECTED)
   {
+    IPAddress wifiIP = WiFi.localIP();
+    if (wifiIP == IPAddress(0, 0, 0, 0) || wifiIP[0] > 255 || wifiIP[1] > 255 || wifiIP[2] > 255 || wifiIP[3] > 255)
+    {
+      debugSerialPrint("WiFi connected but invalid IP address.\n");
+      return NET_NONE;
+    }
     byte mac[6];
     getWiFiMAC(mac);
     debugSerialPrintf("WiFi MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    debugSerialPrintf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-    server.begin();
-    netMode = NET_WIFI;
+    debugSerialPrintf("WiFi connected, IP: %d.%d.%d.%d\n", wifiIP[0], wifiIP[1], wifiIP[2], wifiIP[3]);
+    int rssi = WiFi.RSSI();
+    if (rssi < 0 && rssi > -100)
+    {
+      debugSerialPrintf("WiFi RSSI: %d dBm\n", rssi);
+    }
+    else
+    {
+      debugSerialPrint("WiFi RSSI: Invalid\n");
+    }
+    wifiServer.begin();
+    return NET_WIFI;
   }
   else
   {
     debugSerialPrint("WiFi connection failed.\n");
-    netMode = NET_NONE;
+    return NET_NONE;
   }
   debugSerialPrint("WiFi initialized...\n");
 }
-#endif
-
-#ifdef USE_WIZNET
 
 /**
  * @brief Reset the WIZNET5K chip using the hardware reset pin.
  */
 void wiznet5k_reset()
 {
-#ifdef USE_WIZNET
   gpio_init(WIZNET_RST);
   gpio_set_dir(WIZNET_RST, GPIO_OUT);
   gpio_put(WIZNET_RST, 0); // Assert reset (active low)
   sleep_ms(10);            // Hold reset for 10ms
   gpio_put(WIZNET_RST, 1); // Release reset
   sleep_ms(100);           // Wait for chip to be ready
-#endif
 }
 
 /**
@@ -1827,68 +1826,174 @@ void initWIZNET5K()
   sprintf(resultStr, "Ethernet IP: %s\n", Ethernet.localIP().toString().c_str());
   tftPrint(resultStr);
   netMode = NET_WIZNET;
+  ethServer.begin();
   tftPrint("Ethernet Network initialized...\n");
 }
-#endif
+
+NetworkMode initNetworking()
+{
+  if (!use_networking)
+  {
+    tftPrint("Networking disabled, running unconnected.\n");
+    return NET_NONE;
+  }
+
+  tftPrint("Initializing Networking...\n");
+
+  // First try WIZNET (Ethernet) with 10 second timeout
+  tftPrint("Trying WIZNET (Ethernet)...\n");
+  unsigned long wiznetStartTime = millis();
+
+  byte mac[6];
+  char resultStr[32];
+  getWiznetMAC(mac);
+
+  // --- Reset WIZNET5K chip before SPI init ---
+  wiznet5k_reset();
+
+  spi_init(WIZNET_SPI_PORT, WIZNET_SPI_BPS);
+  gpio_set_function(WIZNET_SPI_SCK, GPIO_FUNC_SPI);
+  gpio_set_function(WIZNET_SPI_MOSI, GPIO_FUNC_SPI);
+  gpio_set_function(WIZNET_SPI_MISO, GPIO_FUNC_SPI);
+  gpio_init(WIZNET_SPI_CS);
+  gpio_set_dir(WIZNET_SPI_CS, GPIO_OUT);
+  gpio_put(WIZNET_SPI_CS, 1);
+
+  // --- Setup WIZNET5K INT pin and ISR ---
+  gpio_init(WIZNET_INT);
+  gpio_set_dir(WIZNET_INT, GPIO_IN);
+  gpio_pull_up(WIZNET_INT);
+
+  Ethernet.init(WIZNET_SPI_CS);
+
+  // Try DHCP first
+  tftPrint("Trying DHCP...\n");
+  int dhcpResult = Ethernet.begin(mac, 10000);
+
+  if (dhcpResult == 0)
+  {
+    // DHCP failed, try static IP
+    tftPrint("DHCP failed, trying static IP...\n");
+    Ethernet.begin(mac, ip);
+  }
+
+  // Wait a bit for link status to stabilize
+  delay(100);
+
+  // Check if Ethernet link is active
+  if (Ethernet.linkStatus() == LinkON)
+  {
+    // WIZNET connected successfully
+    IPAddress localIP = Ethernet.localIP();
+    sprintf(resultStr, "Ethernet MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    tftPrint(resultStr);
+    sprintf(resultStr, "Ethernet IP: %s\n", localIP.toString().c_str());
+    tftPrint(resultStr);
+    ethServer.begin();
+    tftPrint("Ethernet Network initialized successfully!\n");
+    return NET_WIZNET;
+  }
+  else
+  {
+    tftPrint("Ethernet link is down, trying WiFi as fallback...\n");
+  }
+
+  // WIZNET failed, check if 10 seconds have passed
+  if (millis() - wiznetStartTime < 10000)
+  {
+    // Wait for remaining time
+    delay(10000 - (millis() - wiznetStartTime));
+  }
+
+  // Try WiFi
+  NetworkMode wifiResult = initWiFi();
+  if (wifiResult == NET_WIFI)
+  {
+    tftPrint("WiFi connected successfully!\n");
+    return NET_WIFI;
+  }
+
+  // Both failed
+  tftPrint("All networking attempts failed, running unconnected.\n");
+  return NET_NONE;
+}
+
+// TODO: Review NTP connection when using WiFi. Due to metal case the WiFi connection is bad could be the reason for the problems
 
 bool setTimeFromNTP()
 {
   uint8_t ntp_packet[48] = {0};
   ntp_packet[0] = 0b11100011;
-
+  int packetSize = 0;
+  uint8_t recv_buf[48];
+  uint32_t start = millis();
+  EthernetUDP ethUdp;
+  WiFiUDP udp;
   IPAddress ntpServerIP;
+  char resultStr[64];
+  uint32_t secs_since_1900;
+  uint32_t unix_time;
+  time_t t; // <-- This is fine; no need for 'struct tm;' here
+
   if (!ntpServerIP.fromString(NTP_SERVER))
   {
     tftPrint("Invalid NTP server IP.\n");
     return false;
   }
 
-  char resultStr[64];
-
-#if defined(USE_WIFI)
-  WiFiUDP udp;
-  udp.begin(2390);
-  udp.beginPacket(ntpServerIP, NTP_PORT);
-  udp.write(ntp_packet, sizeof(ntp_packet));
-  udp.endPacket();
-
-  uint32_t start = millis();
-  int packetSize = 0;
-  uint8_t recv_buf[48];
-  while ((millis() - start) < NTP_TIMEOUT_MS)
+  if (netMode == NET_WIFI)
   {
-    packetSize = udp.parsePacket();
-    if (packetSize >= 48)
+    if (udp.begin(0) == 0)
     {
-      udp.read(recv_buf, 48);
-      break;
+      tftPrint("Failed to open UDP socket for NTP.\n");
+      return false;
     }
-    delay(10);
-  }
-#elif defined(USE_WIZNET)
-  EthernetUDP ethUdp;
-  ethUdp.begin(2390);
-  ethUdp.beginPacket(ntpServerIP, NTP_PORT);
-  ethUdp.write(ntp_packet, sizeof(ntp_packet));
-  ethUdp.endPacket();
+    udp.beginPacket(ntpServerIP, NTP_PORT);
+    udp.write(ntp_packet, sizeof(ntp_packet));
+    udp.endPacket();
+    debugSerialPrint("NTP packet sent, waiting for response...\n");
 
-  uint32_t start = millis();
-  int packetSize = 0;
-  uint8_t recv_buf[48];
-  while ((millis() - start) < NTP_TIMEOUT_MS)
-  {
-    packetSize = ethUdp.parsePacket();
-    if (packetSize >= 48)
+    while ((millis() - start) < NTP_TIMEOUT_MS)
     {
-      ethUdp.read(recv_buf, 48);
-      break;
+      packetSize = udp.parsePacket();
+      if (packetSize == 48)
+      {
+        debugSerialPrintf("NTP response received: %d bytes\n", packetSize);
+        udp.read(recv_buf, 48);
+        break;
+      }
+      delay(10);
     }
-    delay(10);
   }
-#else
-  debugSerialPrint("NTP requires either WiFi or WIZNET enabled.\n");
-  return false;
-#endif
+  else if (netMode == NET_WIZNET)
+  {
+    if (ethUdp.begin(0) == 0)
+    {
+      tftPrint("Failed to open UDP socket for NTP.\n");
+      return false;
+    }
+    ethUdp.beginPacket(ntpServerIP, NTP_PORT);
+    ethUdp.write(ntp_packet, sizeof(ntp_packet));
+    ethUdp.endPacket();
+    debugSerialPrint("NTP packet sent, waiting for response...\n");
+
+    while ((millis() - start) < NTP_TIMEOUT_MS)
+    {
+      packetSize = ethUdp.parsePacket();
+      if (packetSize == 48)
+      {
+        debugSerialPrintf("NTP response received: %d bytes\n", packetSize);
+        ethUdp.read(recv_buf, 48);
+        break;
+      }
+      delay(10);
+    }
+  }
+  else
+  {
+    debugSerialPrint("NTP requires network connection.\n");
+    return false;
+  }
 
   if (packetSize < 48)
   {
@@ -1896,30 +2001,24 @@ bool setTimeFromNTP()
     return false;
   }
 
-  uint32_t secs_since_1900 =
-      (recv_buf[40] << 24) | (recv_buf[41] << 16) | (recv_buf[42] << 8) | recv_buf[43];
-  uint32_t unix_time = secs_since_1900 - 2208988800U;
+  secs_since_1900 = (recv_buf[40] << 24) | (recv_buf[41] << 16) | (recv_buf[42] << 8) | recv_buf[43];
+  unix_time = secs_since_1900 - 2208988800U;
 
   struct timeval tv;
   tv.tv_sec = unix_time;
   tv.tv_usec = 0;
   settimeofday(&tv, nullptr);
 
-  time_t t = unix_time;
-  struct tm *tm_info = localtime(&t);
+  t = unix_time;
+  tm *tm_info = localtime(&t); // <-- Now 'tm' is fully defined from <time.h>
 
   sprintf(resultStr, "System time set from NTP: %04d-%02d-%02d %02d:%02d:%02d\n",
           tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
           tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
   tftPrint(resultStr);
-
   return true;
 }
 
-/**
- * @brief Set the local timezone for the system.
- * @param tz POSIX timezone string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3" for Central Europe
- */
 void setLocalTimezone(const char *tz)
 {
   setenv("TZ", tz, 1);
@@ -1979,14 +2078,10 @@ void serveSensorData(Stream &client)
 
   // Determine network type string
   const char *nettype = "None";
-#if defined(USE_WIFI)
   if (netMode == NET_WIFI)
     nettype = "WLAN";
-#endif
-#if defined(USE_WIZNET)
-  if (netMode == NET_WIZNET)
+  else if (netMode == NET_WIZNET)
     nettype = "Ethernet";
-#endif
 
   time_t now = time(NULL);
   struct tm *tm_info = localtime(&now);
@@ -2068,11 +2163,17 @@ void sendSensorUDPStream(const char *channel, const float *data, size_t count)
   }
   snprintf(packet + len, sizeof(packet) - len, "\n");
 
-  if (netMode == NET_WIZNET || netMode == NET_WIFI)
+  if (netMode == NET_WIZNET)
   {
-    udpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    udpStream.write((const uint8_t *)packet, strlen(packet));
-    udpStream.endPacket();
+    ethUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
+    ethUdpStream.write((const uint8_t *)packet, strlen(packet));
+    ethUdpStream.endPacket();
+  }
+  else if (netMode == NET_WIFI)
+  {
+    wifiUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
+    wifiUdpStream.write((const uint8_t *)packet, strlen(packet));
+    wifiUdpStream.endPacket();
   }
 }
 
@@ -2093,11 +2194,17 @@ void sendSensorUDPStream(const char *channel, const int *data, size_t count)
   }
   snprintf(packet + len, sizeof(packet) - len, "\n");
 
-  if (netMode == NET_WIZNET || netMode == NET_WIFI)
+  if (netMode == NET_WIZNET)
   {
-    udpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    udpStream.write((const uint8_t *)packet, strlen(packet));
-    udpStream.endPacket();
+    ethUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
+    ethUdpStream.write((const uint8_t *)packet, strlen(packet));
+    ethUdpStream.endPacket();
+  }
+  else if (netMode == NET_WIFI)
+  {
+    wifiUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
+    wifiUdpStream.write((const uint8_t *)packet, strlen(packet));
+    wifiUdpStream.endPacket();
   }
 }
 
@@ -3094,36 +3201,39 @@ void setup()
   // Set your local timezone here (example: Central Europe)
   setLocalTimezone(LOCAL_TIMEZONE);
 
-#if defined(USE_WIFI)
-  initWiFi();
+  netMode = initNetworking();
   if (netMode == NET_WIFI)
   {
     byte mac[6];
     getWiFiMAC(mac);
     formatMACString(mac, macString);
   }
-#elif defined(USE_WIZNET)
-  initWIZNET5K();
-  if (netMode == NET_WIZNET)
+  else if (netMode == NET_WIZNET)
   {
     byte mac[6];
     getWiznetMAC(mac);
     formatMACString(mac, macString);
   }
-#endif
 
   if (!setTimeFromNTP())
   {
     tftPrint("Failed to set system time from NTP server.\n");
   }
 
-  server.begin();
+  // Server is already started in initNetworking()
   tftPrint("HTTP server started...\n");
-#if defined(USE_WIFI)
-  resultStr = "Serving chart page at http://" + WiFi.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
-#elif defined(USE_WIZNET)
-  resultStr = "Serving chart page at http://" + Ethernet.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
-#endif
+  if (netMode == NET_WIFI)
+  {
+    resultStr = "Serving chart page at http://" + WiFi.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
+  }
+  else if (netMode == NET_WIZNET)
+  {
+    resultStr = "Serving chart page at http://" + Ethernet.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
+  }
+  else
+  {
+    resultStr = "No network connection - server not available\n";
+  }
   tftPrint(resultStr.c_str());
   resultStr = "UDP stream port: " + String(UDP_STREAM_PORT) + "\n";
   tftPrint(resultStr.c_str());
@@ -3339,24 +3449,41 @@ void loop()
 
   if (netMode == NET_WIZNET || netMode == NET_WIFI)
   {
-#if defined(USE_WIZNET)
-    EthernetClient client = server.accept();
-#endif
-#if defined(USE_WIFI)
-    WiFiClient client = server.accept();
-#endif
+    EthernetClient ethClient;
+    WiFiClient wifiClient;
+
+    if (netMode == NET_WIZNET)
+    {
+      ethClient = ethServer.accept();
+    }
+    else if (netMode == NET_WIFI)
+    {
+      wifiClient = wifiServer.accept();
+    }
+
+    // Use a pointer to the active client
+    Stream *client = nullptr;
+    if (netMode == NET_WIZNET && ethClient)
+    {
+      client = &ethClient;
+    }
+    else if (netMode == NET_WIFI && wifiClient)
+    {
+      client = &wifiClient;
+    }
+
     if (client)
     {
-      while (client.connected() && !client.available())
+      while (static_cast<Client *>(client)->connected() && !client->available())
         tight_loop_contents();
       String req = "";
-      if (client.available())
+      if (client->available())
       {
-        req = client.readStringUntil('\r');
+        req = client->readStringUntil('\r');
         // Consume the rest of the HTTP headers
-        while (client.available())
+        while (client->available())
         {
-          String line = client.readStringUntil('\n');
+          String line = client->readStringUntil('\n');
           if (line.length() <= 1)
             break; // Empty line marks end of headers
           tight_loop_contents();
@@ -3364,39 +3491,46 @@ void loop()
 
         if (req.indexOf("GET /udpstream") == 0)
         {
-          serveUDPStreamControl(client, req);
+          serveUDPStreamControl(*client, req);
         }
         else if (req.indexOf("GET /setmode") == 0)
         {
-          serveModeControl(client, req);
+          serveModeControl(*client, req);
         }
         else if (req.indexOf("GET /setaxis") == 0)
         {
-          serveAxisControl(client, req);
+          serveAxisControl(*client, req);
         }
         else if (req.indexOf("GET /touchcalibrate") == 0)
         {
-          serveTouchCalibrate(client, req);
+          serveTouchCalibrate(*client, req);
         }
         else if (req.indexOf("GET /touchcalibdata") == 0)
         {
-          serveTouchCalibData(client, req);
+          serveTouchCalibData(*client, req);
         }
         else if (req.indexOf("GET /setloglevel") == 0)
         {
-          serveSetLogLevel(client, req);
+          serveSetLogLevel(*client, req);
         }
         else if (req.indexOf("GET /data") == 0)
         {
-          serveSensorData(client);
+          serveSensorData(*client);
         }
         else
         {
-          serveChartPage(client);
+          serveChartPage(*client);
         }
       }
       delay(1);
-      client.stop();
+      if (netMode == NET_WIZNET)
+      {
+        ethClient.stop();
+      }
+      else if (netMode == NET_WIFI)
+      {
+        wifiClient.stop();
+      }
     }
   }
 

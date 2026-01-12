@@ -166,8 +166,8 @@ const uint16_t XPT2046_XMAX_VALUE = (1 << (XPT2046_RESOLUTION_BITS - 1)) - 1; //
 #define SD_CS 26         // GP26
 
 #define SD_SPI_PORT TFT_SPI_PORT // Using same SPI0 as TFT
-#define SD_SPI_BPS 20000000      // 20 MHz for SD card (same as TFT and Touch)
-#define SD_CONFIG SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(20))
+#define SD_SPI_BPS 10000000      // 10 MHz for SD card (same as TFT and Touch)
+#define SD_CONFIG SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(10))
 
 #if SD_FAT_TYPE == 0
 SdFat sd;
@@ -446,16 +446,16 @@ inline void debugSerialPrintf(const char *, ...) {}
 
 void initSDCard()
 {
-  debugSerialPrint("Initializing SD card...");
+  debugSerialPrintln("Initializing SD card...");
 
   // Initialize LittleFS
   if (!LittleFS.begin())
   {
-    debugSerialPrint("Failed to mount LittleFS!");
+    debugSerialPrintln("Failed to mount LittleFS!");
     return;
   }
-  debugSerialPrint("LittleFS mounted successfully.");
-  debugSerialPrint("Using hardware SPI for SD card");
+  debugSerialPrintln("LittleFS mounted successfully.");
+  debugSerialPrintln("Using hardware SPI for SD card");
   spi_init(SD_SPI_PORT, SD_SPI_BPS);
   gpio_set_function(SD_SCK, GPIO_FUNC_SPI);
   gpio_set_function(SD_MOSI, GPIO_FUNC_SPI);
@@ -469,30 +469,49 @@ void initSDCard()
   // Initialize SD card
   if (!sd.begin(SD_CONFIG))
   {
-    debugSerialPrint("SD card initialization failed!");
+    debugSerialPrintln("SD card initialization failed!");
     return;
   }
-  debugSerialPrint("SD card initialized successfully.");
+  debugSerialPrintln("SD card initialized successfully.");
+
+  // Detect and log filesystem type
+  uint8_t fatType = sd.fatType();
+  if (fatType == 16)
+  {
+    debugSerialPrintln("FAT16 filesystem detected.");
+  }
+  else if (fatType == 32)
+  {
+    debugSerialPrintln("FAT32 filesystem detected.");
+  }
+  else if (fatType == 64)
+  {
+    debugSerialPrintln("exFAT filesystem detected.");
+  }
+  else
+  {
+    debugSerialPrintf("Unknown filesystem type: %d\n", fatType);
+  }
 
   // Check if the root directory exists
   if (!sd.exists("/"))
   {
-    debugSerialPrint("Root directory does not exist, creating...");
+    debugSerialPrintln("Root directory does not exist, creating...");
     if (!sd.mkdir("/"))
     {
-      debugSerialPrint("Failed to create root directory!");
+      debugSerialPrintln("Failed to create root directory!");
       return;
     }
   }
-  debugSerialPrint("Root directory exists.");
+  debugSerialPrintln("Root directory exists.");
   // List files in the root directory
   FsFile root = sd.open("/");
   if (!root)
   {
-    debugSerialPrint("Failed to open root directory!");
+    debugSerialPrintln("Failed to open root directory!");
     return;
   }
-  debugSerialPrint("Listing files in root directory:");
+  debugSerialPrintln("Listing files in root directory:");
   FsFile file = root.openNextFile();
   while (file)
   {
@@ -502,12 +521,12 @@ void initSDCard()
     file = root.openNextFile();
   }
   root.close();
-  debugSerialPrint("SD card initialized and files listed successfully.");
+  debugSerialPrintln("SD card initialized and files listed successfully.");
 }
 
 void disableSDCard()
 {
-  debugSerialPrint("Disabling SD card...");
+  debugSerialPrintln("Disabling SD card...");
   // Set CS of SD card high to disable it
   if (SD_CS != -1)
   {
@@ -3139,6 +3158,8 @@ void setup()
 
   LittleFS.begin(); // Initialize LittleFS filesystem
   tftPrint("Filesystem initialized...\n");
+
+  initSDCard(); // Initialize SD card
 
 #ifdef DEBUG_BUILD
   if (logVerbosity >= LOG_DEBUG)

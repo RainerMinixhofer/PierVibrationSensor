@@ -37,8 +37,9 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
-#include <Ethernet.h>
 #include <WiFi.h>
+#define ETHERNET_LINK_STATUS_DEFINED
+#include <Ethernet_Generic.h>
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 #include <hardware/pwm.h> // Add this include for PWM functions

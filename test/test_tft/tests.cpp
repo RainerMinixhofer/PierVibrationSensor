@@ -20,10 +20,10 @@
 #define TFT_ROTATION 1       // Set the default rotation for the display
 #define TFT_TEXT_SIZE 1      // Set the default text size for the display
 
-// #define TFT_TESTS
-// #define TFT_TESTS_SLOW
+#define TFT_TESTS
+#define TFT_TESTS_SLOW
 // #define TOUCH_TESTS
-#define TOUCH_TESTS_INTERACTIVE
+// #define TOUCH_TESTS_INTERACTIVE
 
 // TFT display tests
 

@@ -6,7 +6,7 @@
 // SD configuration (matching main.cpp)
 #define SD_FAT_TYPE 3
 #define SD_CS 26
-#define SD_SCK 2  // GP2
+#define SD_CLK 2  // GP2
 #define SD_MOSI 7 // GP7
 #define SD_MISO 0 // GP0
 #define SD_SPI_PORT spi0
@@ -34,7 +34,7 @@ void setUp(void)
 {
     // Initialize SPI for SD card
     spi_init(SD_SPI_PORT, SD_SPI_BPS);
-    gpio_set_function(SD_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(SD_CLK, GPIO_FUNC_SPI);
     gpio_set_function(SD_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SD_MISO, GPIO_FUNC_SPI);
 

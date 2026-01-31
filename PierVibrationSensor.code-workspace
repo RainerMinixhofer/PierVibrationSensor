@@ -10,6 +10,9 @@
 			"optional": "cpp",
 			"string_view": "cpp",
 			"future": "cpp"
+		},
+		"chat.tools.terminal.autoApprove": {
+			"pio": true
 		}
 	}
 }

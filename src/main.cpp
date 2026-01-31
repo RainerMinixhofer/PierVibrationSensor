@@ -14,7 +14,7 @@
 #define USE_HARDWARE_SPI // comment out to use software SPI for TFT display
 
 // Global networking control variable
-bool use_networking = true; // Set to true to enable networking (WIZNET first, then WiFi fallback)
+bool use_networking = false; // Set to true to enable networking (WIZNET first, then WiFi fallback)
 
 // --- Logging and Debug Output ---
 enum LogLevel
@@ -37,7 +37,16 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
+// Prevent Ethernet/WiFi enum conflicts by renaming Wiznet Ethernet symbols
+#define EthernetLinkStatus EthernetLinkStatus_Wiznet
+#define Unknown Unknown_Wiznet
+#define LinkON LinkON_Wiznet
+#define LinkOFF LinkOFF_Wiznet
 #include <Ethernet.h>
+#undef EthernetLinkStatus
+#undef Unknown
+#undef LinkON
+#undef LinkOFF
 #include <WiFi.h>
 #include <hardware/flash.h>
 #include <hardware/sync.h>
@@ -57,6 +66,7 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 #include <Adafruit_ICM20948.h>
 #include <Adafruit_Sensor.h>
 #include "version.h"
+#include "pin_config.h" // GPIO pin assignments
 
 #define PERFORM_CALIBRATION // Comment to disable startup calibration
 
@@ -64,24 +74,11 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 
 // WIZNET5K Ethernet settings
 #define WIZNET_SPI_PORT spi0
-#define WIZNET_SPI_SCK 18
-#define WIZNET_SPI_MOSI 19
-#define WIZNET_SPI_MISO 16
-#define WIZNET_SPI_CS 17
 #define WIZNET_SPI_BPS 2000 * 1000
-#define WIZNET_RST 20 ///< WIZNET5K HW reset input pin
-#define WIZNET_INT 21 ///< WIZNET5K interrupt output pin (goes low when e.g. when wake on LAN is triggered)
 
 // Constants for ADS1256
 #define ADS1256_SPI_PORT SPI1
-#define ADS1256_SPI_SCK 10
-#define ADS1256_SPI_MOSI 11
-#define ADS1256_SPI_MISO 12
-#define ADS1256_SPI_CS 13
-#define ADS1256_SPI_RST 0 // Set to 0 if not used
 #define ADS1256_SPI_BPS 1400 * 1000
-#define ADS1256_SYNC 14
-#define ADS1256_DRDY 15
 #define ADS1256_DRATE DRATE_2000SPS // 2000 SPS to get approximately 500 SPS overall
 #define ADS1256_CLOCKMHZ 7.68
 #define ADS1256_VREF 2.5
@@ -91,9 +88,6 @@ ADS1256 ads(ADS1256_DRDY, ADS1256_SPI_RST, ADS1256_SYNC, ADS1256_SPI_CS, 2.500, 
 
 // Constants for ICM20948
 #define ICM20948_I2C_PORT Wire // Connected to I2C0
-#define ICM20948_I2C_SDA 8
-#define ICM20948_I2C_SCL 9
-#define ICM20948_INT 5
 #define ICM20948_I2C_BPS 400 * 1000
 #define ICM20948_ADDR 0x69 // AD0 pin high
 Adafruit_ICM20948 icm;
@@ -107,21 +101,6 @@ Adafruit_ICM20948 icm;
 #define RINGBUFFER_ACCELZ_RAW 5
 
 // Constants for TFT display with ILI9341 driver
-// Hardware pins mapping (Display <-> Raspberry Pi Pico 2 W):
-// SDO(MISO) <-> GP0
-// SCK <-> GP2
-// SDI(MOSI) <-> GP7
-// DC <-> GP4
-// RESET <-> GP6
-// CS <-> GP1
-
-#define TFT_SCLK 2      // GP2 (SCK)
-#define TFT_MOSI 7      // GP7 (SDI)
-#define TFT_MISO 0      // GP0 (SDO), set to -1 if not used
-#define TFT_CS 1        // GP1
-#define TFT_DC 4        // GP4
-#define TFT_RST 6       // GP6, set to -1 if not used
-#define TFT_LED 3       // GP3, Set to -1 if not used
 #define TFT_ROTATION 1  // Set the default rotation for the display
 #define TFT_TEXT_SIZE 1 // Set the default text size for the display
 
@@ -136,11 +115,6 @@ Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
 // Set FORCETOUCHCALIBRATION to true to force touch calibration at every startup.
 // You can get the resulting calibration parameters from the webpage with 'Show Calibration Data' button.
 #define FORCETOUCHCALIBRATION false // Set to true to force touch calibration at every startup
-#define TOUCH_CLK TFT_SCLK          // GP2 (shared with TFT and SD SCK)
-#define TOUCH_DIN TFT_MOSI          // GP7 (shared with TFT and SD MOSI)
-#define TOUCH_DO TFT_MISO           // GP0 (shared with TFT and SD MISO)
-#define TOUCH_CS 22                 // GP22, Set to -1 if not used
-#define TOUCH_IRQ 27                // GP27, Set to -1 if not used
 
 // Create TFT touchscreen object using XPT2046 driver
 #define TOUCH_SPI_PORT spi0 // Using SPI0
@@ -155,15 +129,6 @@ const uint16_t XPT2046_XMAX_VALUE = (1 << (XPT2046_RESOLUTION_BITS - 1)) - 1; //
 // SD_FAT_TYPE = 0 for SdFat/File as defined in SdFatConfig.h,
 // 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
 #define SD_FAT_TYPE 3
-//
-// Chip select pin
-#define SD_CS_PIN = 10
-//
-// Pin numbers in templates must be constants.
-#define SD_SCK TFT_SCLK  // GP2 (shared with TFT and Touch SCK)
-#define SD_MOSI TFT_MOSI // GP7 (shared with TFT and Touch MOSI)
-#define SD_MISO TFT_MISO // GP0 (shared with TFT and Touch MISO)
-#define SD_CS 26         // GP26
 
 #define SD_SPI_PORT TFT_SPI_PORT // Using same SPI0 as TFT
 #define SD_SPI_BPS 10000000      // 10 MHz for SD card (same as TFT and Touch)
@@ -250,8 +215,9 @@ volatile bool trigger_touch_calibration = false;                          // Tri
 // --- Touch Event Handling ---
 static volatile bool forceTouchCalibration = FORCETOUCHCALIBRATION; // Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
 static volatile bool touch_event_flag = false;
-static volatile int irq_save = 0;       // Save the IRQ state for touch events
-TS_Point touch_event_point = {0, 0, 0}; // Initialize touch point structure for XPT2046_Touchscreen
+static volatile int irq_save = 0;             // Save the IRQ state for touch events
+static volatile uint32_t touch_irq_count = 0; // Debug: number of touch IRQ triggers
+TS_Point touch_event_point = {0, 0, 0};       // Initialize touch point structure for XPT2046_Touchscreen
 
 // --- Sensor Data and Flags ---
 volatile bool ads1256_data_ready = false;  ///< Flag set by ADS1256 DRDY interrupt
@@ -387,11 +353,14 @@ void icm20948_int_isr(uint gpio, uint32_t events)
 // Interrupt handler for TFT touch controller (XPT2046)
 void touch_irq_isr(uint gpio, uint32_t events)
 {
+  (void)gpio;
+  (void)events;
   // Set a volatile flag for main loop processing
   gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false); // disable IRQ to prevent triggering during processing
   // For hardware SPI, just set the flag - don't read in IRQ context
   // Reading will be done in main loop after flag is detected
   touch_event_flag = true;
+  touch_irq_count++;
 }
 
 #ifdef DEBUG_BUILD
@@ -414,10 +383,12 @@ inline void debugSerialPrintln(double val) { Serial.println(val); }
 inline void debugSerialPrintln(char val) { Serial.println(val); }
 inline void debugSerialPrintf(const char *fmt, ...)
 {
+  char buffer[256];
   va_list args;
   va_start(args, fmt);
-  Serial.printf(fmt, args);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
   va_end(args);
+  Serial.print(buffer);
 }
 #else
 inline void debugSerialPrint(const char *) {}
@@ -457,7 +428,7 @@ void initSDCard()
   debugSerialPrintln("LittleFS mounted successfully.");
   debugSerialPrintln("Using hardware SPI for SD card");
   spi_init(SD_SPI_PORT, SD_SPI_BPS);
-  gpio_set_function(SD_SCK, GPIO_FUNC_SPI);
+  gpio_set_function(SD_CLK, GPIO_FUNC_SPI);
   gpio_set_function(SD_MOSI, GPIO_FUNC_SPI);
   gpio_set_function(SD_MISO, GPIO_FUNC_SPI);
 
@@ -681,6 +652,31 @@ void initTFTDisplay()
   gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI); // GP2 - SCK
   gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI); // GP7 - MOSI
   // Note: CS is handled by the library as a GPIO pin
+
+  // CRITICAL: Disable pull resistors on MISO - pull-up causes all reads to return 0xFF
+  gpio_set_pulls(TFT_MISO, false, false); // No pull-up, no pull-down
+  debugSerialPrintf("Disabled pull resistors on MISO (GP%d)\n", TFT_MISO);
+
+  // Verify GP0 function is actually set to SPI
+  uint32_t gp0_func = (iobank0_hw->io[TFT_MISO].ctrl & IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS) >> IO_BANK0_GPIO0_CTRL_FUNCSEL_LSB;
+  debugSerialPrintf("GP%d function register: %d (should be 1 for SPI)\n", TFT_MISO, gp0_func);
+
+  // SPI LOOPBACK TEST - verify MISO works (connect GP3 to GP0 with jumper)
+  debugSerialPrintln("\n*** SPI LOOPBACK TEST - Connect GP3 to GP0 ***");
+  uint8_t lb_tx[4] = {0xAA, 0x55, 0x12, 0x34};
+  uint8_t lb_rx[4] = {0, 0, 0, 0};
+  spi_write_read_blocking(spi0, lb_tx, lb_rx, 4);
+  debugSerialPrintf("Loopback: TX=0x%02X 0x%02X 0x%02X 0x%02X, RX=0x%02X 0x%02X 0x%02X 0x%02X\n",
+                    lb_tx[0], lb_tx[1], lb_tx[2], lb_tx[3], lb_rx[0], lb_rx[1], lb_rx[2], lb_rx[3]);
+  if (lb_rx[0] == 0xAA && lb_rx[1] == 0x55)
+  {
+    debugSerialPrintln("SUCCESS: GP0 MISO works!");
+  }
+  else
+  {
+    debugSerialPrintln("FAILED: GP0 MISO not receiving!");
+  }
+  debugSerialPrintln("*** Remove jumper to continue ***\n");
 
   debugSerialPrintln("Hardware SPI initialized for TFT display:");
   debugSerialPrintf("SPI Port: spi0, Speed: %d Hz\n", SPI0_BPS);
@@ -3270,13 +3266,105 @@ void setup()
   // This ensures the touchscreen works correctly after WIZNET5K and other devices
   // have potentially modified the SPI0 bus settings
   debugSerialPrintln("Re-initializing touchscreen after SPI bus setup...");
-  spi_init(TOUCH_SPI_PORT, SPI0_BPS); // Ensure SPI0 is running at 10MHz for touchscreen
-  gpio_set_function(TOUCH_CLK, GPIO_FUNC_SPI);
-  gpio_set_function(TOUCH_DIN, GPIO_FUNC_SPI);
-  gpio_set_function(TOUCH_DO, GPIO_FUNC_SPI);
-  touchscreen.begin();
+
+  // Disable other SPI0 devices first
+  if (TFT_CS != -1)
+  {
+    gpio_init(TFT_CS);
+    gpio_set_dir(TFT_CS, GPIO_OUT);
+    gpio_put(TFT_CS, 1); // Deselect TFT
+  }
+  if (SD_CS != -1)
+  {
+    gpio_init(SD_CS);
+    gpio_set_dir(SD_CS, GPIO_OUT);
+    gpio_put(SD_CS, 1); // Deselect SD
+  }
+
+  // DON'T reconfigure SPI - TFT already initialized it
+  debugSerialPrintf("Initializing touchscreen with CS on GPIO %d...\n", TOUCH_CS);
+  debugSerialPrintln("Note: Using existing SPI0 configuration from TFT");
+
+  // CRITICAL: Disable pull-up on MISO (GP0) - pull-up causes 0xFF reads
+  gpio_set_pulls(TFT_MISO, false, false); // No pull-up, no pull-down
+  debugSerialPrintf("Disabled pull resistors on MISO (GP%d)\n", TFT_MISO);
+
+  // Configure CS as GPIO for library to control (not hardware SPI CS)
+  pinMode(TOUCH_CS, OUTPUT);
+  digitalWrite(TOUCH_CS, HIGH);
+  debugSerialPrintf("Touch CS configured as GPIO output, initial state: %d\n", digitalRead(TOUCH_CS));
+
+  // Initialize the touchscreen library - it will use the existing SPI bus
+  debugSerialPrintln("Calling touchscreen.begin()...");
+  bool touch_ok = touchscreen.begin();
+  debugSerialPrintf("touchscreen.begin() returned: %d\n", touch_ok);
   touchscreen.setRotation(TFT_ROTATION);
+
+  // Setup touch IRQ
+  debugSerialPrintf("Setting up touch IRQ on GPIO %d...\n", TOUCH_IRQ);
+  gpio_init(TOUCH_IRQ);
+  gpio_set_dir(TOUCH_IRQ, GPIO_IN);
+  gpio_pull_up(TOUCH_IRQ);
+
+  // Read initial IRQ state
+  int irq_state = gpio_get(TOUCH_IRQ);
+  debugSerialPrintf("Touch IRQ initial state: %d (should be 1 when not touched)\n", irq_state);
+
+  gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, &touch_irq_isr);
+  debugSerialPrintln("Touch IRQ configured.");
+
   delay(100); // Brief stabilization delay
+
+  // Test touch read
+  debugSerialPrintln("Testing touch controller read...");
+  debugSerialPrintf("CS pin state before read: %d\n", gpio_get(TOUCH_CS));
+  TS_Point test_pt = touchscreen.getPoint();
+  debugSerialPrintf("CS pin state after read: %d\n", gpio_get(TOUCH_CS));
+  debugSerialPrintf("Touch test: touched=%d, x=%d, y=%d, z=%d\n",
+                    touchscreen.touched(), test_pt.x, test_pt.y, test_pt.z);
+
+  // Try manual SPI read to verify communication
+  debugSerialPrintln("Testing manual SPI read from touch controller...");
+
+  // XPT2046 requires SPI Mode 0, max 2 MHz
+  // Configure SPI for touch controller (different from TFT settings)
+  spi_set_format(TOUCH_SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+  spi_set_baudrate(TOUCH_SPI_PORT, 2000000); // 2 MHz for touch
+  debugSerialPrintln("SPI configured for XPT2046: Mode 0, 2 MHz");
+
+  // Re-verify GP0 is still SPI function
+  uint32_t gp0_func_now = (iobank0_hw->io[TFT_MISO].ctrl & IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS) >> IO_BANK0_GPIO0_CTRL_FUNCSEL_LSB;
+  debugSerialPrintf("GP%d function at touch test: %d (should be 1 for SPI)\n", TFT_MISO, gp0_func_now);
+  if (gp0_func_now != 1)
+  {
+    debugSerialPrintln("ERROR: GP0 no longer configured as SPI! Re-configuring...");
+    gpio_set_function(TFT_MISO, GPIO_FUNC_SPI);
+  }
+
+  // Test CS control with digitalWrite (what library uses)
+  debugSerialPrintf("CS before digitalWrite LOW: %d\n", digitalRead(TOUCH_CS));
+  digitalWrite(TOUCH_CS, LOW);
+  debugSerialPrintf("CS after digitalWrite LOW: %d\n", digitalRead(TOUCH_CS));
+  delayMicroseconds(1);
+
+  // XPT2046 protocol: send command, then transfer dummy bytes while reading response
+  // Command format: 0x93 = 1001 0011 (Y-pos, 12-bit, differential, PD=11 for always-on)
+  uint8_t tx_buf[3] = {0x93, 0x00, 0x00}; // Command + 2 dummy bytes (PD bits set for always-on)
+  uint8_t rx_buf[3];
+  spi_write_read_blocking(TOUCH_SPI_PORT, tx_buf, rx_buf, 3);
+
+  digitalWrite(TOUCH_CS, HIGH);
+  debugSerialPrintf("CS after digitalWrite HIGH: %d\n", digitalRead(TOUCH_CS));
+  debugSerialPrintf("Manual SPI read result (cmd 0x93): 0x%02X 0x%02X 0x%02X\n", rx_buf[0], rx_buf[1], rx_buf[2]);
+
+  // Also try with screen touched - touch it now and check again
+  debugSerialPrintln("*** TOUCH THE SCREEN NOW ***");
+  delay(2000);
+  digitalWrite(TOUCH_CS, LOW);
+  delayMicroseconds(1);
+  spi_write_read_blocking(TOUCH_SPI_PORT, tx_buf, rx_buf, 3);
+  digitalWrite(TOUCH_CS, HIGH);
+  debugSerialPrintf("Manual SPI read with touch: 0x%02X 0x%02X 0x%02X\n", rx_buf[0], rx_buf[1], rx_buf[2]);
 
   tftPrint("Starting Main Loop...\n");
   debugSerialPrintln("Main loop started - collecting sensor data");
@@ -3306,6 +3394,22 @@ void loop()
   static float gyroZ_block[UDP_PACKET_SIZE];
   static size_t block_idx = 0;
   static uint8_t icm_read_counter = 0; // Counter to reduce ICM20948 read frequency
+
+  // Debug: report touch IRQ triggers periodically
+  static uint32_t last_touch_irq_count = 0;
+  static unsigned long last_touch_irq_log = 0;
+  if (logVerbosity >= LOG_DEBUG && (millis() - last_touch_irq_log) > 1000)
+  {
+    uint32_t current_count = touch_irq_count;
+    if (current_count != last_touch_irq_count)
+    {
+      debugSerialPrintf("Touch IRQ count: %lu (delta %lu)\n",
+                        (unsigned long)current_count,
+                        (unsigned long)(current_count - last_touch_irq_count));
+      last_touch_irq_count = current_count;
+    }
+    last_touch_irq_log = millis();
+  }
 
   const uint8_t myMuxList[] = {SING_0, SING_7};                                     // or any list of SING_x constants
   adcValue0 = ads.cycleSingle(myMuxList, sizeof(myMuxList) / sizeof(myMuxList[0])); // Read single-ended channel 0 (Veloc X) selecting channel 7 as next channel

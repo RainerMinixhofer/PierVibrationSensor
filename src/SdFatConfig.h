@@ -29,6 +29,7 @@
  */
 #pragma once
 #include <stdint.h>
+#include "pin_config.h"
 #ifdef __AVR__
 #include <avr/io.h>
 #endif // __AVR__
@@ -167,10 +168,10 @@
  * 3 - An external SPI driver derived from SdSpiBaseClass is always used.
  */
 #ifndef SPI_DRIVER_SELECT
-#ifdef USE_HARDWARE_SPI
-#define SPI_DRIVER_SELECT 1  // Use standard library (hardware) SPI driver
-#else
+#if SD_SPI_PORT == -1
 #define SPI_DRIVER_SELECT 2  // Use software SPI driver
+#else
+#define SPI_DRIVER_SELECT 0  // Use hardware SPI driver
 #endif
 #endif // SPI_DRIVER_SELECT
 /**

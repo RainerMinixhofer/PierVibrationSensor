@@ -13,11 +13,6 @@
 // #define WAIT_FOR_TOUCH // comment out to disable waiting for touch input
 #define USE_HARDWARE_SPI // comment out to use software SPI for TFT display
 #define ENABLE_SD_CARD 0 // Set to 1 to enable SD card support (causes 10-30s delay if no card inserted)
-#define ENABLE_TFT 0     // Set to 1 to enable TFT display
-#define ENABLE_TOUCH 0   // Set to 1 to enable touchscreen
-#if !ENABLE_TFT
-#define tftPrint(...)
-#endif
 
 // Global networking control variable
 bool use_networking = true; // Set to true to enable networking (WIZNET first, then WiFi fallback)
@@ -186,6 +181,11 @@ IPAddress ip(10, 0, 3, 177);
 // Networking servers and UDP streams
 EthernetServer ethServer(HTTP_SERVER_PORT);
 WiFiServer wifiServer(HTTP_SERVER_PORT);
+EthernetClient ethClient;         // Global client to maintain connection state
+WiFiClient wifiClient;            // Global client to maintain connection state
+bool ethClientConnected = false;  // Track connection state
+bool wifiClientConnected = false; // Track connection state
+bool httpOperationActive = false; // Track when HTTP operations are active (disable SPI speed switching)
 EthernetUDP ethUdpStream;
 WiFiUDP wifiUdpStream;
 
@@ -200,9 +200,6 @@ enum NetworkMode
   NET_WIFI
 };
 NetworkMode netMode = NET_NONE;
-
-// Global flag to prevent duplicate server info printing across resets
-static bool serverInfoPrinted = false;
 
 /* DSP/FFT Implementation:
  * - The code supports both fixed-point and floating-point DSP pipelines for FFT and signal processing.
@@ -427,9 +424,49 @@ inline void debugSerialPrintf(const char *, ...) {}
 #endif
 
 // ============================================================================
-// SD CARD FUNCTIONS
+// SPI CONFIGURATION FUNCTIONS
 // ============================================================================
 
+/**
+ * @brief Initialize SPI bus for TFT display
+ */
+void tft_init_spi()
+{
+  // Initialize hardware SPI for TFT display
+  spi_init(TFT_SPI_PORT, TFT_SPI_BPS);
+
+  // Configure SPI pins
+  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI); // GP0 - MISO
+  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI); // GP2 - SCK
+  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI); // GP3 - MOSI
+  // Note: CS is handled by the library as a GPIO pin
+
+  // CRITICAL: Disable pull resistors on MISO
+  gpio_set_pulls(TFT_MISO, false, false); // No pull-up, no pull-down
+  debugSerialPrintf("Disabled pull resistors on MISO (GP%d)\n", TFT_MISO);
+
+  debugSerialPrintln("Hardware SPI initialized for TFT display");
+  debugSerialPrintf("SPI Port: spi0, Speed: %.2f MHz\n", TFT_SPI_BPS / 1000000.0);
+  debugSerialPrintf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
+  debugSerialPrintf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RESET);
+}
+
+/**
+ * @brief Initialize SPI bus for Touch controller
+ */
+void touch_init_spi()
+{
+  // Touch controller uses the same SPI bus (SPI0) as TFT
+  // CS pin is already configured by XPT2046_Touchscreen library
+  gpio_init(TOUCH_CS);
+  gpio_set_dir(TOUCH_CS, GPIO_OUT);
+  gpio_put(TOUCH_CS, 1); // CS idle high
+
+  debugSerialPrintln("Touch SPI initialized");
+  debugSerialPrintf("CS: GP%d, IRQ: GP%d\n", TOUCH_CS, TOUCH_IRQ);
+}
+
+// wiznet_init_spi() is defined further below with full Wiznet initialization
 #if ENABLE_SD_CARD
 void initSDCard()
 {
@@ -616,6 +653,8 @@ void setBacklight(float brightness)
 
 void tft_read_display_id_and_status()
 {
+  // SPI at 25MHz for all operations
+
   // ILI9341 responds to 0x04 (Read Display Identification Information)
   // Should return 3 bytes: Manufacturer ID, Module/Driver Version ID, Module/Driver ID
   // Yields 0x00 0x00 0x00 since the IDs seem not to be provided by the display
@@ -628,14 +667,18 @@ void tft_read_display_id_and_status()
   // print the IDs for debug
   debugSerialPrintf("ILI9341 ID bytes: 0x%02X 0x%02X 0x%02X\n", id1, id2, id3);
 
+  // SPI already at 25MHz
   tft.begin(TFT_SPI_BPS); // Pass SPI frequency to prevent override
 
+  // Read status at 25MHz
   uint8_t stat1 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 0); // #2 D[31:25] status bits
   uint8_t stat2 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 1); // #3 D[22:16] status bits
   uint8_t stat3 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 2); // #4 D[10:8] status bits
   uint8_t stat4 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 3); // #5 D[7:5] status bits
   // print the IDs for debug
   debugSerialPrintf("ILI9341 Status bytes: 0x%02X 0x%02X 0x%02X 0x%02X\n", stat1, stat2, stat3, stat4);
+
+  // SPI remains at 25MHz for all operations
 }
 
 void tft_read_test()
@@ -655,11 +698,12 @@ void tft_read_test()
   debugSerialPrintf("Gamma Control Byte: 0x%02X\n", x);
 }
 
-#if ENABLE_TFT
 void tftPrint(const char *msg, bool resetline = false)
 {
   // Print debug messages to Serial
   debugSerialPrint(msg);
+
+  // SPI already at 25MHz for all devices
 
   static int tft_line = 0;
   static const int font_height = 8 * TFT_TEXT_SIZE;
@@ -710,7 +754,6 @@ void tftPrint(const char *msg, bool resetline = false)
     }
   }
 }
-#endif
 
 void initTFTDisplay()
 {
@@ -718,23 +761,8 @@ void initTFTDisplay()
   // Note: Don't disable touch controller here - let XPT2046_Touchscreen library manage CS pin
   disableSDCard();
 
-  // Initialize hardware SPI for TFT display
-  spi_init(TFT_SPI_PORT, TFT_SPI_BPS);
-
-  // Configure SPI pins
-  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI); // GP0 - MISO
-  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI);  // GP2 - SCK
-  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI); // GP7 - MOSI
-  // Note: CS is handled by the library as a GPIO pin
-
-  // CRITICAL: Disable pull resistors on MISO - pull-up causes all reads to return 0xFF
-  gpio_set_pulls(TFT_MISO, false, false); // No pull-up, no pull-down
-  debugSerialPrintf("Disabled pull resistors on MISO (GP%d)\n", TFT_MISO);
-
-  debugSerialPrintln("Hardware SPI initialized for TFT display:");
-  debugSerialPrintf("SPI Port: spi0, Speed: %d Hz\n", TFT_SPI_BPS);
-  debugSerialPrintf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
-  debugSerialPrintf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RESET);
+  // Initialize TFT SPI pins and configuration (defined below)
+  tft_init_spi();
 
   setBacklight(0.0);      // Turn off backlight initially
   tft.begin(TFT_SPI_BPS); // Pass SPI frequency to prevent override
@@ -1080,9 +1108,9 @@ void calibrateTouchController()
   tft.setRotation(TFT_ROTATION);
 
   // Initialize touch controller with matching rotation
-  // touchscreen.begin(); // Disabled
+  touchscreen.begin();
 #ifdef USE_HARDWARE_SPI
-  // touchscreen.setRotation(TFT_ROTATION); // Disabled
+  touchscreen.setRotation(TFT_ROTATION);
 #endif
 
   tft.scrollTo(0); // Reset hardware scrolling to ensure correct coordinate mapping
@@ -3257,19 +3285,11 @@ void setup()
   }
   sleep_ms(1000);
 #endif
-#if ENABLE_TFT
   initTFTDisplay(); // Initialize TFT display early to show debug messages
-#endif
   tftPrint("Starting Pier Vibration Sensor...\n");
   char versionStr[100];
   sprintf(versionStr, "Version: %s (%s)\n", GIT_COMMIT_SHORT, GIT_COMMIT_DATE);
   tftPrint(versionStr);
-
-  // Start with display off to prevent SPI congestion
-  mode = -1;
-
-  // Initialize networking after TFT
-  netMode = initNetworking();
 
 #ifdef DEBUG_BUILD
   debugSerialPrintln("Git Version: " GIT_COMMIT_SHORT);
@@ -3317,8 +3337,8 @@ void setup()
   {
     tftPrint("No touch calibration found, starting calibration...\n");
     // calibrateTouchController() will initialize the touchscreen
-    // calibrateTouchController(); // Disabled
-    calibrationPerformed = true; // Skip calibration
+    calibrateTouchController();
+    calibrationPerformed = true;
   }
   else
   {
@@ -3327,17 +3347,17 @@ void setup()
     debugSerialPrintln("Initializing touchscreen with loaded calibration...");
 
     // Set display rotation
-    // tft.setRotation(TFT_ROTATION); // Disabled
+    tft.setRotation(TFT_ROTATION);
 
     // Reset hardware scrolling to ensure correct coordinate mapping
-    // tft.scrollTo(0); // Disabled
+    tft.scrollTo(0);
 
     // Initialize touch controller - begin() will handle CS pin setup
-    // touchscreen.begin(); // Disabled
-    // touchscreen.setRotation(TFT_ROTATION); // Disabled
+    touchscreen.begin();
+    touchscreen.setRotation(TFT_ROTATION);
 
     tftPrint("Touch controller initialized...\n");
-    // tft.setCursor(0, 0); // Disabled
+    tft.setCursor(0, 0);
   }
 
   initADS1256();
@@ -3347,7 +3367,7 @@ void setup()
   // Set your local timezone here (example: Central Europe)
   setLocalTimezone(LOCAL_TIMEZONE);
 
-  // Networking already initialized above
+  netMode = initNetworking();
   if (netMode == NET_WIFI)
   {
     byte mac[6];
@@ -3367,29 +3387,25 @@ void setup()
   }
 
   // Server is already started in initNetworking()
-  if (!serverInfoPrinted)
+  tftPrint("HTTP server started...\n");
+  if (netMode == NET_WIFI)
   {
-    tftPrint("HTTP server started...\n");
-    if (netMode == NET_WIFI)
-    {
-      resultStr = "Serving chart page at http://" + WiFi.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
-    }
-    else if (netMode == NET_WIZNET)
-    {
-      resultStr = "Serving chart page at http://" + Ethernet.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
-    }
-    else
-    {
-      resultStr = "No network connection - server not available\n";
-    }
-    tftPrint(resultStr.c_str());
-    resultStr = "UDP stream port: " + String(UDP_STREAM_PORT) + "\n";
-    tftPrint(resultStr.c_str());
-    resultStr = "UDP packet size: " + String(UDP_PACKET_SIZE) + "\n";
-    tftPrint(resultStr.c_str());
-    tftPrint("---------------------------------------------\n");
-    serverInfoPrinted = true;
+    resultStr = "Serving chart page at http://" + WiFi.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
   }
+  else if (netMode == NET_WIZNET)
+  {
+    resultStr = "Serving chart page at http://" + Ethernet.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
+  }
+  else
+  {
+    resultStr = "No network connection - server not available\n";
+  }
+  tftPrint(resultStr.c_str());
+  resultStr = "UDP stream port: " + String(UDP_STREAM_PORT) + "\n";
+  tftPrint(resultStr.c_str());
+  resultStr = "UDP packet size: " + String(UDP_PACKET_SIZE) + "\n";
+  tftPrint(resultStr.c_str());
+  tftPrint("---------------------------------------------\n");
   setup_dsp();
 
   tftPrint("---------------------------------------------\n");
@@ -3398,6 +3414,9 @@ void setup()
   // Re-initialize touchscreen after all other SPI devices have been configured
   // This ensures the touchscreen works correctly after WIZNET5K and other devices
   // have potentially modified the SPI0 bus settings
+  debugSerialPrintln("Touch disabled for debugging");
+
+  /*
   debugSerialPrintln("Re-initializing touchscreen after SPI bus setup...");
 
   // Disable other SPI0 devices first
@@ -3429,10 +3448,9 @@ void setup()
 
   // Initialize the touchscreen library - it will use the existing SPI bus
   debugSerialPrintln("Calling touchscreen.begin()...");
-  // bool touch_ok = touchscreen.begin(); // Disabled for testing
-  bool touch_ok = true; // Assume ok
+  bool touch_ok = touchscreen.begin();
   debugSerialPrintf("touchscreen.begin() returned: %d\n", touch_ok);
-  // touchscreen.setRotation(TFT_ROTATION); // Disabled
+  touchscreen.setRotation(TFT_ROTATION);
 
   // Setup touch IRQ
   debugSerialPrintf("Setting up touch IRQ on GPIO %d...\n", TOUCH_IRQ);
@@ -3445,17 +3463,18 @@ void setup()
   debugSerialPrintf("Touch IRQ initial state: %d (should be 1 when not touched)\n", irq_state);
 
   gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, &touch_irq_isr);
+  */
   debugSerialPrintln("Touch IRQ configured.");
 
   delay(100); // Brief stabilization delay
 
   // Test touch read
   debugSerialPrintln("Testing touch controller read...");
-  // debugSerialPrintf("CS pin state before read: %d\n", gpio_get(TOUCH_CS));
-  // TS_Point test_pt = touchscreen.getPoint();
-  // debugSerialPrintf("CS pin state after read: %d\n", gpio_get(TOUCH_CS));
-  // debugSerialPrintf("Touch test: touched=%d, x=%d, y=%d, z=%d\n",
-  //                   touchscreen.touched(), test_pt.x, test_pt.y, test_pt.z);
+  debugSerialPrintf("CS pin state before read: %d\n", gpio_get(TOUCH_CS));
+  TS_Point test_pt = touchscreen.getPoint();
+  debugSerialPrintf("CS pin state after read: %d\n", gpio_get(TOUCH_CS));
+  debugSerialPrintf("Touch test: touched=%d, x=%d, y=%d, z=%d\n",
+                    touchscreen.touched(), test_pt.x, test_pt.y, test_pt.z);
 
   // Try manual SPI read to verify communication
   debugSerialPrintln("Testing manual SPI read from touch controller...");
@@ -3510,17 +3529,28 @@ void setup()
 
 void loop()
 {
-  static unsigned long loop_start_time = 0;
-  static unsigned long block_start_time = 0;
-  static unsigned long timing_report_interval = 5000; // Report every 5 seconds
-  static unsigned long last_timing_report = 0;
-
-  // Initialize timing at loop start
-  loop_start_time = micros();
-
-  // Ensure all SPI0 CS pins are deselected at loop start
-  deselectSpi0DevicesForWiznet();
-
+  // Periodic network heartbeat (every 5s)
+  static uint32_t last_net_log_ms = 0;
+  if (millis() - last_net_log_ms > 5000)
+  {
+    if (netMode == NET_WIZNET)
+    {
+      auto linkStatus = Ethernet.linkStatus();
+      debugSerialPrintf("NET: WIZNET link=%d IP=%s\n", linkStatus, Ethernet.localIP().toString().c_str());
+      // Ensure server is running
+      ethServer.begin();
+    }
+    else if (netMode == NET_WIFI)
+    {
+      debugSerialPrintf("NET: WIFI status=%d IP=%s\n", WiFi.status(), WiFi.localIP().toString().c_str());
+      wifiServer.begin();
+    }
+    else
+    {
+      debugSerialPrintln("NET: NONE");
+    }
+    last_net_log_ms = millis();
+  }
   static int velocXraw_block[UDP_PACKET_SIZE];
   static int velocYraw_block[UDP_PACKET_SIZE];
   static float velocX_block[UDP_PACKET_SIZE];
@@ -3556,35 +3586,22 @@ void loop()
     last_touch_irq_log = millis();
   }
 
-  // TIMING BLOCK 1: ADS1256 Reading
-  block_start_time = micros();
   const uint8_t myMuxList[] = {SING_0, SING_7};                                     // or any list of SING_x constants
   adcValue0 = ads.cycleSingle(myMuxList, sizeof(myMuxList) / sizeof(myMuxList[0])); // Read single-ended channel 0 (Veloc X) selecting channel 7 as next channel
   velocX = ads.convertToVoltage(adcValue0) * 1000000;                               // Convert raw ADC value to uV
 
   adcValue7 = ads.cycleSingle(nullptr, 0);            // Read single-ended channel 7 (Veloc Y) selecting channel 0 as next channel
   velocY = ads.convertToVoltage(adcValue7) * 1000000; // Convert raw ADC value to uV
-  if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-  {
-    debugSerialPrintf("TIMING: ADS1256 Read: %lu us\n", micros() - block_start_time);
-  }
 
   // Read ICM20948 only every 5th iteration to improve overall sampling rate
   // This gives ~40 Hz for IMU data which is sufficient for slow vibrations
   icm_read_counter++;
   if (icm_read_counter >= 5)
   {
-    block_start_time = micros();
     readICM20948();
-    if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-    {
-      debugSerialPrintf("TIMING: ICM20948 Read: %lu us\n", micros() - block_start_time);
-    }
     icm_read_counter = 0;
   }
 
-  // TIMING BLOCK 2: Data Storage and Buffer Operations
-  block_start_time = micros();
   velocXraw_block[block_idx] = adcValue0;
   velocYraw_block[block_idx] = adcValue7;
   velocX_block[block_idx] = velocX;
@@ -3699,14 +3716,9 @@ void loop()
     last_report_sample = total_samples;
     last_report_time = current_time;
   }
-  if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-  {
-    debugSerialPrintf("TIMING: Data Storage/Buffer: %lu us\n", micros() - block_start_time);
-  }
 
   if (block_idx >= UDP_PACKET_SIZE)
   {
-    block_start_time = micros();
     if (udpStreamEnable[0])
     {
       debugSerialPrintf("Sending UDP stream for velocXraw, count: %d\n", UDP_PACKET_SIZE);
@@ -3733,148 +3745,268 @@ void loop()
       sendSensorUDPStream("accelZ", accelZ_block, UDP_PACKET_SIZE);
     }
     block_idx = 0;
-    if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-    {
-      debugSerialPrintf("TIMING: UDP Streaming: %lu us\n", micros() - block_start_time);
-    }
   }
 
   if (netMode == NET_WIZNET || netMode == NET_WIFI)
   {
-    // Use a pointer to the active client
-    Stream *client = nullptr;
-
-    block_start_time = micros();
-
-    // Use non-blocking server methods (Ethernet uses available(), WiFi uses accept() as available() is deprecated)
-    if (netMode == NET_WIZNET)
+    // Accept new client if we don't have one
+    if (netMode == NET_WIZNET && !ethClientConnected)
     {
-      EthernetClient ethClient;
-      ethClient = ethServer.available();
+      ethClient = ethServer.accept();
       if (ethClient)
       {
-        client = &ethClient;
+        IPAddress clientIP = ethClient.remoteIP();
+        uint16_t clientPort = ethClient.remotePort();
 
-        if (logVerbosity >= LOG_DEBUG)
+        // Reject invalid connections (broadcast addresses, non-HTTP ports, etc.)
+        bool validConnection = true;
+        if (clientIP == IPAddress(255, 255, 255, 255) ||
+            clientIP == IPAddress(0, 0, 0, 0) ||
+            clientPort == 0 || clientPort == 67 || clientPort == 68 ||
+            clientPort == 123 || clientPort == 161 || clientPort == 162 ||                     // NTP, SNMP
+            clientPort == 53 || clientPort == 137 || clientPort == 138 || clientPort == 139 || // DNS, NetBIOS
+            clientPort < 1024)                                                                 // Reject all well-known ports except HTTP range
+        {                                                                                      // Invalid/null ports, DHCP ports, and non-HTTP service ports
+          validConnection = false;
+          debugSerialPrintf("HTTP: Rejecting invalid connection from %d.%d.%d.%d:%d\n",
+                            clientIP[0], clientIP[1], clientIP[2], clientIP[3], clientPort);
+          ethClient.stop();
+        }
+
+        if (validConnection)
         {
-          debugSerialPrintln("HTTP: Ethernet client connected");
+          ethClientConnected = true;
+          debugSerialPrintf("HTTP: New Ethernet client accepted from %d.%d.%d.%d:%d\n",
+                            clientIP[0], clientIP[1], clientIP[2], clientIP[3], clientPort);
         }
       }
     }
-    else if (netMode == NET_WIFI)
+    else if (netMode == NET_WIFI && !wifiClientConnected)
     {
-      WiFiClient wifiClient;
       wifiClient = wifiServer.accept();
       if (wifiClient)
       {
-        client = &wifiClient;
+        IPAddress clientIP = wifiClient.remoteIP();
+        uint16_t clientPort = wifiClient.remotePort();
 
-        if (logVerbosity >= LOG_DEBUG)
+        // Reject invalid connections (broadcast addresses, non-HTTP ports, etc.)
+        bool validConnection = true;
+        if (clientIP == IPAddress(255, 255, 255, 255) ||
+            clientIP == IPAddress(0, 0, 0, 0) ||
+            clientPort == 0 || clientPort == 67 || clientPort == 68 ||
+            clientPort == 123 || clientPort == 161 || clientPort == 162 ||                     // NTP, SNMP
+            clientPort == 53 || clientPort == 137 || clientPort == 138 || clientPort == 139 || // DNS, NetBIOS
+            clientPort < 1024)                                                                 // Reject all well-known ports except HTTP range
+        {                                                                                      // Invalid/null ports, DHCP ports, and non-HTTP service ports
+          validConnection = false;
+          debugSerialPrintf("HTTP: Rejecting invalid connection from %d.%d.%d.%d:%d\n",
+                            clientIP[0], clientIP[1], clientIP[2], clientIP[3], clientPort);
+          wifiClient.stop();
+        }
+
+        if (validConnection)
         {
-          debugSerialPrintln("HTTP: WiFi client connected");
+          wifiClientConnected = true;
+          debugSerialPrintf("HTTP: New WiFi client accepted from %d.%d.%d.%d:%d\n",
+                            clientIP[0], clientIP[1], clientIP[2], clientIP[3], clientPort);
         }
       }
     }
 
-    if (client)
+    // Use a pointer to the active client
+    Stream *client = nullptr;
+    Client *rawClient = nullptr;
+    if (netMode == NET_WIZNET && ethClientConnected)
     {
-      // Read the HTTP request line
+      client = &ethClient;
+      rawClient = &ethClient;
+    }
+    else if (netMode == NET_WIFI && wifiClientConnected)
+    {
+      client = &wifiClient;
+      rawClient = &wifiClient;
+    }
+
+    if (client && rawClient)
+    {
+      debugSerialPrintln("HTTP: Processing client request");
+      // Wait for HTTP request data to arrive (up to 5 seconds for initial data)
+      unsigned long waitStart = millis();
+      int waitCount = 0;
+      bool clientDisconnected = false;
+      while (rawClient->connected() && !client->available())
+      {
+        waitCount++;
+        if (waitCount % 50 == 0)
+        { // Log every 50 iterations (~0.5 second)
+          debugSerialPrintf("HTTP: Still waiting for data... (%lu ms, connected=%d, available=%d)\n",
+                            millis() - waitStart, rawClient->connected(), client->available());
+        }
+        if (millis() - waitStart > 5000) // Increased timeout back to 5 seconds
+        {
+          debugSerialPrintf("HTTP: No data received within 5s, closing connection\n");
+          httpOperationActive = false; // Re-enable SPI speed switching
+          ethClientConnected = false;
+          wifiClientConnected = false;
+          if (netMode == NET_WIZNET)
+          {
+            ethClient.stop();
+          }
+          else if (netMode == NET_WIFI)
+          {
+            wifiClient.stop();
+          }
+          return; // Exit early for non-data connections
+        }
+        delay(10); // Yield to network stack
+      }
+      if (!rawClient->connected())
+      {
+        clientDisconnected = true;
+        debugSerialPrintf("HTTP: Client disconnected before sending data\n");
+      }
+
       String req = "";
       if (client->available())
       {
+        unsigned long dataWaitTime = millis() - waitStart;
+        debugSerialPrintf("HTTP: Data available after %lu ms\n", dataWaitTime);
+        httpOperationActive = true; // Disable SPI speed switching during HTTP operations
+        client->setTimeout(500);
         req = client->readStringUntil('\r');
         client->readStringUntil('\n'); // consume end-of-line
         req.trim();
         debugSerialPrintf("HTTP request: %s\n", req.c_str());
-      }
 
-      // Consume the rest of the HTTP headers until a blank line
-      boolean currentLineIsBlank = true;
-      while (static_cast<Client *>(client)->connected())
-      {
-        if (client->available())
+        // Consume the rest of the HTTP headers until a blank line
+        while (static_cast<Client *>(client)->connected())
         {
-          char c = client->read();
-          if (c == '\n' && currentLineIsBlank)
+          String line = client->readStringUntil('\n');
+          if (line.length() == 0 || line == "\r")
+            break; // End of headers
+        }
+
+        if (req.indexOf("GET /udpstream") == 0)
+        {
+          debugSerialPrintln("HTTP: /udpstream");
+          serveUDPStreamControl(*client, req);
+        }
+        else if (req.indexOf("GET /setmode") == 0)
+        {
+          debugSerialPrintln("HTTP: /setmode");
+          serveModeControl(*client, req);
+        }
+        else if (req.indexOf("GET /setaxis") == 0)
+        {
+          debugSerialPrintln("HTTP: /setaxis");
+          serveAxisControl(*client, req);
+        }
+        else if (req.indexOf("GET /touchcalibrate") == 0)
+        {
+          debugSerialPrintln("HTTP: /touchcalibrate");
+          serveTouchCalibrate(*client, req);
+        }
+        else if (req.indexOf("GET /touchcalibdata") == 0)
+        {
+          debugSerialPrintln("HTTP: /touchcalibdata");
+          serveTouchCalibData(*client, req);
+        }
+        else if (req.indexOf("GET /setloglevel") == 0)
+        {
+          debugSerialPrintln("HTTP: /setloglevel");
+          serveSetLogLevel(*client, req);
+        }
+        else if (req.indexOf("GET /data") == 0)
+        {
+          debugSerialPrintln("HTTP: /data");
+          serveSensorData(*client);
+        }
+        else if (req.indexOf("GET /favicon.ico") == 0 || req.indexOf("favicon.ico") != -1)
+        {
+          debugSerialPrintln("HTTP: Serving favicon.ico");
+          client->println("HTTP/1.1 204 No Content");
+          client->println("Connection: close");
+          client->println();
+          client->flush();
+        }
+        else if (req.indexOf("GET / ") == 0 || req.indexOf("GET / HTTP") == 0 || req.indexOf("GET /index") == 0)
+        {
+          serveChartPage(*client);
+          debugSerialPrintln("HTTP: Chart page served, waiting before closing connection");
+          delay(10); // Small delay to allow browser to process response
+          // Close connection after serving the page
+          httpOperationActive = false; // Re-enable SPI speed switching
+          if (netMode == NET_WIZNET)
           {
-            // Blank line received, now process the request
-            if (req.indexOf("GET /data") == 0)
-            {
-              debugSerialPrintln("HTTP: /data");
-              serveSensorData(*client);
-            }
-            else if (req.indexOf("GET /udpstream") == 0)
-            {
-              debugSerialPrintln("HTTP: /udpstream");
-              serveUDPStreamControl(*client, req);
-            }
-            else if (req.indexOf("GET /setmode") == 0)
-            {
-              debugSerialPrintln("HTTP: /setmode");
-              serveModeControl(*client, req);
-            }
-            else if (req.indexOf("GET /setaxis") == 0)
-            {
-              debugSerialPrintln("HTTP: /setaxis");
-              serveAxisControl(*client, req);
-            }
-            else if (req.indexOf("GET /touchcalibrate") == 0)
-            {
-              debugSerialPrintln("HTTP: /touchcalibrate");
-              serveTouchCalibrate(*client, req);
-            }
-            else if (req.indexOf("GET /touchcalibdata") == 0)
-            {
-              debugSerialPrintln("HTTP: /touchcalibdata");
-              serveTouchCalibData(*client, req);
-            }
-            else if (req.indexOf("GET /setloglevel") == 0)
-            {
-              debugSerialPrintln("HTTP: /setloglevel");
-              serveSetLogLevel(*client, req);
-            }
-            else if (req.indexOf("GET /favicon.ico") == 0 || req.indexOf("favicon.ico") != -1)
-            {
-              client->println("HTTP/1.1 204 No Content");
-              client->println("Connection: close");
-              client->println();
-              client->flush();
-            }
-            else if (req.indexOf("GET / ") == 0 || req.indexOf("GET / HTTP") == 0 || req.indexOf("GET /index") == 0)
-            {
-              serveChartPage(*client);
-            }
-            else
-            {
-              // Unknown request, serve chart
-              serveChartPage(*client);
-            }
-            break;
+            ethClient.stop();
+            ethClientConnected = false;
           }
-          if (c == '\n')
+          else if (netMode == NET_WIFI)
           {
-            currentLineIsBlank = true;
+            wifiClient.stop();
+            wifiClientConnected = false;
           }
-          else if (c != '\r')
-          {
-            currentLineIsBlank = false;
-          }
+          return; // Exit early to prevent double connection closing
+        }
+        else
+        {
+          debugSerialPrintf("HTTP: Unknown request: %s\n", req.c_str());
+          client->println("HTTP/1.1 404 Not Found");
+          client->println("Content-Type: text/html");
+          client->println("Connection: close");
+          client->println();
+          client->println("<html><body><h2>404 - Page Not Found</h2></body></html>");
+          client->flush();
+        }
+      }
+      else
+      {
+        IPAddress clientIP = (netMode == NET_WIZNET) ? ethClient.remoteIP() : wifiClient.remoteIP();
+        uint16_t clientPort = (netMode == NET_WIZNET) ? ethClient.remotePort() : wifiClient.remotePort();
+        if (clientDisconnected)
+        {
+          debugSerialPrintf("HTTP: client %d.%d.%d.%d:%d disconnected without sending data\n",
+                            clientIP[0], clientIP[1], clientIP[2], clientIP[3], clientPort);
+        }
+        else
+        {
+          debugSerialPrintf("HTTP: client %d.%d.%d.%d:%d connected but sent no data\n",
+                            clientIP[0], clientIP[1], clientIP[2], clientIP[3], clientPort);
+        }
+        httpOperationActive = false; // Re-enable SPI speed switching
+        // No data received within timeout; close connection to avoid hanging
+        if (netMode == NET_WIZNET)
+        {
+          ethClient.stop();
+          ethClientConnected = false;
+        }
+        else if (netMode == NET_WIFI)
+        {
+          wifiClient.stop();
+          wifiClientConnected = false;
         }
       }
       delay(1);
-      static_cast<Client *>(client)->stop();
+      debugSerialPrintln("HTTP: Client request processing completed");
+      httpOperationActive = false; // Re-enable SPI speed switching
+      if (netMode == NET_WIZNET)
+      {
+        ethClient.stop();
+        ethClientConnected = false;
+      }
+      else if (netMode == NET_WIFI)
+      {
+        wifiClient.stop();
+        wifiClientConnected = false;
+      }
     }
-    if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-    {
-      debugSerialPrintf("TIMING: HTTP Networking: %lu us\n", micros() - block_start_time);
-    }
+    // NOTE: Don't restore SPI speed here - let Ethernet library manage it
+    // The Wiznet library will reconfigure SPI as needed for 25MHz operations
   }
 
-#if ENABLE_TOUCH
-  // TIMING BLOCK 4: Touch Input Handling
-  block_start_time = micros();
   // Handle touch input for mode selection menu
-  bool mode_changed = handleTouchInput(mode);
+  // bool mode_changed = handleTouchInput(mode);
+  bool mode_changed = false;
   if (mode_changed)
   {
     // Reset mode-specific flags when mode changes
@@ -3919,11 +4051,6 @@ void loop()
   }
 
   previous_mode = mode;
-  if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-  {
-    debugSerialPrintf("TIMING: Touch Input: %lu us\n", micros() - block_start_time);
-  }
-#endif
 
   if (mode == -1)
   {
@@ -3931,9 +4058,6 @@ void loop()
   }
   else
   {
-#if ENABLE_TFT
-    // TIMING BLOCK 5: Display Updates
-    block_start_time = micros();
     static int last_trigger_sample = -10000; // Track when we last triggered
 
     // Check if crossing was detected in real-time during data acquisition
@@ -3964,6 +4088,7 @@ void loop()
       }
     }
 
+    // Display updates run at 25MHz SPI, same as Wiznet
     if (mode == 0)
     {
       // Mode 0: Statistics text mode
@@ -4094,19 +4219,5 @@ void loop()
         last_display_update_mode23 = millis();
       }
     }
-    if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-    {
-      debugSerialPrintf("TIMING: Display Updates: %lu us\n", micros() - block_start_time);
-    }
-#endif
-  }
-
-  // TIMING REPORT: Total loop time
-  if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-  {
-    debugSerialPrintf("------\n");
-    debugSerialPrintf("TIMING: Total Loop: %lu us\n", micros() - loop_start_time);
-    debugSerialPrintf("======\n");
-    last_timing_report = millis();
   }
 }

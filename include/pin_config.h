@@ -80,7 +80,7 @@
 
 #define SD_SPI_PORT -1             // -1 = software SPI, 0 = hardware SPI0, 1 = hardware SPI1
 #define SD_SPI_BPS_INIT 400 * 1000 // 400 kHz for SD card initialization
-#define SD_SPI_BPS 5 * 100 * 1000  // 0.5 MHz for SD card
+#define SD_SPI_BPS 5 * 1000 * 1000 // 5 MHz for SD card
 #define SD_CLK 18                  // GP18  - Output: SPI Clock (shared)
 #define SD_MOSI 22                 // GP22  - Output: SPI MOSI (shared)
 #define SD_MISO 19                 // GP19  - Input:  SPI MISO (shared)

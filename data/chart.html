@@ -113,12 +113,16 @@
         <button id="accelZBtn" class="stream-btn disabled" onclick="toggleStream('accelZ')">UDP accelZ: OFF</button>
       </div>
       <div id="chart-container">
+        <!-- VELOCITY_CHART_START -->
         <div class="chart-box">
           <div id="velocChart" style="width:100%;height:300px;"></div>
         </div>
+        <!-- VELOCITY_CHART_END -->
+        <!-- ACCELERATION_CHART_START -->
         <div class="chart-box">
           <div id="accelChart" style="width:100%;height:300px;"></div>
         </div>
+        <!-- ACCELERATION_CHART_END -->
       </div>
     </div>
   </div>
@@ -348,6 +352,12 @@
             document.getElementById('current-mode').textContent = d.mode;
             // Update mode button highlighting
             updateModeButtons(d.mode);
+
+            // Hide/show charts based on mode: show only when display is off (mode -1)
+            const chartContainer = document.getElementById('chart-container');
+            if (chartContainer) {
+              chartContainer.style.display = (d.mode === -1) ? 'block' : 'none';
+            }
 
             // Update spectrogram scale only when in mode 3
             if (d.mode === 3 && d.spectrogramMax !== undefined) {

@@ -1,8 +1,8 @@
-# SD Card Test Suite - test_sd2
+# SD Card Test Suite - test_sd
 
 ## Overview
 
-This test directory contains a basic SD card test implementation using a custom SPI driver that directly interfaces with the SD card hardware. Unlike `test_sd` which uses the SdFat library, this implementation provides low-level block read/write operations.
+This test directory contains a basic SD card test implementation using a custom SPI driver that directly interfaces with the SD card hardware. It provides low-level block read/write operations.
 
 ## Pin Configuration
 
@@ -122,10 +122,10 @@ The `USE_FAST_GPIO` flag is automatically enabled for RP2040 targets. To disable
 
 ```bash
 # Build the test
-pio test -e test_sd2
+pio test -e test_sd
 
 # Upload and run the test
-pio test -e test_sd2 --upload-port COM3
+pio test -e test_sd --upload-port COM3
 ```
 
 ### Expected Output

@@ -13,62 +13,87 @@
 #define PIN_CONFIG_H
 
 // ============================================================================
-// TFT Display (ILI9341) - spi0 @ 25 MHz
+// TFT Display (ILI9341) - spi0 @ 37.5 MHz
 // ============================================================================
 
-#ifndef TFT_SPI_PORT
-#define TFT_SPI_PORT 0 // Use SPI0
-#endif
-#define TFT_SPI_BPS 40 * 1000 * 1000      // 40 MHz SPI clock for ILI9341
-#define TFT_SPI_BPS_READ 10 * 1000 * 1000 // 10 MHz SPI clock for ILI9341
-#ifndef TFT_SCLK
-#define TFT_SCLK 2 // GP2  - Output: SPI Clock
-#endif
-#ifndef TFT_MOSI
-#define TFT_MOSI 3 // GP3  - Output: SPI MOSI (Master Out Slave In)
-#endif
-#ifndef TFT_MISO
-#define TFT_MISO 0 // GP0  - Input:  SPI MISO (Master In Slave Out)
-#endif
-#ifndef TFT_CS
-#define TFT_CS 1 // GP1  - Output: Chip Select
-#endif
-#ifndef TFT_DC
-#define TFT_DC 4 // GP4  - Output: Data/Command Select
-#endif
-#ifndef TFT_RESET
-#define TFT_RESET 6 // GP6  - Output: Reset (active low)
-#endif
-#ifndef TFT_LED
-#define TFT_LED 7 // GP7  - Output: Backlight Control (PWM capable)
-#endif
+// ===========================================================================
+// Display Driver Chip
+// ===========================================================================
+#define ILI9341_DRIVER 1
+
+// ===========================================================================
+// Interface mode
+// ===========================================================================
+// #define TFT_PARALLEL_8_BIT 0   // Not using parallel
+// #define RP2040_PIO_INTERFACE 0 // Not using PIO
+
+// ===========================================================================
+// Pin configuration - explicit values from pin_config.h
+// ===========================================================================
+// TFT Display pins
+#define TFT_MISO 0            // GP0  - SPI MISO
+#define TFT_MOSI 3            // GP3  - SPI MOSI
+#define TFT_SCLK 2            // GP2  - SPI Clock
+#define TFT_CS 1              // GP1  - Chip Select
+#define TFT_DC 4              // GP4  - Data/Command
+#define TFT_RST 6             // GP6  - Reset
+#define TFT_BL 7              // GP7  - Backlight
+#define TFT_BACKLIGHT_ON HIGH // assuming active HIGH control of backlight
+
+// ===========================================================================
+// SPI Frequencies (Hz)
+// ===========================================================================
+#define SPI_FREQUENCY 37500000      // Default write frequency: 37.5 MHz (CPSDVSR=2, SCR=0)
+#define SPI_READ_FREQUENCY 10000000 // Read frequency: 10 MHz (reduced for register reading test)
+
+// ===========================================================================
+// Display configuration
+// ===========================================================================
+// Override TFT display dimensions for landscape mode (320x240)
+// Library defaults are portrait (240x320), so we redefine after include
+#undef TFT_WIDTH
+#undef TFT_HEIGHT
+#define TFT_WIDTH 320
+#define TFT_HEIGHT 240
+#define TFT_ROTATION 1 // Landscape (0=portrait, 1=landscape, 2=reverse portrait, 3=reverse landscape)
+
+// ===========================================================================
+// Font selection
+// ===========================================================================
+#define LOAD_GLCD  // 1. Standard 5x7 pixel font - needs ~1820 bytes in FLASH
+#define LOAD_FONT2 // 2. Small 16 pixel high font, needs ~3534 bytes in FLASH, 96 characters
+#define LOAD_FONT4 // 4. Medium 26 pixel high font, needs ~5848 bytes in FLASH, 96 characters
+#define LOAD_FONT6 // 6. Large 48 pixel font, needs ~2666 bytes in FLASH, only characters 1234567890:-.apm
+#define LOAD_FONT7 // 7. 7 segment 48 pixel font, needs ~2438 bytes in FLASH, only characters 1234567890:-.
+#define LOAD_FONT8 // 8. Large 75 pixel font needs ~3256 bytes in FLASH, only characters 1234567890:-.
+#define LOAD_GFXFF // FreeFonts. Use #include <FS.h> and #include <SPIFFS.h> in sketch
+
+// ===========================================================================
+// Optional features
+// ===========================================================================
+// #define SMOOTH_FONT
 
 // ============================================================================
 // Touchscreen (XPT2046) - spi0 @ 1 MHz
 // ============================================================================
 
-#define TOUCH_SPI_PORT TFT_SPI_PORT   // Shared with TFT and Wiznet
-#define TOUCH_SPI_BPS 1 * 1000 * 1000 // 1 MHz SPI clock for XPT2046
-#define TOUCH_CLK TFT_SCLK            // GP2  - Output: SPI Clock (shared)
-#define TOUCH_DIN TFT_MOSI            // GP3  - Output: SPI MOSI (shared)
-#define TOUCH_DO TFT_MISO             // GP0  - Input:  SPI MISO (shared)
-#ifndef TOUCH_CS
-#define TOUCH_CS 26 // GP26 - Output: Chip Select
-#endif
-#define TOUCH_IRQ 27 // GP27 - Input:  Touch Interrupt (active low)
+#define TOUCH_CS 26                 // GP26 - Touch Chip Select
+#define SPI_TOUCH_FREQUENCY 2500000 // Touch frequency: 2.5 MHz
+#define TOUCH_IRQ 27                // GP27 - Input:  Touch Interrupt (active low)
 
 // ============================================================================
-// Wiznet (W5500/W5100S Ethernet) - spi0 @ 20 MHz
+// Wiznet (W5500/W5100S Ethernet) - spi0 @ 37.5 MHz
 // ============================================================================
 
-#define WIZNET_SPI_PORT TFT_SPI_PORT    // Shared with TFT and Touchscreen
-#define WIZNET_SPI_BPS 20 * 1000 * 1000 // 20    MHz SPI clock for Wiznet
-#define WIZNET_SCLK TFT_SCLK            // GP2  - Output: SPI Clock (shared)
-#define WIZNET_MOSI TFT_MOSI            // GP3  - Output: SPI MOSI (shared)
-#define WIZNET_MISO TFT_MISO            // GP0  - Input:  SPI MISO (shared)
-#define WIZNET_SPI_CS 17                // GP17 - Output: Chip Select
-#define WIZNET_RST 20                   // GP20 - Output: Hardware Reset (active low)
-#define WIZNET_INT 21                   // GP21 - Input:  Interrupt (active low, e.g., Wake-on-LAN)
+#define WIZNET_SPI_PORT TFT_SPI_PORT // Shared with TFT and Touchscreen
+#define USING_SPI2 false             // Set to true if using SPI2 for Wiznet (not shared), false if using shared SPI0
+#define WIZNET_SPI_BPS 37500000      // 37.5 MHz SPI clock for Wiznet
+#define WIZNET_SCLK TFT_SCLK         // GP2  - Output: SPI Clock (shared)
+#define WIZNET_MOSI TFT_MOSI         // GP3  - Output: SPI MOSI (shared)
+#define WIZNET_MISO TFT_MISO         // GP0  - Input:  SPI MISO (shared)
+#define WIZNET_SPI_CS 17             // GP17 - Output: Chip Select
+#define WIZNET_RST 20                // GP20 - Output: Hardware Reset (active low)
+#define WIZNET_INT 21                // GP21 - Input:  Interrupt (active low, e.g., Wake-on-LAN)
 
 // Define SPI_ETHERNET_SETTINGS for Ethernet_Generic library
 // (w5100.h will redefine this, so we use a wrapper macro for the intended value)
@@ -124,8 +149,8 @@ GP2  - TFT_SCLK / TOUCH_CLK / WIZNET_SCLK (Output)
 GP3  - TFT_MOSI / TOUCH_DIN / WIZNET_MOSI (Output)
 GP4  - TFT_DC (Output)
 GP5  - ICM20948_INT (Input)
-GP6  - TFT_RESET (Output)
-GP7  - TFT_LED (Output, PWM)
+GP6  - TFT_RST (Output)
+GP7  - TFT_BL (Output, PWM)
 GP8  - ICM20948_I2C_SDA (I/O)
 GP9  - ICM20948_I2C_SCL (Output)
 GP10 - ADS1256_SCLK (Output)

@@ -1,0 +1,56 @@
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+; SPDX-License-Identifier: BSD-3-Clause
+
+; Full-duplex SPI with SCK period of 4 clock cycles
+; Clock phase = 0: data is captured on the leading edge of each SCK pulse
+
+.program spi_cpha0
+.side_set 1
+
+; Pin assignments:
+; - SCK is side-set pin 0
+; - MOSI is OUT pin 0
+; - MISO is IN pin 0
+
+.wrap_target
+    pull side 0
+    out pins, 1 side 0 [1] ; Output MOSI, SCK low, delay
+    in pins, 1 side 1 [1]  ; Input MISO, SCK high, delay
+.wrap
+
+% c-sdk {
+#include "hardware/gpio.h"
+
+static inline void pio_spi_init(PIO pio, uint sm, uint prog_offs, uint n_bits,
+        float clkdiv, bool cpha, bool cpol, uint pin_sck, uint pin_mosi, uint pin_miso) {
+    pio_sm_config c = spi_cpha0_program_get_default_config(prog_offs);
+    
+    sm_config_set_out_pins(&c, pin_mosi, 1);
+    sm_config_set_in_pins(&c, pin_miso);
+    sm_config_set_sideset_pins(&c, pin_sck);
+    
+    // MSB-first, auto push/pull, threshold=n_bits
+    sm_config_set_out_shift(&c, false, true, n_bits);
+    sm_config_set_in_shift(&c, false, true, n_bits);
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    // MOSI, SCK output are low, MISO is input
+    pio_sm_set_pins_with_mask(pio, sm, 0, (1u << pin_sck) | (1u << pin_mosi));
+    pio_sm_set_pindirs_with_mask(pio, sm, (1u << pin_sck) | (1u << pin_mosi), 
+                                  (1u << pin_sck) | (1u << pin_mosi) | (1u << pin_miso));
+    
+    pio_gpio_init(pio, pin_mosi);
+    pio_gpio_init(pio, pin_miso);
+    gpio_disable_pulls(pin_miso);
+    pio_gpio_init(pio, pin_sck);
+
+    // Configure CPOL via GPIO inversion
+    gpio_set_outover(pin_sck, cpol ? GPIO_OVERRIDE_INVERT : GPIO_OVERRIDE_NORMAL);
+    
+    // Bypass input synchronizer to reduce input delay
+    hw_set_bits(&pio->input_sync_bypass, 1u << pin_miso);
+
+    pio_sm_init(pio, sm, prog_offs, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

@@ -3,21 +3,18 @@
  * @brief Main application for Pier Vibration Sensor: Reads ADS1256 and MPU-6500, serves web UI, and streams UDP sensor data.
  *
  * @note SPI Bus Configuration:
- * - All devices on SPI0: Display (ILI9341), Touchscreen (XPT2046), SD Card @ 10 MHz
+ * - All devices on SPI0: Display (ILI9341), Touchscreen (XPT2046) and WIZNET Ethernet (W5500/W5100S) share SPI0 with separate chip selects.
  * - SPI1: ADS1256 @ 1.4 MHz
+ * - I2C0: ICM20948 9-DOF sensor @ 400 kHz
+ * - GPIO: SD card uses software SPI on separate GPIO pins to avoid conflicts with SPI0 devices.
  * - Fixed clock speeds have proven to be most stable
  */
 
 // Networking is now runtime-controlled via use_networking global variable
 // WIZNET-first-then-WiFi-fallback logic implemented in initNetworking()
 // #define WAIT_FOR_TOUCH // comment out to disable waiting for touch input
-#define USE_HARDWARE_SPI // comment out to use software SPI for TFT display
-#define ENABLE_SD_CARD 0 // Set to 1 to enable SD card support (causes 10-30s delay if no card inserted)
-#define ENABLE_TFT 0     // Set to 1 to enable TFT display
-#define ENABLE_TOUCH 0   // Set to 1 to enable touchscreen
-#if !ENABLE_TFT
-#define tftPrint(...)
-#endif
+#define ENABLE_SD_CARD 1 // Set to 1 to enable SD card support (causes 10-30s delay if no card inserted)
+// #define TESTING_WEBSERVER // Uncomment to use simple counter page webserver from test_wiznet_counter_button for testing
 
 // Global networking control variable
 bool use_networking = true; // Set to true to enable networking (WIZNET first, then WiFi fallback)
@@ -35,50 +32,44 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 
 #include <Arduino.h>
 #include "pico/stdlib.h" // <-- Add this include for Pico SDK functions
-#include "hardware/spi.h"
-#include "hardware/i2c.h"
+// #include "hardware/spi.h"
+// #include "hardware/i2c.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdarg.h>
 #include <sys/time.h>
 #include <time.h>
-#include "pin_config.h"
-// Prevent Ethernet/WiFi enum conflicts by renaming Wiznet Ethernet symbols
-#define EthernetLinkStatus EthernetLinkStatus_Wiznet
-#define Unknown Unknown_Wiznet
-#define LinkON LinkON_Wiznet
-#define LinkOFF LinkOFF_Wiznet
-#define W5100Class W5100Class_Wiznet
-#include <Ethernet_Generic.h>
-
-// Undefine macros before including WiFi to avoid conflicts
+// Rename lwIP Ethernet enum and its values to prevent conflict with Ethernet library
+#define EthernetLinkStatus EthernetLinkStatus_LWIP
+#define Unknown Unknown_LWIP
+#define LinkON LinkON_LWIP
+#define LinkOFF LinkOFF_LWIP
+#define DHCP_TIMEOUT 10000 // 10 seconds for DHCP
+#define LINK_TIMEOUT 5000  // 5 seconds for link detection
+#include <WiFi.h>
 #undef EthernetLinkStatus
 #undef Unknown
 #undef LinkON
 #undef LinkOFF
-#undef W5100Class
-
-extern W5100Class_Wiznet W5100;
 #ifdef UDP_TX_PACKET_MAX_SIZE
 #undef UDP_TX_PACKET_MAX_SIZE
 #endif
-#include <WiFi.h>
+// Now include the Ethernet library which defines its own EthernetLinkStatus and enum values
+#include <Ethernet_Generic.h>
 #include <hardware/flash.h>
-#include <hardware/sync.h>
+// #include <hardware/sync.h>
 #include <hardware/pwm.h> // Add this include for PWM functions
 #include <ADS1256.h>      // Make sure to include the ADS1256 library
-// #include <FastIMU.h>
 #include <Wire.h>
 #include <FS.h>       // Already present
 #include <LittleFS.h> // Use LittleFS for file system operations
 #include "arm_math.h"
-#include "Adafruit_GFX.h"
-#include "Adafruit_ILI9341.h"
-#include <XPT2046_Touchscreen.h>
+#include <TFT_eSPI.h>    // TFT_eSPI supports both display and touch
 #include "SdFatConfig.h" // Include SdFatConfig.h for SD card support
 #include <SdFat.h>
-#include <Adafruit_ICM20X.h>
+#include "sd_spi.h" // Low-level SD card SPI interface
+// #include <Adafruit_ICM20X.h>
 #include <Adafruit_ICM20948.h>
 #include <Adafruit_Sensor.h>
 #include "version.h"
@@ -107,28 +98,33 @@ Adafruit_ICM20948 icm;
 #define RINGBUFFER_ACCELY_RAW 4
 #define RINGBUFFER_ACCELZ_RAW 5
 
-// Constants for TFT display with ILI9341 driver
-#define TFT_ROTATION 1  // Set the default rotation for the display
-#define TFT_TEXT_SIZE 1 // Set the default text size for the display
+// Constants for TFT display with TFT_eSPI
+#define TFT_TEXT_SIZE 1             // Set the default text size for the display
+#define TFT_DISPLAY_REFRESH_RATE 20 // Set a refresh rate of 20 FPS for the display modes 1,2 and 3
+#define TEXT_DISPLAY_REFRESH_RATE 1 // Set a refresh rate of 1 FPS for the text display in mode 0
 
-Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RESET);
+// Create TFT_eSPI object (handles both display and touch via eSPI_Setup.h)
+TFT_eSPI tft = TFT_eSPI();
+
+// ILI9341 hardware scrolling command constants
+#define ILI9341_VSCRDEF 0x33  // Vertical Scroll Definition
+#define ILI9341_VSCRSADD 0x37 // Vertical Scrolling Start Address
+
+// Hardware scrolling configuration (landscape mode 320x240)
+#define SCROLL_TOP_FIXED_AREA 0    // Lines fixed at top
+#define SCROLL_BOTTOM_FIXED_AREA 0 // Lines fixed at bottom
+static uint16_t scroll_x_start = SCROLL_TOP_FIXED_AREA;
 
 // Custom color constants (RGB565 format)
 #define COLOR_GREY 0x7BEF // Medium grey for UI elements
 
-// Constants for XPT2046 TFT touch controller
+// Touch controller calibration settings
 // Set FORCETOUCHCALIBRATION to true to force touch calibration at every startup.
 // You can get the resulting calibration parameters from the webpage with 'Show Calibration Data' button.
 #define FORCETOUCHCALIBRATION false // Set to true to force touch calibration at every startup
 
-// Create TFT touchscreen object using XPT2046 driver
-XPT2046_Touchscreen touchscreen(TOUCH_CS, TOUCH_IRQ);
-
-// XPT2046 touch controller resolution constants
-// XPT2046 uses 12-bit ADC (0-4095 range)
-const uint8_t XPT2046_RESOLUTION_BITS = 12;                                   // ADC resolution in bits
-const uint16_t XPT2046_YMAX_VALUE = (1 << XPT2046_RESOLUTION_BITS) - 1;       // Maximum raw coordinate value based on resolution (4095)
-const uint16_t XPT2046_XMAX_VALUE = (1 << (XPT2046_RESOLUTION_BITS - 1)) - 1; // Due to wiring, X max is half of full range (2047)
+// Touch calibration threshold for TFT_eSPI getTouch()
+#define TOUCH_THRESHOLD 600 // Pressure threshold for valid touch
 
 // SD_FAT_TYPE = 0 for SdFat/File as defined in SdFatConfig.h,
 // 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
@@ -173,15 +169,21 @@ struct CalibrationMatrix
 #define LOCAL_TIMEZONE "Europe/Vienna" // Set your local timezone (IANA TZ format)
 #define NTP_SERVER "10.0.0.1"          // Set your local NTP server IP here
 #define NTP_PORT 123
-#define NTP_TIMEOUT_MS 10000
+#define NTP_TIMEOUT_MS 2000
 
-#define HTTP_SERVER_PORT 3000
+#define HTTP_SERVER_PORT 3001
 #define UDP_STREAM_PORT 10000
 #define UDP_PACKET_SIZE 32 // Set your desired block size
 
 // --- Fallback IP when DHCP is not working ---
 
 IPAddress ip(10, 0, 3, 177);
+
+// DHCP-assigned network parameters
+IPAddress assignedIP;
+IPAddress assignedGateway;
+IPAddress assignedSubnet;
+IPAddress assignedDNS;
 
 // Networking servers and UDP streams
 EthernetServer ethServer(HTTP_SERVER_PORT);
@@ -199,7 +201,7 @@ enum NetworkMode
   NET_WIZNET,
   NET_WIFI
 };
-NetworkMode netMode = NET_NONE;
+volatile NetworkMode netMode = NET_NONE;
 
 // Global flag to prevent duplicate server info printing across resets
 static bool serverInfoPrinted = false;
@@ -232,7 +234,7 @@ static volatile bool forceTouchCalibration = FORCETOUCHCALIBRATION; // Set to tr
 static volatile bool touch_event_flag = false;
 static volatile int irq_save = 0;             // Save the IRQ state for touch events
 static volatile uint32_t touch_irq_count = 0; // Debug: number of touch IRQ triggers
-TS_Point touch_event_point = {0, 0, 0};       // Initialize touch point structure for XPT2046_Touchscreen
+// Note: TFT_eSPI uses getTouch(&x, &y) instead of TS_Point structure
 
 // --- Sensor Data and Flags ---
 volatile bool ads1256_data_ready = false;  ///< Flag set by ADS1256 DRDY interrupt
@@ -254,9 +256,7 @@ volatile int mode = 3;         // -1 = off 0 = text 1 = waveform, 2 = fft, 3 = s
 volatile int display_axis = 0; // 0 = X axis, 1 = Y axis, 2 = radial velocity
 // --- Radial velocity calculation ---
 float velocR = 0.0; // Latest radial velocity value in m/s
-bool text_mode_initialized = false;
-bool waveform_initialized = false;
-bool mode23_screen_cleared = false;
+bool mode_initialized = false;
 
 // --- Menu State ---
 const int NUM_MENU_BUTTONS = 5;
@@ -333,11 +333,11 @@ struct MenuButton
  * and a color for visual distinction.
  */
 MenuButton menu_buttons[NUM_MENU_BUTTONS] = {
-    {10, 30, 60, 32, "OFF", -1, ILI9341_RED},
-    {10, 66, 60, 32, "TEXT", 0, ILI9341_BLUE},
-    {10, 102, 60, 32, "WAVE", 1, ILI9341_GREEN},
-    {10, 138, 60, 32, "FFT", 2, ILI9341_CYAN},
-    {10, 174, 60, 32, "SGRAM", 3, ILI9341_MAGENTA}};
+    {10, 30, 60, 32, "OFF", -1, TFT_RED},
+    {10, 66, 60, 32, "TEXT", 0, TFT_BLUE},
+    {10, 102, 60, 32, "WAVE", 1, TFT_GREEN},
+    {10, 138, 60, 32, "FFT", 2, TFT_CYAN},
+    {10, 174, 60, 32, "SGRAM", 3, TFT_MAGENTA}};
 
 unsigned long menu_show_time = 0;
 const unsigned long MENU_TIMEOUT_MS = 15000; // Menu auto-hides after 15 seconds
@@ -346,7 +346,6 @@ const unsigned long MENU_TIMEOUT_MS = 15000; // Menu auto-hides after 15 seconds
 // FORWARD DECLARATIONS
 // ============================================================================
 
-void drawMenuIndicator(int scroll_offset = 0);
 void drawModeMenu();
 
 // ============================================================================
@@ -427,12 +426,152 @@ inline void debugSerialPrintf(const char *, ...) {}
 #endif
 
 // ============================================================================
+// GPIO INITIALIZATION
+// ============================================================================
+
+/**
+ * @brief Initialize all GPIO pins according to pin_config.h
+ * @details Sets pin direction and default values for all peripherals:
+ *          - TFT Display (ILI9341)
+ *          - Touchscreen (XPT2046)
+ *          - Wiznet Ethernet (W5500/W5100S)
+ *          - SD Card
+ *          - ADS1256 ADC
+ *          - ICM20948 9-DOF sensor
+ *
+ * @note Chip select pins are set HIGH (inactive) by default
+ * @note I2C pins (SDA/SCL) are left for Wire library to initialize
+ * @note SPI pins (MOSI/MISO/SCLK) are initialized but may be reconfigured by SPI library
+ */
+void initAllGPIOs()
+{
+  static bool initialized = false;
+  if (initialized)
+  {
+    debugSerialPrintln("  GPIOs already initialized, skipping...");
+    return;
+  }
+  debugSerialPrintln("Initializing all GPIOs...");
+  initialized = true;
+
+  // -------------------------------------------------------------------------
+  // TFT Display (ILI9341) - SPI0
+  // -------------------------------------------------------------------------
+  // SPI pins (will be properly configured by SPI library, but set safe defaults)
+  pinMode(TFT_MISO, INPUT);  // GP0 - SPI MISO (input)
+  pinMode(TFT_MOSI, OUTPUT); // GP3 - SPI MOSI (output)
+  pinMode(TFT_SCLK, OUTPUT); // GP2 - SPI Clock (output)
+  digitalWrite(TFT_MOSI, LOW);
+  digitalWrite(TFT_SCLK, LOW);
+
+  // Control pins
+  pinMode(TFT_CS, OUTPUT);    // GP1 - Chip Select
+  digitalWrite(TFT_CS, HIGH); // Deselect TFT (active low)
+
+  pinMode(TFT_DC, OUTPUT);    // GP4 - Data/Command
+  digitalWrite(TFT_DC, HIGH); // Default to data mode
+
+  pinMode(TFT_RST, OUTPUT);    // GP6 - Reset
+  digitalWrite(TFT_RST, HIGH); // Inactive (active low)
+
+  pinMode(TFT_BL, OUTPUT);   // GP7 - Backlight
+  digitalWrite(TFT_BL, LOW); // Start with backlight off (will be enabled later)
+
+  debugSerialPrintln("  TFT Display pins initialized");
+
+  // -------------------------------------------------------------------------
+  // Touchscreen (XPT2046) - SPI0 (shared with TFT)
+  // -------------------------------------------------------------------------
+  pinMode(TOUCH_CS, OUTPUT);    // GP26 - Chip Select
+  digitalWrite(TOUCH_CS, HIGH); // Deselect touch controller (active low)
+
+  gpio_init(TOUCH_IRQ); // Ensure proper initialization
+  gpio_set_dir(TOUCH_IRQ, GPIO_IN);
+  gpio_pull_up(TOUCH_IRQ);
+
+  debugSerialPrintln("  Touchscreen pins initialized");
+
+  // -------------------------------------------------------------------------
+  // Wiznet Ethernet (W5500/W5100S) - SPI0 (shared with TFT)
+  // -------------------------------------------------------------------------
+  // SPI pins shared with TFT (already initialized above)
+
+  pinMode(WIZNET_SPI_CS, OUTPUT);    // GP17 - Chip Select
+  digitalWrite(WIZNET_SPI_CS, HIGH); // Deselect Wiznet (active low)
+
+  pinMode(WIZNET_RST, OUTPUT);    // GP20 - Hardware Reset
+  digitalWrite(WIZNET_RST, HIGH); // Inactive (active low)
+
+  pinMode(WIZNET_INT, INPUT); // GP21 - Interrupt (active low)
+  gpio_pull_up(WIZNET_INT);
+
+  debugSerialPrintln("  Wiznet Ethernet pins initialized");
+
+  // -------------------------------------------------------------------------
+  // SD Card - Software SPI
+  // -------------------------------------------------------------------------
+  pinMode(SD_CLK, OUTPUT); // GP18 - SPI Clock
+  digitalWrite(SD_CLK, LOW);
+
+  pinMode(SD_MOSI, OUTPUT); // GP22 - SPI MOSI
+  digitalWrite(SD_MOSI, LOW);
+
+  pinMode(SD_MISO, INPUT); // GP19 - SPI MISO
+
+  pinMode(SD_CS, OUTPUT);    // GP16 - Chip Select
+  digitalWrite(SD_CS, HIGH); // Deselect SD card (active low)
+
+  debugSerialPrintln("  SD Card pins initialized");
+
+  // -------------------------------------------------------------------------
+  // ADS1256 ADC - SPI1
+  // -------------------------------------------------------------------------
+  pinMode(ADS1256_SCLK, OUTPUT); // GP10 - SPI Clock
+  digitalWrite(ADS1256_SCLK, LOW);
+
+  pinMode(ADS1256_MOSI, OUTPUT); // GP11 - SPI MOSI
+  digitalWrite(ADS1256_MOSI, LOW);
+
+  pinMode(ADS1256_MISO, INPUT); // GP12 - SPI MISO
+
+  pinMode(ADS1256_CS, OUTPUT);    // GP13 - Chip Select
+  digitalWrite(ADS1256_CS, HIGH); // Deselect ADS1256 (active low)
+
+  pinMode(ADS1256_SYNC, OUTPUT);    // GP14 - Sync/Power Down
+  digitalWrite(ADS1256_SYNC, HIGH); // Normal operation (active low for power down)
+
+  pinMode(ADS1256_DRDY, INPUT); // GP15 - Data Ready (active low)
+
+  debugSerialPrintln("  ADS1256 ADC pins initialized");
+
+  // -------------------------------------------------------------------------
+  // ICM20948 9-DOF Sensor - I2C0
+  // -------------------------------------------------------------------------
+  // I2C pins (SDA/SCL) will be initialized by Wire library
+  // GP8 - ICM20948_I2C_SDA (I/O)
+  // GP9 - ICM20948_I2C_SCL (Output with pull-up)
+
+  pinMode(ICM20948_INT, INPUT); // GP5 - Interrupt Output
+
+  debugSerialPrintln("  ICM20948 sensor pins initialized");
+
+  // -------------------------------------------------------------------------
+  // Summary
+  // -------------------------------------------------------------------------
+  debugSerialPrintln("All GPIOs initialized successfully");
+  debugSerialPrintln("  Output pins: All set to default safe states");
+  debugSerialPrintln("  Input pins: Configured for reading");
+  debugSerialPrintln("  Chip selects: All set HIGH (inactive)");
+  debugSerialPrintln("  I2C pins: Will be configured by Wire library");
+}
+
+// ============================================================================
 // SD CARD FUNCTIONS
 // ============================================================================
 
-#if ENABLE_SD_CARD
 void initSDCard()
 {
+  Serial.println("\n=== SD Card Initialization ===");
   debugSerialPrintln("Initializing SD card...");
 
   // Initialize LittleFS
@@ -442,102 +581,168 @@ void initSDCard()
     return;
   }
   debugSerialPrintln("LittleFS mounted successfully.");
-  debugSerialPrintln("Using software SPI for SD card");
-  debugSerialPrintln("Setting up SD pin modes...");
-  pinMode(SD_CLK, OUTPUT);
-  debugSerialPrintln("SD_CLK configured");
-  pinMode(SD_MOSI, OUTPUT);
-  debugSerialPrintln("SD_MOSI configured");
-  pinMode(SD_MISO, INPUT);
-  debugSerialPrintln("SD_MISO configured");
 
-  // Configure CS pin as output
-  pinMode(SD_CS, OUTPUT);
-  debugSerialPrintln("SD_CS configured");
-  digitalWrite(SD_CS, HIGH); // Start with CS high (inactive)
-  debugSerialPrintln("SD_CS set HIGH");
-  Serial.flush();
-  delay(100);
-
-  // Initialize SD card at low speed, then switch to fast speed
+  // Initialize SD card via SPI
   Serial.println("Attempting SD card initialization...");
   Serial.println("NOTE: This may take 10-30 seconds if no SD card is inserted.");
   Serial.println("Please wait - system will continue automatically after timeout.");
   Serial.flush();
 
   unsigned long sd_start = millis();
-  bool sd_initialized = sd.begin(SD_CONFIG_INIT);
+  bool sd_card_available = sd_spi_init();
   unsigned long init_time = millis() - sd_start;
 
-  if (!sd_initialized)
+  if (!sd_card_available)
   {
     debugSerialPrintf("SD card initialization failed after %lu ms (no card inserted or card error)\n", init_time);
     debugSerialPrintln("Continuing without SD card support...");
     Serial.flush();
     return;
   }
+
   debugSerialPrintf("SD card detected in %lu ms\n", init_time);
-  if (!sd.cardBegin(SD_CONFIG_FAST) || !sd.volumeBegin())
-  {
-    debugSerialPrintln("Failed to switch SD SPI to fast speed!");
-    debugSerialPrintln("Continuing with slow SD card access...");
-    // Don't return - continue even if we can't switch to fast speed
-  }
-  else
-  {
-    debugSerialPrintln("SD card initialized successfully at fast speed.");
-  }
 
-  // Detect and log filesystem type
-  uint8_t fatType = sd.fatType();
-  if (fatType == 16)
-  {
-    debugSerialPrintln("FAT16 filesystem detected.");
-  }
-  else if (fatType == 32)
-  {
-    debugSerialPrintln("FAT32 filesystem detected.");
-  }
-  else if (fatType == 64)
-  {
-    debugSerialPrintln("exFAT filesystem detected.");
-  }
-  else
-  {
-    debugSerialPrintf("Unknown filesystem type: %d\n", fatType);
-  }
+  // Get card status
+  uint8_t status = sd_spi_get_status();
+  Serial.print("Card Status: 0x");
+  Serial.println(status, HEX);
 
-  // Check if the root directory exists
-  if (!sd.exists("/"))
+  // Get and display card type
+  const char *card_type_str = sd_spi_get_card_type_string();
+  Serial.print("Card Type: ");
+  Serial.println(card_type_str);
+
+  // Read OCR for card capacity information
+  uint32_t ocr = 0;
+  if (sd_spi_read_ocr(&ocr))
   {
-    debugSerialPrintln("Root directory does not exist, creating...");
-    if (!sd.mkdir("/"))
+    Serial.println("\nOCR (Operating Conditions Register):");
+    Serial.print("  Power Up Status: ");
+    Serial.println((ocr & 0x80000000) ? "Complete" : "Busy");
+
+    // Determine card capacity type
+    Serial.print("  Card Capacity Status: ");
+    if (ocr & 0x40000000)
     {
-      debugSerialPrintln("Failed to create root directory!");
-      return;
+      uint64_t capacity = sd_spi_get_capacity();
+      if (capacity > (32LL * 1024 * 1024 * 1024))
+      {
+        Serial.println("SDXC (>32GB)");
+      }
+      else
+      {
+        Serial.println("SDHC (2GB-32GB)");
+      }
+    }
+    else
+    {
+      Serial.println("SDSC (<2GB)");
     }
   }
-  debugSerialPrintln("Root directory exists.");
-  // List files in the root directory
-  FsFile root = sd.open("/");
-  if (!root)
+
+  // Identify filesystem
+  fs_info_t fs_info;
+  bool fs_identified = sd_spi_identify_filesystem(&fs_info);
+
+  if (!fs_identified)
   {
-    debugSerialPrintln("Failed to open root directory!");
+    Serial.println("Failed to identify filesystem!");
     return;
   }
-  debugSerialPrintln("Listing files in root directory:");
-  FsFile file = root.openNextFile();
-  while (file)
+
+  // Display filesystem information
+  const char *fs_type = sd_spi_get_fs_type_string(fs_info.type);
+  Serial.print("\nFile System Type: ");
+  Serial.println(fs_type);
+
+  Serial.println("Filesystem Details:");
+  Serial.print("  Bytes per Sector: ");
+  Serial.println(fs_info.bytes_per_sector);
+  Serial.print("  Sectors per Cluster: ");
+  Serial.println(fs_info.sectors_per_cluster);
+  Serial.print("  FAT Count: ");
+  Serial.println(fs_info.fat_count);
+  Serial.print("  Cluster Count: ");
+  Serial.println(fs_info.cluster_count);
+
+  // Calculate and display filesystem size
+  uint64_t fs_size = (uint64_t)fs_info.total_sectors * fs_info.bytes_per_sector;
+  Serial.print("  Total Size: ");
+  if (fs_size >= (1024LL * 1024 * 1024))
   {
-    char fname[64] = {0};
-    file.getName(fname, sizeof(fname));
-    debugSerialPrintf("File: %s, Size: %d bytes\n", fname, file.fileSize());
-    file = root.openNextFile();
+    Serial.print(fs_size / (1024LL * 1024 * 1024));
+    Serial.println(" GB");
   }
-  root.close();
-  debugSerialPrintln("SD card initialized and files listed successfully.");
+  else if (fs_size >= (1024 * 1024))
+  {
+    Serial.print(fs_size / (1024 * 1024));
+    Serial.println(" MB");
+  }
+  else
+  {
+    Serial.print(fs_size / 1024);
+    Serial.println(" KB");
+  }
+
+  // Read and display root directory
+  Serial.println("\nReading Root Directory:");
+
+  dirent_t directory[32];
+  int entry_count = sd_spi_read_directory(&fs_info, directory, 32);
+
+  if (entry_count < 0)
+  {
+    Serial.println("Failed to read directory!");
+    return;
+  }
+
+  Serial.print("Found ");
+  Serial.print(entry_count);
+  Serial.println(" entries:");
+
+  if (entry_count == 0)
+  {
+    Serial.println("  (empty directory)");
+  }
+  else
+  {
+    // Display directory entries
+    for (int i = 0; i < entry_count && i < 32; i++)
+    {
+      Serial.print("  ");
+      Serial.print(i + 1);
+      Serial.print(". ");
+      Serial.print(directory[i].filename);
+
+      // Pad filename for alignment
+      int name_len = strlen(directory[i].filename);
+      if (name_len < 35)
+      {
+        for (int j = name_len; j < 35; j++)
+          Serial.print(" ");
+      }
+      else
+      {
+        Serial.println();
+        Serial.print("     ");
+      }
+
+      // Display attributes and size
+      Serial.print(" [");
+      if (directory[i].attributes & 0x10)
+        Serial.print("DIR");
+      else
+      {
+        Serial.print("FILE ");
+        Serial.print(directory[i].file_size);
+        Serial.print("B");
+      }
+      Serial.println("]");
+    }
+  }
+
+  debugSerialPrintln("SD card initialized successfully.");
 }
-#endif // ENABLE_SD_CARD
 
 void disableSDCard()
 {
@@ -545,53 +750,139 @@ void disableSDCard()
   // Set CS of SD card high to disable it
   if (SD_CS != -1)
   {
-    gpio_init(SD_CS);
-    gpio_set_dir(SD_CS, GPIO_OUT);
-    gpio_put(SD_CS, 1); // Disable SD card
+    digitalWrite(SD_CS, HIGH); // Disable SD card
   }
 }
 
-// Deselect all other SPI0 devices before talking to WIZNET
-void deselectSpi0DevicesForWiznet()
+void disableTouch()
 {
-  // TFT CS
-  if (TFT_CS != -1)
-  {
-    gpio_init(TFT_CS);
-    gpio_set_dir(TFT_CS, GPIO_OUT);
-    gpio_put(TFT_CS, 1);
-  }
-
-  // Touch CS
   if (TOUCH_CS != -1)
   {
-    gpio_init(TOUCH_CS);
-    gpio_set_dir(TOUCH_CS, GPIO_OUT);
-    gpio_put(TOUCH_CS, 1);
+    digitalWrite(TOUCH_CS, HIGH); // Deselect touch
   }
+}
 
-  // SD CS (shared SPI0 in this project context)
-  if (SD_CS != -1)
-  {
-    gpio_init(SD_CS);
-    gpio_set_dir(SD_CS, GPIO_OUT);
-    gpio_put(SD_CS, 1);
-  }
+// ============================================================================
+// SPI HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Release SPI bus
+ * Sets all SPI device CS pins high to release the bus and prevent conflicts
+ * Call this before switching operation between shared SPI devices
+ */
+void releaseSPIBus()
+{
+  // Release TFT from SPI bus
+#if defined(TFT_CS) && TFT_CS != -1
+  digitalWrite(TFT_CS, HIGH);
+#endif
+
+  // Release touch controller from SPI bus
+#if defined(TOUCH_CS) && TOUCH_CS != -1
+  digitalWrite(TOUCH_CS, HIGH);
+#endif
+
+  // Wiznet CS is managed by Ethernet library, but we can ensure it's available
+#if defined(WIZNET_SPI_CS) && WIZNET_SPI_CS != -1
+  digitalWrite(WIZNET_SPI_CS, HIGH);
+#endif
+}
+
+/**
+ * @brief Get SPI baudrate for TFT display (SPI0)
+ * @param spi SPI instance (spi0 for TFT)
+ * @return Actual baudrate in Hz
+ */
+static uint32_t get_tft_spi_baudrate(spi_inst_t *spi)
+{
+  spi_hw_t *hw = spi_get_hw(spi);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu; // CR0 bits 15:8 contain SCR
+  uint32_t clk = clock_get_hz(clk_peri);
+  if (cpsr == 0)
+    return 0;
+  return clk / (cpsr * (scr + 1u));
+}
+
+/**
+ * @brief Log TFT SPI speed with tag for debugging
+ * @param tag Description tag for the log message
+ */
+static void log_tft_spi_speed(const char *tag)
+{
+  spi_inst_t *spi = TFT_SPI_PORT;
+  spi_hw_t *hw = spi_get_hw(spi);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
+  uint32_t baud = get_tft_spi_baudrate(spi);
+
+  debugSerialPrintf("%s SPI baud: %.2f MHz (cpsr=%lu, scr=%lu)\n", tag, baud / 1000000.0, cpsr, scr);
+}
+
+/**
+ * @brief Get SPI baudrate for Wiznet adapter
+ * @param spi SPI instance
+ * @return Actual baudrate in Hz
+ */
+static uint32_t get_wiznet_spi_baudrate(spi_inst_t *spi)
+{
+  spi_hw_t *hw = spi_get_hw(spi);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
+  uint32_t clk = clock_get_hz(clk_peri);
+  if (cpsr == 0)
+    return 0;
+  return clk / (cpsr * (scr + 1u));
+}
+
+/**
+ * @brief Log Wiznet SPI speed with tag for debugging
+ * @param tag Description tag for the log message
+ */
+static void log_wiznet_spi_speed(const char *tag)
+{
+  spi_hw_t *hw = spi_get_hw(WIZNET_SPI_PORT);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
+  uint32_t baud = get_wiznet_spi_baudrate(WIZNET_SPI_PORT);
+
+  debugSerialPrintf("%s SPI baud: %lu Hz (cpsr=%lu, scr=%lu)\n", tag, baud, cpsr, scr);
 }
 
 // ============================================================================
 // TFT DISPLAY FUNCTIONS
 // ============================================================================
 
+/**
+ * @brief Enable TFT backlight (from test_all)
+ */
+static void enableBacklight()
+{
+  if (TFT_BL != -1)
+  {
+    digitalWrite(TFT_BL, HIGH);
+  }
+}
+
+/**
+ * @brief Disable TFT backlight (from test_all)
+ */
+static void disableBacklight()
+{
+  if (TFT_BL != -1)
+  {
+    digitalWrite(TFT_BL, LOW); // Turn off backlight
+  }
+}
+
 void setBacklight(float brightness)
 {
-  if (TFT_LED != -1)
+  if (TFT_BL != -1)
   {
     if (brightness == 0.0f || brightness == 1.0f)
     {
-      gpio_init(TFT_LED);
-      gpio_set_dir(TFT_LED, GPIO_OUT);
-      gpio_put(TFT_LED, (int)brightness); // Directly set pin state for full off/on
+      digitalWrite(TFT_BL, (int)brightness); // Directly set pin state for full off/on
     }
     else
     {
@@ -599,63 +890,102 @@ void setBacklight(float brightness)
       static bool initialized = false;
       if (!initialized)
       {
-        gpio_set_function(TFT_LED, GPIO_FUNC_PWM);
-        uint slice_num = pwm_gpio_to_slice_num(TFT_LED);
+        gpio_set_function(TFT_BL, GPIO_FUNC_PWM);
+        uint slice_num = pwm_gpio_to_slice_num(TFT_BL);
         pwm_set_wrap(slice_num, 255); // 8-bit resolution
         pwm_set_enabled(slice_num, true);
         initialized = true;
       }
-      uint slice_num = pwm_gpio_to_slice_num(TFT_LED);
+      uint slice_num = pwm_gpio_to_slice_num(TFT_BL);
       uint level = (uint)(brightness * 255.0f);
       if (level > 255)
         level = 255;
-      pwm_set_gpio_level(TFT_LED, level);
+      pwm_set_gpio_level(TFT_BL, level);
     }
   }
 }
 
-void tft_read_display_id_and_status()
+/**
+ * @brief Draws a menu indicator ("hamburger" icon) on the TFT display
+ *
+ * This function renders a small menu indicator icon on the top left corner of the TFT display.
+ * It clears the background area to prevent artifacts from scrolling,
+ * then draws a three-line "hamburger" menu icon with a border.
+ *
+ * @param scroll_offset The current scroll offset, used to position the menu indicator appropriately based on rotation.
+ */
+void drawMenuIndicator(int scroll_offset)
 {
-  // ILI9341 responds to 0x04 (Read Display Identification Information)
-  // Should return 3 bytes: Manufacturer ID, Module/Driver Version ID, Module/Driver ID
-  // Yields 0x00 0x00 0x00 since the IDs seem not to be provided by the display
 
-  // Read 3 bytes (index 1 denotes the second byte, since the first byte read back is a dummy byte)
-  uint8_t id1 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDID, 0); // ID1 Status Register
-  uint8_t id2 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDID, 1); // ID2 Status Register
-  uint8_t id3 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDID, 2); // ID3 Status Register
+  int x_base = (2 + scroll_offset) % 320; // Adjust x position based on scroll offset for landscape modes
+  int y_base = 0;
 
-  // print the IDs for debug
-  debugSerialPrintf("ILI9341 ID bytes: 0x%02X 0x%02X 0x%02X\n", id1, id2, id3);
+  int w = tft.width();
+  int h = tft.height();
 
-  tft.begin(TFT_SPI_BPS); // Pass SPI frequency to prevent override
+  // Clear background with a slightly larger area to remove old border pixels from scrolling
+  tft.fillRect(x_base - 1, y_base, 18, 16, TFT_BLACK);
 
-  uint8_t stat1 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 0); // #2 D[31:25] status bits
-  uint8_t stat2 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 1); // #3 D[22:16] status bits
-  uint8_t stat3 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 2); // #4 D[10:8] status bits
-  uint8_t stat4 = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDDST, 3); // #5 D[7:5] status bits
-  // print the IDs for debug
-  debugSerialPrintf("ILI9341 Status bytes: 0x%02X 0x%02X 0x%02X 0x%02X\n", stat1, stat2, stat3, stat4);
+  // Draw a small "hamburger" menu icon (3 horizontal lines)
+  tft.fillRect(x_base + 3, y_base + 2, 10, 2, TFT_WHITE);
+  tft.fillRect(x_base + 3, y_base + 7, 10, 2, TFT_WHITE);
+  tft.fillRect(x_base + 3, y_base + 12, 10, 2, TFT_WHITE);
+  // Add a small border
+  tft.drawRect(x_base, y_base, 16, 16, COLOR_GREY);
 }
 
-void tft_read_test()
+/**
+ * @brief Draws a menu indicator ("hamburger" icon) on the TFT display, adjusting for screen rotation and scroll offset.
+ *
+ * This function renders a small menu indicator icon at a position determined by the current scroll offset and
+ * the TFT display's rotation setting. It clears the background area to prevent artifacts from scrolling,
+ * then draws a three-line "hamburger" menu icon with a border.
+ *
+ * @param scroll_offset The current scroll offset, used to position the menu indicator appropriately based on rotation.
+ */
+void drawMenuIndicatorOld(int scroll_offset)
 {
-  // read diagnostics (optional but can help debug problems)
-  uint8_t x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDMODE);
-  debugSerialPrintf("Display Power Mode: 0x%02X\n", x);
-  x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDMADCTL);
-  debugSerialPrintf("MADCTL Mode: 0x%02X\n", x);
-  x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDPIXFMT);
-  debugSerialPrintf("Pixel Format: 0x%02X\n", x);
-  x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDIMGFMT);
-  debugSerialPrintf("Image Format: 0x%02X\n", x);
-  x = tft.Adafruit_SPITFT::readcommand8(ILI9341_RDSELFDIAG);
-  debugSerialPrintf("Self Diagnostic: 0x%02X\n", x);
-  x = tft.readcommand8(ILI9341_GMCTRN1, 13);
-  debugSerialPrintf("Gamma Control Byte: 0x%02X\n", x);
+  // Account for different rotation settings
+  // Rotation 0: Portrait (240w x 320h) - scrollTo scrolls vertically
+  // Rotation 1: Landscape (320w x 240h) - scrollTo scrolls horizontally
+  // Rotation 2: Portrait inverted (240w x 320h) - scrollTo scrolls vertically
+  // Rotation 3: Landscape inverted (320w x 240h) - scrollTo scrolls horizontally
+
+  int x_base = 2;
+  int y_base = 0;
+
+  // Use current scroll offset for positioning; when menu is visible use the saved offset so icon stays at physical top-left
+  int effective_offset = menu_visible ? saved_scroll_offset : scroll_offset;
+  int w = tft.width();
+  int h = tft.height();
+
+  switch (TFT_ROTATION)
+  {
+  case 0: // Portrait - scroll affects y
+    y_base = effective_offset % h;
+    break;
+  case 1: // Landscape - scroll affects x
+    x_base = effective_offset % w + 2;
+    break;
+  case 2: // Portrait inverted - scroll affects y
+    y_base = effective_offset % h;
+    break;
+  case 3: // Landscape inverted - scroll affects x
+    x_base = effective_offset % w + 2;
+    break;
+  }
+
+  // Clear background with a slightly larger area to remove old border pixels from scrolling
+  tft.fillRect(x_base - 1, y_base, 18, 16, TFT_BLACK);
+
+  // Draw a small "hamburger" menu icon (3 horizontal lines)
+  tft.fillRect(x_base + 3, y_base + 2, 10, 2, TFT_WHITE);
+  tft.fillRect(x_base + 3, y_base + 7, 10, 2, TFT_WHITE);
+  tft.fillRect(x_base + 3, y_base + 12, 10, 2, TFT_WHITE);
+  // Add a small border
+  tft.drawRect(x_base, y_base, 16, 16, COLOR_GREY);
 }
 
-#if ENABLE_TFT
 void tftPrint(const char *msg, bool resetline = false)
 {
   // Print debug messages to Serial
@@ -690,7 +1020,7 @@ void tftPrint(const char *msg, bool resetline = false)
     // If at bottom, wrap to top
     if (tft_line >= max_lines)
     {
-      tft.fillRect(0, 0, tft.width(), disp_height, ILI9341_BLACK);
+      tft.fillRect(0, 0, tft.width(), disp_height, TFT_BLACK);
       tft_line = 0;
       drawMenuIndicator(disp_column); // Redraw menu indicator after clearing screen
     }
@@ -710,44 +1040,104 @@ void tftPrint(const char *msg, bool resetline = false)
     }
   }
 }
-#endif
 
-void initTFTDisplay()
+// ============================================================================
+// Hardware Scrolling Functions (ILI9341)
+// ============================================================================
+
+/**
+ * @brief Set hardware scroll address (vertical scrolling start position)
+ * @param VSP Vertical Scrolling Start Address (0 to scroll_height-1)
+ */
+void scrollAddress(uint16_t VSP)
 {
+  tft.writecommand(ILI9341_VSCRSADD); // Vertical scrolling start address
+  tft.writedata(VSP >> 8);
+  tft.writedata(VSP & 0xFF);
+}
+
+/**
+ * @brief Setup hardware scroll area for ILI9341 display
+ * @param TFA Top Fixed Area (lines at top that don't scroll)
+ * @param BFA Bottom Fixed Area (lines at bottom that don't scroll)
+ * @note Hardware scrolling is only supported in portrait mode thus we ignore TFT_ROTATION for determining scroll height.
+ * The scroll height is always the long side of the display (320 lines) regardless of rotation.
+ * The TFT_eSPI library does not provide built-in support for hardware scrolling, so we send the ILI9341 commands directly to configure the scroll area.
+ */
+void setupScrollArea(uint16_t TFA, uint16_t BFA)
+{
+  uint16_t scroll_height = 320; // ILI9341 scroll height is always 320 lines in portrait mode regardless of rotation
+
+  tft.writecommand(ILI9341_VSCRDEF); // Vertical scroll definition
+  tft.writedata(TFA >> 8);
+  tft.writedata(TFA & 0xFF);
+  tft.writedata((scroll_height - TFA - BFA) >> 8);
+  tft.writedata((scroll_height - TFA - BFA) & 0xFF);
+  tft.writedata(BFA >> 8);
+  tft.writedata(BFA & 0xFF);
+  scrollAddress(TFA);
+}
+
+/**
+ * @brief Scroll display by incrementing scroll position
+ * @param offset Scroll offset (pixels to scroll)
+ */
+void scrollDisplay(int offset)
+{
+  if (offset == 0)
+  {
+    scroll_x_start = 0;
+    scrollAddress(scroll_x_start);
+    return;
+  }
+  uint16_t scroll_height = 320; // ILI9341 scroll height is always 320 lines in portrait mode regardless of rotation
+
+  scroll_x_start = (scroll_x_start + offset) % scroll_height;
+  if (scroll_x_start < SCROLL_TOP_FIXED_AREA)
+    scroll_x_start = SCROLL_TOP_FIXED_AREA;
+
+  scrollAddress(scroll_x_start);
+}
+
+// ============================================================================
+// TFT Display Initialization
+// ============================================================================
+
+static void initTFTDisplay(uint8_t rotation)
+{
+  static bool tft_initialized = false;
   debugSerialPrintln("TFT display driver initialization");
-  // Note: Don't disable touch controller here - let XPT2046_Touchscreen library manage CS pin
-  disableSDCard();
 
-  // Initialize hardware SPI for TFT display
-  spi_init(TFT_SPI_PORT, TFT_SPI_BPS);
+  // Deselect other SPI0 devices before TFT init
+  // and turn off backlight before initialization
 
-  // Configure SPI pins
-  gpio_set_function(TFT_MISO, GPIO_FUNC_SPI); // GP0 - MISO
-  gpio_set_function(TFT_SCLK, GPIO_FUNC_SPI);  // GP2 - SCK
-  gpio_set_function(TFT_MOSI, GPIO_FUNC_SPI); // GP7 - MOSI
-  // Note: CS is handled by the library as a GPIO pin
-
-  // CRITICAL: Disable pull resistors on MISO - pull-up causes all reads to return 0xFF
-  gpio_set_pulls(TFT_MISO, false, false); // No pull-up, no pull-down
-  debugSerialPrintf("Disabled pull resistors on MISO (GP%d)\n", TFT_MISO);
-
-  debugSerialPrintln("Hardware SPI initialized for TFT display:");
-  debugSerialPrintf("SPI Port: spi0, Speed: %d Hz\n", TFT_SPI_BPS);
-  debugSerialPrintf("MISO: GP%d, MOSI: GP%d, SCK: GP%d\n", TFT_MISO, TFT_MOSI, TFT_SCLK);
-  debugSerialPrintf("CS: GP%d, DC: GP%d, RST: GP%d\n", TFT_CS, TFT_DC, TFT_RESET);
-
-  setBacklight(0.0);      // Turn off backlight initially
-  tft.begin(TFT_SPI_BPS); // Pass SPI frequency to prevent override
-  setBacklight(0.25);     // Turn on backlight after initialization
-  tft_read_display_id_and_status();
-  tft_read_test();               // Read and print display diagnostics
-  delay(1000);                   // Allow time for display to stabilize
-  tft.setRotation(TFT_ROTATION); // Set the display rotation
-  tft.fillScreen(ILI9341_BLACK);
-  tft.setTextColor(ILI9341_WHITE);
+  releaseSPIBus();
+  disableBacklight();
+  if (!tft_initialized)
+  {
+    tft.init();
+    log_tft_spi_speed("After TFT begin");
+    tft_initialized = true;
+  }
+  // Read display status
+  // TFT_eSPI provides basic diagnostics via getSetup()
+  debugSerialPrintln("TFT_eSPI setup information:");
+  debugSerialPrintf("  Width: %d, Height: %d\n", tft.width(), tft.height());
+  debugSerialPrintf("  Rotation: %d\n", tft.getRotation());
+  // Configure display settings
+  tft.fillScreen(TFT_BLACK);
+  tft.setRotation(rotation);
   tft.setTextSize(TFT_TEXT_SIZE);
-  tft.setScrollMargins(0, 0); // Set scroll margins to 0
+  tft.setTextColor(TFT_WHITE);
   tft.setCursor(0, 0);
+  enableBacklight();
+
+  delay(100); // Brief stabilization delay
+
+  // Setup hardware scrolling area (uses ILI9341 commands directly)
+  setupScrollArea(SCROLL_TOP_FIXED_AREA, SCROLL_BOTTOM_FIXED_AREA);
+  debugSerialPrintln("Hardware scrolling configured");
+
   tftPrint("TFT display driver initialized...\n");
   tftPrint("---------------------------------------------\n");
 }
@@ -784,12 +1174,12 @@ void serveSetLogLevel(Stream &client, const String &req)
   client.printf("OK logVerbosity=%d\n", logVerbosity);
 }
 
-void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN, int level = LOG_INFO)
+void debugPrint(const char *msg, uint16_t color = TFT_GREEN, int level = LOG_INFO)
 {
   if (logVerbosity < level)
     return;
   debugSerialPrint(msg);
-  if (mode == 0 && text_mode_initialized)
+  if (mode == 0 && mode_initialized)
   {
     static int tft_line = 3;
     static const int font_height = 8 * TFT_TEXT_SIZE;
@@ -804,11 +1194,11 @@ void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN, int level = LOG
       {
         int clear_x = 80; // menu occupies left ~80px
         int clear_w = tft.width() - clear_x;
-        tft.fillRect(clear_x, 3 * font_height, clear_w, disp_height - 3 * font_height, ILI9341_BLACK);
+        tft.fillRect(clear_x, 3 * font_height, clear_w, disp_height - 3 * font_height, TFT_BLACK);
       }
       else
       {
-        tft.fillRect(0, 3 * font_height, tft.width(), disp_height - 3 * font_height, ILI9341_BLACK);
+        tft.fillRect(0, 3 * font_height, tft.width(), disp_height - 3 * font_height, TFT_BLACK);
       }
       tft_line = 3;
       text_block_refresh = false;
@@ -821,14 +1211,21 @@ void debugPrint(const char *msg, uint16_t color = ILI9341_GREEN, int level = LOG
       int len = line_end ? (line_end - p) : strlen(p);
       if (tft_line >= max_lines)
       {
-        tft.fillRect(0, 3 * font_height, tft.width(), disp_height - 3 * font_height, ILI9341_BLACK);
+        tft.fillRect(0, 3 * font_height, tft.width(), disp_height - 3 * font_height, TFT_BLACK);
         tft_line = 3;
       }
-      tft.setCursor(0, tft_line * font_height);
       tft.setTextColor(color);
       tft.setTextSize(TFT_TEXT_SIZE);
-      for (int i = 0; i < len; ++i)
-        tft.write(p[i]);
+      tft.setTextDatum(TL_DATUM); // Ensure left-to-right text alignment
+      // Create a temporary string for this line
+      char line_buf[256];
+      if (len >= sizeof(line_buf))
+        len = sizeof(line_buf) - 1;
+      memcpy(line_buf, p, len);
+      line_buf[len] = '\0';
+      // Position text to the right of menu if visible
+      int text_x = menu_visible ? 80 : 0;
+      tft.drawString(line_buf, text_x, tft_line * font_height);
       if (line_end)
       {
         tft_line++;
@@ -875,7 +1272,31 @@ void debugPrintln(const char *msg, int level = LOG_INFO)
 // XPT2046 FUNCTIONS
 // ============================================================================
 
-void drawCalibrationCross(int x, int y, uint16_t color = ILI9341_RED)
+/**
+ * @brief Initialize touch controller (improved from test_all)
+ * TFT_eSPI handles touch initialization via eSPI_Setup.h configuration
+ * Touch is enabled automatically when tft.begin() is called
+ */
+void initTouchController()
+{
+  debugSerialPrintln("Initializing touch controller via TFT_eSPI...");
+  debugSerialPrintln("Touch support configured in eSPI_Setup.h");
+
+  // TFT_eSPI touch is initialized automatically with tft.begin()
+  // Touch pins are configured in eSPI_Setup.h:
+  // - TOUCH_CS is configured automatically
+  // - Touch calibration is stored in eSPI_Setup.h
+
+  debugSerialPrintf("Touch CS pin: GP%d (managed by TFT_eSPI)\n", TOUCH_CS);
+  if (TOUCH_IRQ != -1)
+  {
+    debugSerialPrintf("Touch IRQ pin: GP%d (optional for TFT_eSPI)\n", TOUCH_IRQ);
+  }
+
+  debugSerialPrintln("Touch controller ready (TFT_eSPI)");
+}
+
+void drawCalibrationCross(int x, int y, uint16_t color = TFT_RED)
 {
   // Draw a cross at the specified position
   tft.drawLine(x - 10, y, x + 10, y, color);
@@ -1076,19 +1497,9 @@ void applyMMSECalibration(uint16_t touch_x, uint16_t touch_y, int &display_x, in
 void calibrateTouchController()
 // MMSE-based multipoint calibration (AN-1021 algorithm)
 {
-  // Set display rotation
-  tft.setRotation(TFT_ROTATION);
-
-  // Initialize touch controller with matching rotation
-  // touchscreen.begin(); // Disabled
-#ifdef USE_HARDWARE_SPI
-  // touchscreen.setRotation(TFT_ROTATION); // Disabled
-#endif
-
-  tft.scrollTo(0); // Reset hardware scrolling to ensure correct coordinate mapping
-  tft.fillScreen(ILI9341_BLACK);
+  tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextColor(TFT_WHITE);
   tft.setTextSize(2);
   tft.printf("MMSE Touch Calibration\n");
   tft.printf("%d-point mode\n", NUM_CALIB_POINTS);
@@ -1136,12 +1547,18 @@ void calibrateTouchController()
   // uint16_t touch_x[numPoints] = {3927, 193, 2054, 3915, 189};
   // uint16_t touch_y[numPoints] = {3920, 3943, 2127, 331, 371};
 
+  // Local structure to hold touch event data
+  struct
+  {
+    uint16_t x, y, z;
+  } touch_event_point;
+
   for (int i = 0; i < numPoints; ++i)
   {
     // Clear entire screen before each calibration point
-    tft.fillScreen(ILI9341_BLACK);
+    tft.fillScreen(TFT_BLACK);
     tft.setCursor(10, 10);
-    tft.setTextColor(ILI9341_WHITE);
+    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(1);
     tft.printf("Touch cross %d/%d", i + 1, numPoints);
     drawCalibrationCross(lcd_x[i], lcd_y[i]);
@@ -1151,27 +1568,27 @@ void calibrateTouchController()
 
     while (!touch_detected)
     {
-      if (touchscreen.touched())
+      uint16_t tx = 0, ty = 0;
+      if (tft.getTouch(&tx, &ty, TOUCH_THRESHOLD))
       {
-        touch_event_point = touchscreen.getPoint();
-        if (touch_event_point.z > 0)
-        {
-          touch_detected = true;
-          debugSerialPrintf("Touch detected: x=%d, y=%d, z=%d\n",
-                            touch_event_point.x, touch_event_point.y, touch_event_point.z);
-        }
+        touch_event_point.x = tx;
+        touch_event_point.y = ty;
+        touch_event_point.z = 1000; // Simulate pressure value
+        touch_detected = true;
+        debugSerialPrintf("Touch detected: x=%d, y=%d, z=%d\n",
+                          touch_event_point.x, touch_event_point.y, touch_event_point.z);
       }
       delay(10);
     }
 
     // Wait for touch release
     delay(100);
-    while (touchscreen.touched())
+    while (tft.getTouch(&touch_event_point.x, &touch_event_point.y, TOUCH_THRESHOLD))
     {
       delay(10);
     }
 
-    drawCalibrationCross(lcd_x[i], lcd_y[i], ILI9341_GREEN); // Draw green cross to indicate touch was registered
+    drawCalibrationCross(lcd_x[i], lcd_y[i], TFT_GREEN); // Draw green cross to indicate touch was registered
 
     // Store raw coordinates without rotation - let MMSE algorithm handle the transformation
     touch_x[i] = touch_event_point.x;
@@ -1179,7 +1596,7 @@ void calibrateTouchController()
 
     debugSerialPrintf("Calibration point %d: Expected LCD(%d,%d) <-> Raw Touch(%d,%d)\n",
                       i, lcd_x[i], lcd_y[i], touch_x[i], touch_y[i]);
-    tft.fillScreen(ILI9341_BLACK);
+    tft.fillScreen(TFT_BLACK);
   }
 
   // Calculate MMSE calibration matrix
@@ -1212,7 +1629,7 @@ void calibrateTouchController()
   }
 
   // Verify calibration accuracy with 3 test points
-  tft.fillScreen(ILI9341_BLACK);
+  tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.print("Verifying calibration...\n");
   tft.print("Touch 3 test points\n");
@@ -1236,33 +1653,29 @@ void calibrateTouchController()
   for (int i = 0; i < numTestPoints; ++i)
   {
     // Clear the instruction area
-    tft.fillRect(0, 0, tft.width(), 30, ILI9341_BLACK);
+    tft.fillRect(0, 0, tft.width(), 30, TFT_BLACK);
     tft.setCursor(10, 10);
     tft.printf("Touch test point %d/3", i + 1);
-    drawCalibrationCross(test_lcd_x[i], test_lcd_y[i], ILI9341_YELLOW);
+    drawCalibrationCross(test_lcd_x[i], test_lcd_y[i], TFT_YELLOW);
 
     bool touch_detected = false;
+    uint16_t tx = 0, ty = 0;
     while (!touch_detected)
     {
-      if (touchscreen.touched())
+      if (tft.getTouch(&tx, &ty, TOUCH_THRESHOLD))
       {
-        touch_event_point = touchscreen.getPoint();
-        if (touch_event_point.z > 0)
-        {
-          touch_detected = true;
-        }
+        test_touch_x[i] = tx;
+        test_touch_y[i] = ty;
+        touch_detected = true;
       }
       delay(10);
     }
     delay(100);
-    while (touchscreen.touched())
+    // Wait for touch release
+    while (tft.getTouch(&tx, &ty, TOUCH_THRESHOLD))
     {
       delay(10);
     }
-
-    // Store raw coordinates without rotation - MMSE matrix handles the transformation
-    test_touch_x[i] = touch_event_point.x;
-    test_touch_y[i] = touch_event_point.y;
 
     // Calculate calibration accuracy for this point
     int calibrated_x, calibrated_y;
@@ -1275,16 +1688,16 @@ void calibrateTouchController()
     float error_y = calibrated_y - test_lcd_y[i];
     float error = sqrtf(error_x * error_x + error_y * error_y);
 
-    drawCalibrationCross(test_lcd_x[i], test_lcd_y[i], ILI9341_GREEN);
+    drawCalibrationCross(test_lcd_x[i], test_lcd_y[i], TFT_GREEN);
 
     // Display error near the crosshair
     tft.setCursor(test_lcd_x[i] + 15, test_lcd_y[i] - 10);
-    tft.setTextColor(ILI9341_WHITE);
+    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(1);
     tft.printf("Err: %.1fpx", error);
 
     delay(1500);
-    tft.fillScreen(ILI9341_BLACK);
+    tft.fillScreen(TFT_BLACK);
   }
 
   // Calculate calibration accuracy
@@ -1326,10 +1739,10 @@ void calibrateTouchController()
   debugSerialPrintf("Maximum error: %.2f pixels\n", max_error);
 
   // Display results on screen
-  tft.fillScreen(ILI9341_BLACK);
+  tft.fillScreen(TFT_BLACK);
   tft.setCursor(10, 40);
   tft.setTextSize(2);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextColor(TFT_WHITE);
   tft.print("Calibration Complete\n\n");
 
   tft.setTextSize(1);
@@ -1338,27 +1751,27 @@ void calibrateTouchController()
 
   if (avg_error < 5.0f)
   {
-    tft.setTextColor(ILI9341_GREEN);
+    tft.setTextColor(TFT_GREEN);
     tft.print("Excellent accuracy!");
   }
   else if (avg_error < 10.0f)
   {
-    tft.setTextColor(ILI9341_YELLOW);
+    tft.setTextColor(TFT_YELLOW);
     tft.print("Good accuracy");
   }
   else
   {
-    tft.setTextColor(ILI9341_RED);
+    tft.setTextColor(TFT_RED);
     tft.print("Consider recalibrating");
   }
 
   // Reset text color to white for subsequent output
-  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextColor(TFT_WHITE);
 
   delay(3000);
 
   // Clear screen to prevent cluttering of subsequent output
-  tft.fillScreen(ILI9341_BLACK);
+  tft.fillScreen(TFT_BLACK);
 }
 
 bool loadTouchCalibration()
@@ -1663,6 +2076,7 @@ void initICM20948()
   gpio_init(ICM20948_INT);
   gpio_set_dir(ICM20948_INT, GPIO_IN);
   gpio_pull_up(ICM20948_INT);
+  // Assign IRQ handler and enable in one call (test code style)
   gpio_set_irq_enabled_with_callback(ICM20948_INT, GPIO_IRQ_EDGE_FALL, true, &icm20948_int_isr);
   tftPrint("IMU initialized...\n");
   tftPrint("---------------------------------------------\n");
@@ -1834,34 +2248,30 @@ NetworkMode initWiFi()
 }
 
 /**
- * @brief Reset the WIZNET5K chip using the hardware reset pin.
+ * @brief Reset the WIZNET5K chip using the hardware reset pin (from test_all)
+ * Improved implementation with proper timing and debug output
  */
 void wiznet5k_reset()
 {
-  gpio_init(WIZNET_RST);
-  gpio_set_dir(WIZNET_RST, GPIO_OUT);
-  gpio_put(WIZNET_RST, 0); // Assert reset (active low)
-  sleep_ms(10);            // Hold reset for 10ms
-  gpio_put(WIZNET_RST, 1); // Release reset
-  sleep_ms(100);           // Wait for chip to be ready
+  debugSerialPrintln("Resetting WIZNET5K chip...");
+  digitalWrite(WIZNET_RST, LOW);  // Assert reset (active low)
+  sleep_ms(10);                   // Hold reset for 10ms
+  digitalWrite(WIZNET_RST, HIGH); // Release reset
+  sleep_ms(100);                  // Wait for chip to stabilize
+  debugSerialPrintln("WIZNET5K reset complete");
 }
 
 /**
- * @brief Initialize SPI bus and pins for WIZNET5K (same as test_wiznet).
+ * @brief Initialize SPI bus and pins for WIZNET5K (improved from test_all)
+ * This follows the proven initialization pattern from test_wiznet suite
  */
 void wiznet_init_spi()
 {
-  // Initialize SPI bus
-  spi_init(WIZNET_SPI_PORT, WIZNET_SPI_BPS);
-  spi_set_format(WIZNET_SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-  spi_set_baudrate(WIZNET_SPI_PORT, WIZNET_SPI_BPS);
+  debugSerialPrintln("Initializing WIZNET SPI...");
+  debugSerialPrintln("Using improved initialization strategy from test_all");
 
-  // Configure SPI pins
-  gpio_set_function(WIZNET_SCLK, GPIO_FUNC_SPI);
-  gpio_set_function(WIZNET_MOSI, GPIO_FUNC_SPI);
-  gpio_set_function(WIZNET_MISO, GPIO_FUNC_SPI);
-
-  // Ensure Arduino SPI instance uses the same pins/frequency as WIZNET
+  // Reinitialize SPI using Arduino SPI API to keep it in sync with Ethernet library
+  // This pattern is proven to work reliably from test_all
   SPI.end();
   SPI.setSCK(WIZNET_SCLK);
   SPI.setTX(WIZNET_MOSI);
@@ -1870,23 +2280,20 @@ void wiznet_init_spi()
   SPI.beginTransaction(SPISettings(WIZNET_SPI_BPS, MSBFIRST, SPI_MODE0));
   SPI.endTransaction();
 
-  // Configure CS pin as GPIO output (managed manually)
-  gpio_init(WIZNET_SPI_CS);
-  gpio_set_dir(WIZNET_SPI_CS, GPIO_OUT);
-  gpio_put(WIZNET_SPI_CS, 1); // CS idle high
-
   debugSerialPrintln("Wiznet SPI initialized");
-  debugSerialPrintf("SPI Port: spi0, Speed: %d Hz\n", WIZNET_SPI_BPS);
   debugSerialPrintf("MISO: GP%d, MOSI: GP%d, SCK: GP%d, CS: GP%d\n",
                     WIZNET_MISO, WIZNET_MOSI, WIZNET_SCLK, WIZNET_SPI_CS);
   debugSerialPrintf("RST: GP%d, INT: GP%d\n", WIZNET_RST, WIZNET_INT);
+  log_wiznet_spi_speed("After Wiznet SPI init");
 }
 
 /**
- * @brief Configure interrupt pin for WIZNET5K (same as test_wiznet).
+ * @brief Configure interrupt pin for WIZNET5K (from test_all)
+ * Sets up INT pin with proper pull-up configuration
  */
 void wiznet_init_interrupt()
 {
+  debugSerialPrintln("Configuring WIZNET INT pin...");
   gpio_init(WIZNET_INT);
   gpio_set_dir(WIZNET_INT, GPIO_IN);
   gpio_pull_up(WIZNET_INT);
@@ -1904,42 +2311,16 @@ void wiznet5k_int_isr(uint gpio, uint32_t events)
   // Optionally: set a volatile flag for main loop processing
 }
 
-void initWIZNET5K()
+NetworkMode initNetworking()
 {
   byte mac[6];
   char resultStr[32];
-  tftPrint("Initializing Ethernet Network...\n");
+  // Fallback static IP parameters if DHCP fails (must be in same subnet as gateway)
+  IPAddress staticCounter(10, 0, 3, 46);
+  IPAddress staticGateway(10, 0, 0, 1);
+  IPAddress staticSubnet(255, 255, 252, 0);
+  IPAddress dnsServer(8, 8, 8, 8);
 
-  getWiznetMAC(mac);
-
-  // --- Reset WIZNET5K chip before SPI init ---
-  wiznet5k_reset();
-
-  // Ensure other SPI0 devices are deselected before Wiznet init
-  deselectSpi0DevicesForWiznet();
-
-  // --- Initialize SPI and INT pin (same as test_wiznet) ---
-  wiznet_init_spi();
-  wiznet_init_interrupt();
-  // gpio_set_irq_enabled_with_callback(WIZNET_INT, GPIO_IRQ_EDGE_FALL, true, &wiznet5k_int_isr);
-
-  Ethernet.init(WIZNET_SPI_CS);
-
-  if (Ethernet.begin(mac) == 0)
-  {
-    Ethernet.begin(mac, ip);
-  }
-  sprintf(resultStr, "Ethernet MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  tftPrint(resultStr);
-  sprintf(resultStr, "Ethernet IP: %s\n", Ethernet.localIP().toString().c_str());
-  tftPrint(resultStr);
-  netMode = NET_WIZNET;
-  ethServer.begin();
-  tftPrint("Ethernet Network initialized...\n");
-}
-
-NetworkMode initNetworking()
-{
   if (!use_networking)
   {
     tftPrint("Networking disabled, running unconnected.\n");
@@ -1952,70 +2333,71 @@ NetworkMode initNetworking()
   tftPrint("Trying WIZNET (Ethernet)...\n");
   unsigned long wiznetStartTime = millis();
 
-  byte mac[6];
-  char resultStr[32];
-  getWiznetMAC(mac);
+  // Ensure other SPI0 devices are deselected before Wiznet init
+  releaseSPIBus();
 
   // --- Reset WIZNET5K chip before SPI init ---
   wiznet5k_reset();
 
-  // Ensure other SPI0 devices are deselected before Wiznet init
-  deselectSpi0DevicesForWiznet();
-
-  // --- Initialize SPI and INT pin (same as test_wiznet) ---
+  // --- Initialize SPI ---
   wiznet_init_spi();
-  wiznet_init_interrupt();
-
-  // Allow WIZNET PHY to settle
-  delay(200);
-
   Ethernet.init(WIZNET_SPI_CS);
+  getWiznetMAC(mac);
 
   // Try DHCP first
-  debugSerialPrintf("CS states before DHCP: TFT=%d TOUCH=%d SD=%d WIZNET=%d\n",
-                    (TFT_CS != -1) ? gpio_get(TFT_CS) : -1,
-                    (TOUCH_CS != -1) ? gpio_get(TOUCH_CS) : -1,
-                    (SD_CS != -1) ? gpio_get(SD_CS) : -1,
-                    (WIZNET_SPI_CS != -1) ? gpio_get(WIZNET_SPI_CS) : -1);
-
-  auto hwStatus = Ethernet.hardwareStatus();
-  auto linkStatus = Ethernet.linkStatus();
-  debugSerialPrintf("Wiznet hardwareStatus=%d, linkStatus=%d\n", hwStatus, linkStatus);
-  uint8_t wiznet_version = W5100.read(0x0039); // VERSIONR (W5500)
-  debugSerialPrintf("Wiznet raw VERSIONR (0x0039)=0x%02X\n", wiznet_version);
-
   tftPrint("Trying DHCP...\n");
-  int dhcpResult = Ethernet.begin(mac, 10000);
+  int dhcpResult = Ethernet.begin(mac, DHCP_TIMEOUT);
 
   if (dhcpResult == 0)
   {
     // DHCP failed, try static IP
     tftPrint("DHCP failed, trying static IP...\n");
-    Ethernet.begin(mac, ip);
+
+    Ethernet.begin(mac, staticCounter, dnsServer, staticGateway, staticSubnet);
+    delay(100);
+    assignedIP = staticCounter;
+  }
+  else
+  {
+    // DHCP succeeded, check if we got a valid IP
+    assignedIP = Ethernet.localIP();
+    if (assignedIP[0] == 0 || assignedIP == IPAddress(0, 0, 0, 0))
+    {
+      tftPrint("DHCP gave invalid IP, trying static IP...\n");
+      Ethernet.begin(mac, staticCounter, dnsServer, staticGateway, staticSubnet);
+      delay(100);
+      assignedIP = staticCounter;
+    }
+    else
+    {
+      debugSerialPrintf("DHCP successful, IP: %d.%d.%d.%d\n", assignedIP[0], assignedIP[1], assignedIP[2], assignedIP[3]);
+      // Store DHCP-assigned network parameters
+      assignedGateway = Ethernet.gatewayIP();
+      assignedSubnet = Ethernet.subnetMask();
+      assignedDNS = Ethernet.dnsServerIP();
+    }
   }
 
   // Wait a bit for link status to stabilize
   delay(100);
 
-  // Check if Ethernet link is active
-  linkStatus = Ethernet.linkStatus();
-  debugSerialPrintf("Wiznet linkStatus after DHCP=%d\n", linkStatus);
-
-  if (linkStatus == LinkON_Wiznet)
+  // Check if we have a valid IP address
+  assignedIP = Ethernet.localIP();
+  if (assignedIP[0] != 0 && assignedIP != IPAddress(0, 0, 0, 0))
   {
     // WIZNET connected successfully
-    IPAddress localIP = Ethernet.localIP();
     sprintf(resultStr, "Ethernet MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     tftPrint(resultStr);
-    sprintf(resultStr, "Ethernet IP: %s\n", localIP.toString().c_str());
+    sprintf(resultStr, "Ethernet IP: %s\n", assignedIP.toString().c_str());
     tftPrint(resultStr);
+
     ethServer.begin();
     tftPrint("Ethernet Network initialized successfully!\n");
     return NET_WIZNET;
   }
   else
   {
-    tftPrint("Ethernet link is down, trying WiFi as fallback...\n");
+    tftPrint("No valid IP address, trying WiFi as fallback...\n");
   }
 
   // WIZNET failed, check if 10 seconds have passed
@@ -2073,7 +2455,8 @@ bool setTimeFromNTP()
     udp.endPacket();
     debugSerialPrint("NTP packet sent, waiting for response...\n");
 
-    while ((millis() - start) < NTP_TIMEOUT_MS)
+    int attempts = 0;
+    while (attempts < 200) // 200 * 10ms = 2 seconds
     {
       packetSize = udp.parsePacket();
       if (packetSize == 48)
@@ -2083,6 +2466,7 @@ bool setTimeFromNTP()
         break;
       }
       delay(10);
+      attempts++;
     }
   }
   else if (netMode == NET_WIZNET)
@@ -2097,7 +2481,8 @@ bool setTimeFromNTP()
     ethUdp.endPacket();
     debugSerialPrint("NTP packet sent, waiting for response...\n");
 
-    while ((millis() - start) < NTP_TIMEOUT_MS)
+    int attempts = 0;
+    while (attempts < 200) // 200 * 10ms = 2 seconds
     {
       packetSize = ethUdp.parsePacket();
       if (packetSize == 48)
@@ -2107,6 +2492,7 @@ bool setTimeFromNTP()
         break;
       }
       delay(10);
+      attempts++;
     }
   }
   else
@@ -2158,6 +2544,90 @@ void formatMACString(byte *mac, char *out)
 // WEBSERVER FUNCTIONS
 // ============================================================================
 
+#ifdef TESTING_WEBSERVER
+void serveSimpleCounterPage(Stream &client, uint32_t counter, uint32_t reqCount)
+{
+  const int DATA_POINTS = 200;
+  String chartDataJSON = "[";
+  for (int i = 0; i < DATA_POINTS; i++)
+  {
+    float x = i * 1.0f;
+    float y = sinf(x * 0.1f) * sinf(x * 0.01f);
+    chartDataJSON += "[";
+    chartDataJSON += String(x, 1);
+    chartDataJSON += ",";
+    chartDataJSON += String(y, 3);
+    chartDataJSON += "]";
+    if (i < DATA_POINTS - 1)
+      chartDataJSON += ",";
+  }
+  chartDataJSON += "]";
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html");
+  client.println("Connection: close");
+  client.println();
+  client.println("<!DOCTYPE html>");
+  client.println("<html><head>");
+  client.println("<title>Counter Button Test</title>");
+  client.println("<script src=\"https://code.highcharts.com/highcharts.js\"></script>");
+  client.println("<style>");
+  client.println("body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }");
+  client.println("button { font-size: 24px; padding: 20px 40px; margin: 20px; background: #4CAF50; color: white; border: none; border-radius: 8px; cursor: pointer; }");
+  client.println("button:hover { background: #45a049; }");
+  client.println(".counter { font-size: 48px; color: #ff6600; margin: 20px; }");
+  client.println("#chart-container { width: 90%; height: 400px; margin: 20px auto; border: 2px solid #ddd; border-radius: 8px; }");
+  client.println(".info { font-size: 18px; color: #666; margin: 10px; }");
+  client.println("</style>");
+  client.println("</head><body>");
+  client.println("<h1>Counter Button Test</h1>");
+  client.printf("<div class='counter'>Counter: %lu</div>", (unsigned long)counter);
+  client.printf("<div class='info'>Requests: %lu</div>", (unsigned long)reqCount);
+  client.println("<button onclick=\"incrementCounter()\">Increment Counter</button>");
+  client.println("<div id=\"chart-container\"></div>");
+  client.println("<script>");
+  client.println("let chart;");
+  client.println("let dataIndex = 0;");
+  client.println("const chartData = ");
+  client.println(chartDataJSON);
+  client.println(";");
+  client.println("function createChart() {");
+  client.println("  chart = Highcharts.chart('chart-container', {");
+  client.println("    chart: { type: 'line', animation: false, marginRight: 10 },");
+  client.println("    title: { text: 'Modulated Sine Wave (Calculated Server-Side)' },");
+  client.println("    xAxis: { type: 'linear', tickPixelInterval: 150 },");
+  client.println("    yAxis: { title: { text: 'Amplitude' }, plotLines: [{ value: 0, width: 1, color: '#808080' }] },");
+  client.println("    tooltip: { formatter: function() { return '<b>' + this.series.name + '</b><br/>' + 'Time: ' + this.x.toFixed(1) + '<br/>' + 'Value: ' + this.y.toFixed(3); } },");
+  client.println("    legend: { enabled: false },");
+  client.println("    exporting: { enabled: false },");
+  client.println("    series: [{ name: 'Modulated Sine', data: [] }]");
+  client.println("  });");
+  client.println("}");
+  client.println("function updateChart() {");
+  client.println("  if (dataIndex < chartData.length) {");
+  client.println("    chart.series[0].addPoint(chartData[dataIndex], true, false);");
+  client.println("    dataIndex++;");
+  client.println("  }");
+  client.println("}");
+  client.println("function incrementCounter() {");
+  client.println("  fetch('/increment').then(() => {");
+  client.println("    fetch('/').then(response => response.text()).then(html => {");
+  client.println("      const parser = new DOMParser();");
+  client.println("      const doc = parser.parseFromString(html, 'text/html');");
+  client.println("      const counterDiv = doc.querySelector('.counter');");
+  client.println("      const infoDiv = doc.querySelector('.info');");
+  client.println("      if (counterDiv) document.querySelector('.counter').innerHTML = counterDiv.innerHTML;");
+  client.println("      if (infoDiv) document.querySelector('.info').innerHTML = infoDiv.innerHTML;");
+  client.println("    });");
+  client.println("  });");
+  client.println("}");
+  client.println("createChart();");
+  client.println("setInterval(updateChart, 100);");
+  client.println("</script>");
+  client.println("</body></html>");
+}
+#endif
+
 void serveChartPage(Stream &client)
 {
   // Open the HTML file from the LittleFS filesystem first
@@ -2173,28 +2643,26 @@ void serveChartPage(Stream &client)
     return;
   }
 
-  size_t fileSize = htmlFile.size();
-  debugSerialPrintf("Serving /chart.html (%u bytes)\n", (unsigned)fileSize);
-
-  // Send HTTP headers with Content-Length
+  // Send HTTP headers
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: text/html; charset=utf-8");
-  client.print("Content-Length: ");
-  client.println(fileSize);
   client.println("Connection: close");
   client.println();
 
   // Read and send file content in chunks
   const size_t bufSize = 512;
-  uint8_t buf[bufSize];
+  char buf[bufSize];
+
   while (htmlFile.available())
   {
-    size_t n = htmlFile.read(buf, bufSize);
+    size_t n = htmlFile.readBytes(buf, bufSize - 1);
     if (n == 0)
     {
       break;
     }
-    client.write(buf, n);
+    buf[n] = '\0'; // Null terminate
+
+    client.print(buf);
   }
 
   client.flush();
@@ -2308,6 +2776,9 @@ void sendSensorUDPStream(const char *channel, const float *data, size_t count)
     wifiUdpStream.write((const uint8_t *)packet, strlen(packet));
     wifiUdpStream.endPacket();
   }
+
+  // Release SPI bus after UDP transmission to prevent state corruption
+  releaseSPIBus();
 }
 
 void sendSensorUDPStream(const char *channel, const int *data, size_t count)
@@ -2339,6 +2810,9 @@ void sendSensorUDPStream(const char *channel, const int *data, size_t count)
     wifiUdpStream.write((const uint8_t *)packet, strlen(packet));
     wifiUdpStream.endPacket();
   }
+
+  // Release SPI bus after UDP transmission to prevent state corruption
+  releaseSPIBus();
 }
 
 void serveUDPStreamControl(Stream &client, const String &req)
@@ -2393,9 +2867,7 @@ void serveModeControl(Stream &client, const String &req)
     {
       mode = newMode;
       // Reset mode-specific flags when mode changes
-      text_mode_initialized = false;
-      waveform_initialized = false;
-      mode23_screen_cleared = false;
+      mode_initialized = false;
 
       debugPrintf("Mode changed to: %d\n", mode);
     }
@@ -2421,26 +2893,20 @@ void serveAxisControl(Stream &client, const String &req)
     {
       display_axis = 0;
       // Reset display flags to force re-initialization with new axis data
-      text_mode_initialized = false;
-      waveform_initialized = false;
-      mode23_screen_cleared = false;
+      mode_initialized = false;
       debugPrintln("Display axis changed to X");
     }
     else if (axisStr == "Y")
     {
       display_axis = 1;
       // Reset display flags to force re-initialization with new axis data
-      text_mode_initialized = false;
-      waveform_initialized = false;
-      mode23_screen_cleared = false;
+      mode_initialized = false;
       debugPrintln("Display axis changed to Y");
     }
     else if (axisStr == "R")
     {
       display_axis = 2;
-      text_mode_initialized = false;
-      waveform_initialized = false;
-      mode23_screen_cleared = false;
+      mode_initialized = false;
       debugPrintln("Display axis changed to R (radial)");
     }
   }
@@ -2534,12 +3000,12 @@ void serveTouchCalibData(Stream &client, const String &req)
 void setup_waveform()
 {
   // Clear the display
-  tft.fillScreen(ILI9341_BLACK);
+  tft.fillScreen(TFT_BLACK);
 
   // Draw center line
   tft.drawLine(waveform_x, waveform_mid_y,
                waveform_x + waveform_w, waveform_mid_y,
-               ILI9341_LIGHTGREY);
+               TFT_LIGHTGREY);
 
   // Calculate trigger level positions
   // Upper trigger at 1/8 from top, lower trigger at 1/8 from bottom
@@ -2552,10 +3018,10 @@ void setup_waveform()
   // Draw dashed horizontal lines for trigger levels
   for (int x = waveform_x; x < waveform_x + waveform_w; x += 4)
   {
-    tft.drawPixel(x, upper_trigger_y, ILI9341_LIGHTGREY);
-    tft.drawPixel(x + 1, upper_trigger_y, ILI9341_LIGHTGREY);
-    tft.drawPixel(x, lower_trigger_y, ILI9341_LIGHTGREY);
-    tft.drawPixel(x + 1, lower_trigger_y, ILI9341_LIGHTGREY);
+    tft.drawPixel(x, upper_trigger_y, TFT_LIGHTGREY);
+    tft.drawPixel(x + 1, upper_trigger_y, TFT_LIGHTGREY);
+    tft.drawPixel(x, lower_trigger_y, TFT_LIGHTGREY);
+    tft.drawPixel(x + 1, lower_trigger_y, TFT_LIGHTGREY);
   }
 
   // Initialize last_points to center line
@@ -2575,17 +3041,17 @@ void draw_fft_frequency_axis()
   const float nyquist_freq = sample_rate / 2.0; // 250 Hz
 
   // Draw axis line
-  tft.drawLine(0, axis_y, 320, axis_y, ILI9341_WHITE);
+  tft.drawLine(0, axis_y, 320, axis_y, TFT_WHITE);
 
   // Draw frequency labels: 0, 50, 100, 150, 200, 250 Hz
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextColor(TFT_WHITE);
 
   for (int freq = 0; freq <= 250; freq += 50)
   {
     int x_pos = (int)(freq / nyquist_freq * 320);
     // Draw tick mark
-    tft.drawLine(x_pos, axis_y, x_pos, axis_y - 3, ILI9341_WHITE);
+    tft.drawLine(x_pos, axis_y, x_pos, axis_y - 3, TFT_WHITE);
     // Draw label (positioned above the axis line to stay on screen)
     // Adjust label position based on number of digits and keep rightmost label on screen
     int label_offset;
@@ -2641,18 +3107,18 @@ void waveform_display(short *samples, int n_samples, int color, bool draw_trigge
 
     // Choose color: red if outside threshold, otherwise use specified color
     bool outside_threshold = (samples[i] > CROSSING_THRESHOLD) || (samples[i] < -CROSSING_THRESHOLD);
-    int line_color = outside_threshold ? ILI9341_RED : color;
+    int line_color = outside_threshold ? TFT_RED : color;
 
     if (i > 0)
     {
-      tft.drawLine(last_x, last_old_y, x_val, old_y_val, ILI9341_BLACK);
+      tft.drawLine(last_x, last_old_y, x_val, old_y_val, TFT_BLACK);
       tft.drawLine(last_x, last_y, x_val, y_val, line_color);
 
       // Redraw trigger level dashes if waveform passes through them (only in waveform mode)
       if (draw_triggers && ((x_val % 4) == 0 || (x_val % 4) == 1))
       {
-        tft.drawPixel(x_val, upper_trigger_y, ILI9341_LIGHTGREY);
-        tft.drawPixel(x_val, lower_trigger_y, ILI9341_LIGHTGREY);
+        tft.drawPixel(x_val, upper_trigger_y, TFT_LIGHTGREY);
+        tft.drawPixel(x_val, lower_trigger_y, TFT_LIGHTGREY);
       }
     }
     last_x = x_val;
@@ -2763,97 +3229,27 @@ void add_display_column(short *values, int n_values)
     return;
   }
 
-  // Normal scrolling mode when menu is not visible
-  int x = waveform_x + disp_column;
-  for (int i = 0; i < MIN(waveform_h, n_values); ++i)
+  // Hardware scrolling for downward movement (new data at top):
+
+  int x = scroll_x_start; // Draw at line that's currently at right corner of display
+  scrollDisplay(1);       // Scroll down by 1 line (content moves down, new line appears at top)
+
+  // Draw horizontal row of frequency data (240 frequency bins across width)
+  for (int y = 0; y < MIN(240, n_values); ++y)
   {
-    int y = waveform_y + waveform_h - i;
 
     // Scale value from [running_min, running_max] to [0, 255]
-    int v = ((long)(values[i] - running_min) * 255) / range;
+    int v = ((long)(values[y] - running_min) * 255) / range;
     v = MAX(0, MIN(255, v)); // Clamp to valid range
 
     int color = getMagmaColor(v);
-    tft.drawPixel(x, y, color);
-  }
-  disp_column = (disp_column + 1) % waveform_w;
-  tft.scrollTo(disp_column);
-
-  drawMenuIndicator(disp_column);
-}
-
-void setup_buffer()
-{
-  for (int i = 0; i < RING_BUFFER_SIZE; ++i)
-  {
-    ring_buffer[i] = 0;
-  }
-}
-
-void buffer_feed(int sample)
-{
-  ring_buffer[ring_buffer_tail++] = sample;
-  ring_buffer_tail &= RING_BUFFER_SIZE - 1;
-}
-
-int find_crossing(int min_size, int threshold, CrossingDirection direction)
-{
-  int tail = ring_buffer_tail; // Snapshot volatile.
-
-  // Check if we have enough samples in the buffer
-  if (tail < min_size + 1)
-  {
-    static unsigned long last_warn = 0;
-    if (millis() - last_warn > 2000)
-    {
-      debugSerialPrint("find_crossing: Not enough samples yet. tail=");
-      debugSerialPrint(tail);
-      debugSerialPrint(", need at least ");
-      debugSerialPrintln(min_size + 1);
-      last_warn = millis();
-    }
-    return 0; // Not enough data yet
+    tft.drawPixel(x, 240 - y, color);
   }
 
-  short last_sample = ring_buffer[(tail - min_size) & (RING_BUFFER_SIZE - 1)];
+  // Next time we'll draw at the new scroll_x_start (new top line)
+  disp_column = scroll_x_start;
 
-  // Only scan recent history (4096 samples) for faster detection
-  int max_scan = min_size + 4096;
-  if (max_scan > RING_BUFFER_SIZE)
-    max_scan = RING_BUFFER_SIZE;
-
-  for (int i = min_size + 1; i < max_scan; ++i)
-  {
-    // Scan backwards, so we find the most recent transition with at least min_size.
-    int index = (tail - i) & (RING_BUFFER_SIZE - 1);
-    short next_sample = ring_buffer[index];
-
-    // Check if signal exits the interval [-threshold, +threshold]
-    bool last_inside = (last_sample >= -threshold) && (last_sample <= threshold);
-
-    if (direction == CROSSING_POSITIVE || direction == CROSSING_BOTH)
-    {
-      // Looking for signal going from inside interval to outside positive
-      if (last_inside && (next_sample > threshold))
-      {
-        return index;
-      }
-    }
-
-    if (direction == CROSSING_NEGATIVE || direction == CROSSING_BOTH)
-    {
-      // Looking for signal going from inside interval to outside negative
-      if (last_inside && (next_sample < -threshold))
-      {
-        return index;
-      }
-    }
-
-    last_sample = next_sample;
-  }
-
-  // Didn't find a crossing.
-  return 0;
+  drawMenuIndicator(scroll_x_start);
 }
 
 void buffer_get_latest(short *buffer, int n_samples, int scalebits)
@@ -2865,6 +3261,12 @@ void buffer_get_latest(short *buffer, int n_samples, int scalebits)
     *buffer++ = ring_buffer[from++] << scalebits;
     from &= RING_BUFFER_SIZE - 1;
   }
+}
+
+void buffer_feed(int sample)
+{
+  ring_buffer[ring_buffer_tail++] = sample;
+  ring_buffer_tail &= RING_BUFFER_SIZE - 1;
 }
 
 #ifdef USE_FIXEDPOINT
@@ -2993,14 +3395,14 @@ void drawModeMenu()
   }
 
   // Clear old menu indicator artifacts before drawing the menu
-  tft.fillRect(origin_x, origin_y, 24, 20, ILI9341_BLACK);
+  tft.fillRect(origin_x, origin_y, 24, 20, TFT_BLACK);
 
   // Draw semi-transparent background (simulate with black box)
-  tft.fillRect(origin_x, origin_y + 20, 80, 220, ILI9341_BLACK);
+  tft.fillRect(origin_x, origin_y + 20, 80, 220, TFT_BLACK);
 
   // Draw title
   tft.setCursor(origin_x + 10, origin_y + 25);
-  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(1);
   tft.print("MODE");
 
@@ -3009,69 +3411,17 @@ void drawModeMenu()
   {
     MenuButton &btn = menu_buttons[i];
     tft.fillRect(origin_x + btn.x, origin_y + btn.y, btn.w, btn.h, btn.color);
-    tft.drawRect(origin_x + btn.x, origin_y + btn.y, btn.w, btn.h, ILI9341_WHITE);
+    tft.drawRect(origin_x + btn.x, origin_y + btn.y, btn.w, btn.h, TFT_WHITE);
 
     // Center text in button
     tft.setCursor(origin_x + btn.x + 5, origin_y + btn.y + 15);
-    tft.setTextColor(ILI9341_WHITE, btn.color);
+    tft.setTextColor(TFT_WHITE, btn.color);
     tft.setTextSize(1);
     tft.print(btn.label);
   }
 
   menu_visible = true;
   menu_show_time = millis();
-}
-
-/**
- * @brief Draws a menu indicator ("hamburger" icon) on the TFT display, adjusting for screen rotation and scroll offset.
- *
- * This function renders a small menu indicator icon at a position determined by the current scroll offset and
- * the TFT display's rotation setting. It clears the background area to prevent artifacts from scrolling,
- * then draws a three-line "hamburger" menu icon with a border.
- *
- * @param scroll_offset The current scroll offset, used to position the menu indicator appropriately based on rotation.
- */
-void drawMenuIndicator(int scroll_offset)
-{
-  // Account for different rotation settings
-  // Rotation 0: Portrait (240w x 320h) - scrollTo scrolls vertically
-  // Rotation 1: Landscape (320w x 240h) - scrollTo scrolls horizontally
-  // Rotation 2: Portrait inverted (240w x 320h) - scrollTo scrolls vertically
-  // Rotation 3: Landscape inverted (320w x 240h) - scrollTo scrolls horizontally
-
-  int x_base = 2;
-  int y_base = 0;
-
-  // Use current scroll offset for positioning; when menu is visible use the saved offset so icon stays at physical top-left
-  int effective_offset = menu_visible ? saved_scroll_offset : scroll_offset;
-  int w = tft.width();
-  int h = tft.height();
-
-  switch (TFT_ROTATION)
-  {
-  case 0: // Portrait - scroll affects y
-    y_base = effective_offset % h;
-    break;
-  case 1: // Landscape - scroll affects x
-    x_base = effective_offset % w + 2;
-    break;
-  case 2: // Portrait inverted - scroll affects y
-    y_base = effective_offset % h;
-    break;
-  case 3: // Landscape inverted - scroll affects x
-    x_base = effective_offset % w + 2;
-    break;
-  }
-
-  // Clear background with a slightly larger area to remove old border pixels from scrolling
-  tft.fillRect(x_base - 1, y_base, 18, 16, ILI9341_BLACK);
-
-  // Draw a small "hamburger" menu icon (3 horizontal lines)
-  tft.fillRect(x_base + 3, y_base + 2, 10, 2, ILI9341_WHITE);
-  tft.fillRect(x_base + 3, y_base + 7, 10, 2, ILI9341_WHITE);
-  tft.fillRect(x_base + 3, y_base + 12, 10, 2, ILI9341_WHITE);
-  // Add a small border
-  tft.drawRect(x_base, y_base, 16, 16, COLOR_GREY);
 }
 
 /**
@@ -3106,131 +3456,137 @@ bool handleTouchInput(volatile int &current_mode)
   static bool touch_was_pressed = false;
   const unsigned long DEBOUNCE_MS = 200;
 
-  // Debug polling (was DEBUG_TOUCH_EVENTS)
-  static unsigned long last_poll_debug = 0;
-  if (logVerbosity >= LOG_DEBUG && millis() - last_poll_debug > 5000)
-  {
-    debugPrintln("handleTouchInput: polling...", LOG_DEBUG);
-    last_poll_debug = millis();
-  }
+  // Only poll for touch events when IRQ flag is set
+  if (!touch_event_flag)
+    return false;
 
-  // Check if enough time has passed since last touch (debounce)
+  // Clear the flag and re-enable IRQ for next touch
+  touch_event_flag = false;
+  gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true);
+
+  // Debounce after IRQ flag is set (test code style)
   if (millis() - last_touch_time < DEBOUNCE_MS)
   {
     return false;
   }
 
-  // Check if touchscreen is being touched first
-  bool is_touched = touchscreen.touched();
-  TS_Point tp;
-  if (is_touched)
+  uint16_t tx = 0, ty = 0;
+  bool is_touched = tft.getTouch(&tx, &ty, TOUCH_THRESHOLD);
+
+  if (!is_touched)
   {
-    tp = touchscreen.getPoint();
-  }
-  else
-  {
-    // When not touched, still call getPoint() to keep touchscreen active
-    tp = touchscreen.getPoint();
+    // False trigger - no actual touch detected
+    return false;
   }
 
-  // Log raw touch data for debugging
-  static unsigned long last_debug_time = 0;
-  static int debug_counter = 0;
-  if (logVerbosity >= LOG_DEBUG && millis() - last_debug_time > 1000)
+  // Create a structure to hold touch coordinates (compatible with existing code)
+  struct
   {
-    debugPrintf("Touch poll #%d: touched=%d, x=%d, y=%d, z=%d\n", debug_counter++, is_touched, tp.x, tp.y, tp.z);
-    last_debug_time = millis();
+    uint16_t x, y, z;
+  } tp;
+  tp.x = tx;
+  tp.y = ty;
+  tp.z = 1000; // Pressure value for touched state
+
+  // Log touch data for debugging
+  if (logVerbosity >= LOG_INFO)
+  {
+    debugPrintf("Touch event (IRQ): x=%d, y=%d\n", tp.x, tp.y);
   }
 
-  // Check for touch press (rising edge detection)
-  if (tp.z > 0)
+  // Process touch event (same logic as before)
+  touch_was_pressed = true;
+  last_touch_time = millis();
+
+  // Convert touch coordinates to display coordinates
+  int display_x, display_y;
+  applyMMSECalibration(tp.x, tp.y, display_x, display_y);
+
+  if (logVerbosity >= LOG_INFO)
   {
-    if (!touch_was_pressed)
+    debugPrintf("Touch event detected at display coordinates: x=%d, y=%d\n", display_x, display_y);
+  }
+
+  // Wake from display-off mode (-1) on any touch: resume to spectrogram (mode 3)
+  if (current_mode == -1)
+  {
+    current_mode = 3;
+    menu_visible = false;
+    scrollAddress(saved_scroll_offset); // Restore hardware scroll position
+    disp_column = saved_scroll_offset % waveform_w;
+    tft.fillScreen(TFT_BLACK);
+    debugPrintln("Waking display to mode 3 (spectrogram) via touch");
+    return true;
+  }
+
+  // Check if touch is in the menu toggle area (top-left corner)
+  if (!menu_visible && display_x < 80 && display_y < 20)
+  {
+    if (logVerbosity >= LOG_INFO)
+      debugPrintln("Menu symbol pressed - showing menu", LOG_INFO);
+    drawModeMenu();
+    return false;
+  }
+
+  if (!menu_visible && logVerbosity >= LOG_INFO)
+    debugPrintln("Touch outside menu symbol area", LOG_INFO);
+
+  // If menu is visible, check button touches
+  if (menu_visible)
+  {
+    // Calculate the same offset compensation used in drawModeMenu()
+    int touch_origin_x = 0;
+    int touch_origin_y = 0;
+    if (TFT_ROTATION == 1 || TFT_ROTATION == 3)
     {
-      // New touch detected
-      touch_was_pressed = true;
-      last_touch_time = millis();
+      touch_origin_x = saved_scroll_offset % tft.width();
+    }
+    else
+    {
+      touch_origin_y = saved_scroll_offset % tft.height();
+    }
 
-      // Convert touch coordinates to display coordinates
-      int display_x, display_y;
-      applyMMSECalibration(tp.x, tp.y, display_x, display_y);
+    // Adjust touch coordinates to account for menu offset
+    int adjusted_touch_x = display_x - touch_origin_x;
+    int adjusted_touch_y = display_y - touch_origin_y;
 
-      if (logVerbosity >= LOG_DEBUG)
-      {
-        debugPrintf("Touch event detected at display coordinates: x=%d, y=%d\n", display_x, display_y);
-      }
-
-      // Wake from display-off mode (-1) on any touch: resume to spectrogram (mode 3)
-      if (current_mode == -1)
-      {
-        current_mode = 3;
-        menu_visible = false;
-        tft.scrollTo(saved_scroll_offset);
-        disp_column = saved_scroll_offset % waveform_w;
-        tft.fillScreen(ILI9341_BLACK);
-        debugPrintln("Waking display to mode 3 (spectrogram) via touch");
-        return true;
-      }
-
-      // Check if touch is in the menu toggle area (top-left corner)
-      if (!menu_visible && display_x < 80 && display_y < 20)
+    for (int i = 0; i < NUM_MENU_BUTTONS; i++)
+    {
+      if (isTouchInButton(adjusted_touch_x, adjusted_touch_y, menu_buttons[i]))
       {
         if (logVerbosity >= LOG_DEBUG)
-          debugPrintln("Menu symbol pressed - showing menu", LOG_DEBUG);
-        drawModeMenu();
-        return false;
-      }
-
-      if (!menu_visible && logVerbosity >= LOG_DEBUG)
-        debugPrintln("Touch outside menu symbol area", LOG_DEBUG);
-
-      // If menu is visible, check button touches
-      if (menu_visible)
-      {
-        for (int i = 0; i < NUM_MENU_BUTTONS; i++)
+          debugPrintf("Menu button pressed: %s (mode %d)\n", menu_buttons[i].label, menu_buttons[i].mode_value);
+        // Mode button pressed
+        int new_mode = menu_buttons[i].mode_value;
+        if (new_mode != current_mode)
         {
-          if (isTouchInButton(display_x, display_y, menu_buttons[i]))
-          {
-            if (logVerbosity >= LOG_DEBUG)
-              debugPrintf("Menu button pressed: %s (mode %d)\n", menu_buttons[i].label, menu_buttons[i].mode_value);
-            // Mode button pressed
-            int new_mode = menu_buttons[i].mode_value;
-            if (new_mode != current_mode)
-            {
-              current_mode = new_mode;
-              menu_visible = false;
+          current_mode = new_mode;
+          menu_visible = false;
 
-              // Restore scroll position and keep drawing aligned after closing the menu
-              tft.scrollTo(saved_scroll_offset);
-              disp_column = saved_scroll_offset % waveform_w;
+          // Restore scroll position and keep drawing aligned after closing the menu
+          scrollAddress(saved_scroll_offset); // Restore hardware scroll position
+          disp_column = saved_scroll_offset % waveform_w;
 
-              // Clear screen for new mode
-              tft.fillScreen(ILI9341_BLACK);
+          // Clear screen for new mode
+          tft.fillScreen(TFT_BLACK);
 
-              debugPrint("Mode changed to: ");
-              debugPrintf("%d\n", current_mode);
-              return true;
-            }
-          }
+          debugPrint("Mode changed to: ");
+          debugPrintf("%d\n", current_mode);
+          return true;
         }
-        if (logVerbosity >= LOG_DEBUG)
-          debugPrintln("Touch in menu area but outside buttons", LOG_DEBUG);
       }
     }
-  }
-  else
-  {
-    // No touch detected
-    touch_was_pressed = false;
+    if (logVerbosity >= LOG_DEBUG)
+      debugPrintln("Touch in menu area but outside buttons", LOG_DEBUG);
   }
 
   // Auto-hide menu after timeout
   if (menu_visible && (millis() - menu_show_time > MENU_TIMEOUT_MS))
   {
     menu_visible = false;
-    tft.scrollTo(saved_scroll_offset);
+    scrollAddress(saved_scroll_offset); // Restore hardware scroll position
     disp_column = saved_scroll_offset % waveform_w;
-    tft.fillScreen(ILI9341_BLACK);
+    tft.fillScreen(TFT_BLACK);
     // Redraw menu indicator after timeout
     if (current_mode > 0)
     {
@@ -3255,18 +3611,17 @@ void setup()
   {
     delay(10);
   }
-  sleep_ms(1000);
 #endif
-#if ENABLE_TFT
-  initTFTDisplay(); // Initialize TFT display early to show debug messages
-#endif
+  // Initialize all GPIO pins to safe default states before peripheral initialization
+  initAllGPIOs();
+
+  initTFTDisplay(TFT_ROTATION); // Initialize TFT display early to show debug messages
   tftPrint("Starting Pier Vibration Sensor...\n");
   char versionStr[100];
   sprintf(versionStr, "Version: %s (%s)\n", GIT_COMMIT_SHORT, GIT_COMMIT_DATE);
   tftPrint(versionStr);
 
-  // Start with display off to prevent SPI congestion
-  mode = -1;
+  mode = 3; // Start in spectrogram mode (mode 3) which has the most SPI activity, so we can test it right away
 
   // Initialize networking after TFT
   netMode = initNetworking();
@@ -3307,39 +3662,31 @@ void setup()
     }
   }
 #endif
+
+  // Initialize touch controller with improved strategy from test_all
   tftPrint("---------------------------------------------\n");
   tftPrint("Initializing XPT2046 touch controller...\n");
-  tftPrint("Start touch controller calibration...\n");
 
   bool calibrationPerformed = false;
 
   if (!loadTouchCalibration() || forceTouchCalibration)
   {
-    tftPrint("No touch calibration found, starting calibration...\n");
+    tftPrint("No touch calibration found or force calibration enabled, starting calibration...\n");
     // calibrateTouchController() will initialize the touchscreen
-    // calibrateTouchController(); // Disabled
-    calibrationPerformed = true; // Skip calibration
+    calibrateTouchController();
+    calibrationPerformed = true;
   }
   else
   {
     tftPrint("Touch calibration loaded from /touch_calib.txt...\n");
-    // Initialize touchscreen the same way as calibrateTouchController() does
-    debugSerialPrintln("Initializing touchscreen with loaded calibration...");
-
-    // Set display rotation
-    // tft.setRotation(TFT_ROTATION); // Disabled
-
-    // Reset hardware scrolling to ensure correct coordinate mapping
-    // tft.scrollTo(0); // Disabled
-
-    // Initialize touch controller - begin() will handle CS pin setup
-    // touchscreen.begin(); // Disabled
-    // touchscreen.setRotation(TFT_ROTATION); // Disabled
-
-    tftPrint("Touch controller initialized...\n");
-    // tft.setCursor(0, 0); // Disabled
   }
 
+  // Initialize touch controller using improved pattern from test_all
+  // This should be done BEFORE other SPI devices to establish baseline
+  initTouchController();
+  tftPrint("Touch controller initialized...\n");
+
+  tftPrint("---------------------------------------------\n");
   initADS1256();
   // initMPU6500();
   initICM20948();
@@ -3361,10 +3708,11 @@ void setup()
     formatMACString(mac, macString);
   }
 
-  if (!setTimeFromNTP())
-  {
-    tftPrint("Failed to set system time from NTP server.\n");
-  }
+  // NTP time sync disabled to prevent hanging
+  // if (!setTimeFromNTP())
+  // {
+  //   tftPrint("Failed to set system time from NTP server.\n");
+  // }
 
   // Server is already started in initNetworking()
   if (!serverInfoPrinted)
@@ -3376,7 +3724,7 @@ void setup()
     }
     else if (netMode == NET_WIZNET)
     {
-      resultStr = "Serving chart page at http://" + Ethernet.localIP().toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
+      resultStr = "Serving chart page at http://" + assignedIP.toString() + ":" + String(HTTP_SERVER_PORT) + "\n";
     }
     else
     {
@@ -3391,117 +3739,14 @@ void setup()
     serverInfoPrinted = true;
   }
   setup_dsp();
+  gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, touch_irq_isr);
 
   tftPrint("---------------------------------------------\n");
   tftPrint("System initialized.\n");
+  tftPrint("---------------------------------------------\n");
 
-  // Re-initialize touchscreen after all other SPI devices have been configured
-  // This ensures the touchscreen works correctly after WIZNET5K and other devices
-  // have potentially modified the SPI0 bus settings
-  debugSerialPrintln("Re-initializing touchscreen after SPI bus setup...");
-
-  // Disable other SPI0 devices first
-  if (TFT_CS != -1)
-  {
-    gpio_init(TFT_CS);
-    gpio_set_dir(TFT_CS, GPIO_OUT);
-    gpio_put(TFT_CS, 1); // Deselect TFT
-  }
-  if (SD_CS != -1)
-  {
-    gpio_init(SD_CS);
-    gpio_set_dir(SD_CS, GPIO_OUT);
-    gpio_put(SD_CS, 1); // Deselect SD
-  }
-
-  // DON'T reconfigure SPI - TFT already initialized it
-  debugSerialPrintf("Initializing touchscreen with CS on GPIO %d...\n", TOUCH_CS);
-  debugSerialPrintln("Note: Using existing SPI0 configuration from TFT");
-
-  // CRITICAL: Disable pull-up on MISO (GP0) - pull-up causes 0xFF reads
-  gpio_set_pulls(TFT_MISO, false, false); // No pull-up, no pull-down
-  debugSerialPrintf("Disabled pull resistors on MISO (GP%d)\n", TFT_MISO);
-
-  // Configure CS as GPIO for library to control (not hardware SPI CS)
-  pinMode(TOUCH_CS, OUTPUT);
-  digitalWrite(TOUCH_CS, HIGH);
-  debugSerialPrintf("Touch CS configured as GPIO output, initial state: %d\n", digitalRead(TOUCH_CS));
-
-  // Initialize the touchscreen library - it will use the existing SPI bus
-  debugSerialPrintln("Calling touchscreen.begin()...");
-  // bool touch_ok = touchscreen.begin(); // Disabled for testing
-  bool touch_ok = true; // Assume ok
-  debugSerialPrintf("touchscreen.begin() returned: %d\n", touch_ok);
-  // touchscreen.setRotation(TFT_ROTATION); // Disabled
-
-  // Setup touch IRQ
-  debugSerialPrintf("Setting up touch IRQ on GPIO %d...\n", TOUCH_IRQ);
-  gpio_init(TOUCH_IRQ);
-  gpio_set_dir(TOUCH_IRQ, GPIO_IN);
-  gpio_pull_up(TOUCH_IRQ);
-
-  // Read initial IRQ state
-  int irq_state = gpio_get(TOUCH_IRQ);
-  debugSerialPrintf("Touch IRQ initial state: %d (should be 1 when not touched)\n", irq_state);
-
-  gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, &touch_irq_isr);
-  debugSerialPrintln("Touch IRQ configured.");
-
-  delay(100); // Brief stabilization delay
-
-  // Test touch read
-  debugSerialPrintln("Testing touch controller read...");
-  // debugSerialPrintf("CS pin state before read: %d\n", gpio_get(TOUCH_CS));
-  // TS_Point test_pt = touchscreen.getPoint();
-  // debugSerialPrintf("CS pin state after read: %d\n", gpio_get(TOUCH_CS));
-  // debugSerialPrintf("Touch test: touched=%d, x=%d, y=%d, z=%d\n",
-  //                   touchscreen.touched(), test_pt.x, test_pt.y, test_pt.z);
-
-  // Try manual SPI read to verify communication
-  debugSerialPrintln("Testing manual SPI read from touch controller...");
-
-  // XPT2046 requires SPI Mode 0, max 2 MHz
-  // Configure SPI for touch controller (different from TFT settings)
-  spi_set_format(TOUCH_SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-  spi_set_baudrate(TOUCH_SPI_PORT, TOUCH_SPI_BPS); // 1 MHz for touch
-  debugSerialPrintf("SPI configured for XPT2046: Mode 0, %d MHz\n", TOUCH_SPI_BPS / 1000000);
-
-  // Re-verify GP0 is still SPI function
-  uint32_t gp0_func_now = (iobank0_hw->io[TFT_MISO].ctrl & IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS) >> IO_BANK0_GPIO0_CTRL_FUNCSEL_LSB;
-  debugSerialPrintf("GP%d function at touch test: %d (should be 1 for SPI)\n", TFT_MISO, gp0_func_now);
-  if (gp0_func_now != 1)
-  {
-    debugSerialPrintln("ERROR: GP0 no longer configured as SPI! Re-configuring...");
-    gpio_set_function(TFT_MISO, GPIO_FUNC_SPI);
-  }
-
-  // Test CS control with digitalWrite (what library uses)
-  debugSerialPrintf("CS before digitalWrite LOW: %d\n", digitalRead(TOUCH_CS));
-  digitalWrite(TOUCH_CS, LOW);
-  debugSerialPrintf("CS after digitalWrite LOW: %d\n", digitalRead(TOUCH_CS));
-  delayMicroseconds(1);
-
-  // XPT2046 protocol: send command, then transfer dummy bytes while reading response
-  // Command format: 0x93 = 1001 0011 (Y-pos, 12-bit, differential, PD=11 for always-on)
-  uint8_t tx_buf[3] = {0x93, 0x00, 0x00}; // Command + 2 dummy bytes (PD bits set for always-on)
-  uint8_t rx_buf[3];
-  spi_write_read_blocking(TOUCH_SPI_PORT, tx_buf, rx_buf, 3);
-
-  digitalWrite(TOUCH_CS, HIGH);
-  debugSerialPrintf("CS after digitalWrite HIGH: %d\n", digitalRead(TOUCH_CS));
-  debugSerialPrintf("Manual SPI read result (cmd 0x93): 0x%02X 0x%02X 0x%02X\n", rx_buf[0], rx_buf[1], rx_buf[2]);
-
-  // Also try with screen touched - touch it now and check again
-  debugSerialPrintln("*** TOUCH THE SCREEN NOW ***");
-  delay(2000);
-  digitalWrite(TOUCH_CS, LOW);
-  delayMicroseconds(1);
-  spi_write_read_blocking(TOUCH_SPI_PORT, tx_buf, rx_buf, 3);
-  digitalWrite(TOUCH_CS, HIGH);
-  debugSerialPrintf("Manual SPI read with touch: 0x%02X 0x%02X 0x%02X\n", rx_buf[0], rx_buf[1], rx_buf[2]);
-
+  debugSerialPrintln("Setup complete - entering main loop");
   tftPrint("Starting Main Loop...\n");
-  debugSerialPrintln("Main loop started - collecting sensor data");
 }
 
 // ============================================================================
@@ -3510,16 +3755,26 @@ void setup()
 
 void loop()
 {
+  // Auto-correct netMode if it was reset but we have a valid network connection
+  if (netMode == NET_NONE && (assignedIP[0] != 0))
+  {
+    netMode = NET_WIZNET; // Restore to NET_WIZNET since DHCP succeeded
+  }
+
+  // ----------------------------------------------------------------------------
+  // LOOP INITIALIZATION AND TIMING
+  // ----------------------------------------------------------------------------
   static unsigned long loop_start_time = 0;
   static unsigned long block_start_time = 0;
   static unsigned long timing_report_interval = 5000; // Report every 5 seconds
   static unsigned long last_timing_report = 0;
 
-  // Initialize timing at loop start
+  // TIMING BLOCK 1: Loop Inititalization
+
   loop_start_time = micros();
 
   // Ensure all SPI0 CS pins are deselected at loop start
-  deselectSpi0DevicesForWiznet();
+  releaseSPIBus();
 
   static int velocXraw_block[UDP_PACKET_SIZE];
   static int velocYraw_block[UDP_PACKET_SIZE];
@@ -3556,7 +3811,10 @@ void loop()
     last_touch_irq_log = millis();
   }
 
-  // TIMING BLOCK 1: ADS1256 Reading
+  // ----------------------------------------------------------------------------
+  // SENSOR DATA ACQUISITION (ADS1256 & ICM20948)
+  // ----------------------------------------------------------------------------
+  // TIMING BLOCK 2: Sensor Data Acquisition
   block_start_time = micros();
   const uint8_t myMuxList[] = {SING_0, SING_7};                                     // or any list of SING_x constants
   adcValue0 = ads.cycleSingle(myMuxList, sizeof(myMuxList) / sizeof(myMuxList[0])); // Read single-ended channel 0 (Veloc X) selecting channel 7 as next channel
@@ -3583,7 +3841,10 @@ void loop()
     icm_read_counter = 0;
   }
 
-  // TIMING BLOCK 2: Data Storage and Buffer Operations
+  // ----------------------------------------------------------------------------
+  // DATA STORAGE AND BUFFER OPERATIONS
+  // ----------------------------------------------------------------------------
+  // TIMING BLOCK 3: Data Storage and Buffer Operations
   block_start_time = micros();
   velocXraw_block[block_idx] = adcValue0;
   velocYraw_block[block_idx] = adcValue7;
@@ -3704,8 +3965,12 @@ void loop()
     debugSerialPrintf("TIMING: Data Storage/Buffer: %lu us\n", micros() - block_start_time);
   }
 
+  // ----------------------------------------------------------------------------
+  // UDP STREAMING (when buffer is full)
+  // ----------------------------------------------------------------------------
   if (block_idx >= UDP_PACKET_SIZE)
   {
+    // TIMING BLOCK 4: UDP Streaming
     block_start_time = micros();
     if (udpStreamEnable[0])
     {
@@ -3739,148 +4004,347 @@ void loop()
     }
   }
 
+  // Release SPI bus immediately before webserver operations to prevent socket state corruption
+  // This ensures both UDP streaming and subsequent TCP socket operations don't interfere
+  releaseSPIBus();
+
+  // ----------------------------------------------------------------------------
+  // HTTP/WEBSERVER NETWORKING
+  // ----------------------------------------------------------------------------
   if (netMode == NET_WIZNET || netMode == NET_WIFI)
   {
-    // Use a pointer to the active client
-    Stream *client = nullptr;
+#ifdef TESTING_WEBSERVER
+    static uint32_t simpleCounter = 0;
+    static uint32_t simpleReqCount = 0;
+#endif
+    static uint32_t httpAcceptedClients = 0;
+    static uint32_t httpSoftResyncCount = 0;
+    static uint32_t httpHardResyncCount = 0;
+    static uint32_t httpResyncFailStreak = 0;
+    static uint32_t httpMaxNoClientLoops = 0;
 
+    // TIMING BLOCK 5: HTTP/WEBSERVER NETWORKING
     block_start_time = micros();
-
-    // Use non-blocking server methods (Ethernet uses available(), WiFi uses accept() as available() is deprecated)
+    unsigned long http_accept_start = micros();
     if (netMode == NET_WIZNET)
     {
-      EthernetClient ethClient;
-      ethClient = ethServer.available();
-      if (ethClient)
+      static uint32_t wiznetNoClientLoops = 0;
+      static unsigned long lastWiznetResyncMs = 0;
+
+      if (wiznetNoClientLoops > 5000 && (millis() - lastWiznetResyncMs) > 10000)
       {
-        client = &ethClient;
+        bool useHardReset = (httpResyncFailStreak >= 2);
+
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintf("HTTP: WIZNET %s resync after %lu no-client loops\n",
+                            useHardReset ? "HARD" : "SOFT",
+                            (unsigned long)wiznetNoClientLoops);
+        }
+
+        releaseSPIBus();
+        if (useHardReset)
+        {
+          wiznet5k_reset();
+          httpHardResyncCount++;
+        }
+        else
+        {
+          httpSoftResyncCount++;
+        }
+        wiznet_init_spi();
+        Ethernet.init(WIZNET_SPI_CS);
+        ethServer.begin();
+
+        httpResyncFailStreak++;
+        lastWiznetResyncMs = millis();
+        wiznetNoClientLoops = 0;
+      }
+
+      EthernetClient client = ethServer.available();
+      if (client)
+      {
+        wiznetNoClientLoops = 0;
+        httpAcceptedClients++;
+        httpResyncFailStreak = 0;
+
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintln("HTTP: Ethernet client accepted");
+        }
+
+        client.setTimeout(250);
+
+        if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+        {
+          debugSerialPrintf("TIMING: HTTP Accept: %lu us\n", micros() - http_accept_start);
+        }
 
         if (logVerbosity >= LOG_DEBUG)
         {
           debugSerialPrintln("HTTP: Ethernet client connected");
         }
+
+        // Request handling pattern analogous to test_wiznet_counter_button
+        unsigned long http_parse_start = micros();
+        String req = client.readStringUntil('\r');
+        client.readStringUntil('\n'); // Skip rest of request line
+        req.trim();
+
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintf("HTTP: Ethernet request line: '%s'\n", req.c_str());
+        }
+
+        unsigned long http_header_read_start = micros();
+        while (client.available() && client.readStringUntil('\n') != "\r")
+          ;
+
+        if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+        {
+          debugSerialPrintf("TIMING: HTTP Header Read: %lu us\n", micros() - http_header_read_start);
+        }
+
+#ifdef TESTING_WEBSERVER
+        simpleReqCount++;
+        if (req.indexOf("GET /increment") != -1)
+        {
+          simpleCounter++;
+          if (logVerbosity >= LOG_DEBUG)
+          {
+            debugSerialPrintf("Simple counter incremented to: %lu\n", (unsigned long)simpleCounter);
+          }
+        }
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintln("HTTP: Ethernet route -> simple counter page");
+        }
+        serveSimpleCounterPage(client, simpleCounter, simpleReqCount);
+#else
+        unsigned long http_handler_start = micros();
+        if (req.indexOf("GET /data") == 0)
+        {
+          if (logVerbosity >= LOG_DEBUG)
+          {
+            debugSerialPrintln("HTTP: Ethernet route -> /data");
+          }
+          serveSensorData(client);
+        }
+        else if (req.indexOf("GET /udpstream") == 0)
+        {
+          debugSerialPrintln("HTTP: /udpstream");
+          serveUDPStreamControl(client, req);
+        }
+        else if (req.indexOf("GET /setmode") == 0)
+        {
+          debugSerialPrintln("HTTP: /setmode");
+          serveModeControl(client, req);
+        }
+        else if (req.indexOf("GET /setaxis") == 0)
+        {
+          debugSerialPrintln("HTTP: /setaxis");
+          serveAxisControl(client, req);
+        }
+        else if (req.indexOf("GET /touchcalibrate") == 0)
+        {
+          debugSerialPrintln("HTTP: /touchcalibrate");
+          serveTouchCalibrate(client, req);
+        }
+        else if (req.indexOf("GET /touchcalibdata") == 0)
+        {
+          debugSerialPrintln("HTTP: /touchcalibdata");
+          serveTouchCalibData(client, req);
+        }
+        else
+        {
+          if (logVerbosity >= LOG_DEBUG)
+          {
+            debugSerialPrintln("HTTP: Ethernet route -> chart page");
+          }
+          serveChartPage(client);
+        }
+
+        if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+        {
+          debugSerialPrintf("TIMING: HTTP Handler: %lu us\n", micros() - http_handler_start);
+          debugSerialPrintf("TIMING: HTTP Parse+Process: %lu us\n", micros() - http_parse_start);
+        }
+#endif
+
+        delay(10);
+        client.stop();
+        releaseSPIBus();
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintln("HTTP: Ethernet client closed");
+        }
+      }
+      else
+      {
+        wiznetNoClientLoops++;
+        if (wiznetNoClientLoops > httpMaxNoClientLoops)
+        {
+          httpMaxNoClientLoops = wiznetNoClientLoops;
+        }
       }
     }
     else if (netMode == NET_WIFI)
     {
-      WiFiClient wifiClient;
-      wifiClient = wifiServer.accept();
-      if (wifiClient)
+      WiFiClient client = wifiServer.accept();
+      if (client)
       {
-        client = &wifiClient;
+        httpAcceptedClients++;
+
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintln("HTTP: WiFi client accepted");
+        }
+
+        client.setTimeout(250);
+
+        if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+        {
+          debugSerialPrintf("TIMING: HTTP Accept: %lu us\n", micros() - http_accept_start);
+        }
 
         if (logVerbosity >= LOG_DEBUG)
         {
           debugSerialPrintln("HTTP: WiFi client connected");
         }
-      }
-    }
 
-    if (client)
-    {
-      // Read the HTTP request line
-      String req = "";
-      if (client->available())
-      {
-        req = client->readStringUntil('\r');
-        client->readStringUntil('\n'); // consume end-of-line
+        // Request handling pattern analogous to test_wiznet_counter_button
+        unsigned long http_parse_start = micros();
+        String req = client.readStringUntil('\r');
+        client.readStringUntil('\n'); // Skip rest of request line
         req.trim();
-        debugSerialPrintf("HTTP request: %s\n", req.c_str());
-      }
 
-      // Consume the rest of the HTTP headers until a blank line
-      boolean currentLineIsBlank = true;
-      while (static_cast<Client *>(client)->connected())
-      {
-        if (client->available())
+        if (logVerbosity >= LOG_DEBUG)
         {
-          char c = client->read();
-          if (c == '\n' && currentLineIsBlank)
+          debugSerialPrintf("HTTP: WiFi request line: '%s'\n", req.c_str());
+        }
+
+        unsigned long http_header_read_start = micros();
+        while (client.available() && client.readStringUntil('\n') != "\r")
+          ;
+
+        if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+        {
+          debugSerialPrintf("TIMING: HTTP Header Read: %lu us\n", micros() - http_header_read_start);
+        }
+
+#ifdef TESTING_WEBSERVER
+        simpleReqCount++;
+        if (req.indexOf("GET /increment") != -1)
+        {
+          simpleCounter++;
+          if (logVerbosity >= LOG_DEBUG)
           {
-            // Blank line received, now process the request
-            if (req.indexOf("GET /data") == 0)
-            {
-              debugSerialPrintln("HTTP: /data");
-              serveSensorData(*client);
-            }
-            else if (req.indexOf("GET /udpstream") == 0)
-            {
-              debugSerialPrintln("HTTP: /udpstream");
-              serveUDPStreamControl(*client, req);
-            }
-            else if (req.indexOf("GET /setmode") == 0)
-            {
-              debugSerialPrintln("HTTP: /setmode");
-              serveModeControl(*client, req);
-            }
-            else if (req.indexOf("GET /setaxis") == 0)
-            {
-              debugSerialPrintln("HTTP: /setaxis");
-              serveAxisControl(*client, req);
-            }
-            else if (req.indexOf("GET /touchcalibrate") == 0)
-            {
-              debugSerialPrintln("HTTP: /touchcalibrate");
-              serveTouchCalibrate(*client, req);
-            }
-            else if (req.indexOf("GET /touchcalibdata") == 0)
-            {
-              debugSerialPrintln("HTTP: /touchcalibdata");
-              serveTouchCalibData(*client, req);
-            }
-            else if (req.indexOf("GET /setloglevel") == 0)
-            {
-              debugSerialPrintln("HTTP: /setloglevel");
-              serveSetLogLevel(*client, req);
-            }
-            else if (req.indexOf("GET /favicon.ico") == 0 || req.indexOf("favicon.ico") != -1)
-            {
-              client->println("HTTP/1.1 204 No Content");
-              client->println("Connection: close");
-              client->println();
-              client->flush();
-            }
-            else if (req.indexOf("GET / ") == 0 || req.indexOf("GET / HTTP") == 0 || req.indexOf("GET /index") == 0)
-            {
-              serveChartPage(*client);
-            }
-            else
-            {
-              // Unknown request, serve chart
-              serveChartPage(*client);
-            }
-            break;
-          }
-          if (c == '\n')
-          {
-            currentLineIsBlank = true;
-          }
-          else if (c != '\r')
-          {
-            currentLineIsBlank = false;
+            debugSerialPrintf("Simple counter incremented to: %lu\n", (unsigned long)simpleCounter);
           }
         }
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintln("HTTP: WiFi route -> simple counter page");
+        }
+        serveSimpleCounterPage(client, simpleCounter, simpleReqCount);
+#else
+        unsigned long http_handler_start = micros();
+        if (req.indexOf("GET /data") == 0)
+        {
+          if (logVerbosity >= LOG_DEBUG)
+          {
+            debugSerialPrintln("HTTP: WiFi route -> /data");
+          }
+          serveSensorData(client);
+        }
+        else if (req.indexOf("GET /udpstream") == 0)
+        {
+          debugSerialPrintln("HTTP: /udpstream");
+          serveUDPStreamControl(client, req);
+        }
+        else if (req.indexOf("GET /setmode") == 0)
+        {
+          debugSerialPrintln("HTTP: /setmode");
+          serveModeControl(client, req);
+        }
+        else if (req.indexOf("GET /setaxis") == 0)
+        {
+          debugSerialPrintln("HTTP: /setaxis");
+          serveAxisControl(client, req);
+        }
+        else if (req.indexOf("GET /touchcalibrate") == 0)
+        {
+          debugSerialPrintln("HTTP: /touchcalibrate");
+          serveTouchCalibrate(client, req);
+        }
+        else if (req.indexOf("GET /touchcalibdata") == 0)
+        {
+          debugSerialPrintln("HTTP: /touchcalibdata");
+          serveTouchCalibData(client, req);
+        }
+        else
+        {
+          if (logVerbosity >= LOG_INFO)
+          {
+            debugSerialPrintln("HTTP: WiFi route -> chart page");
+          }
+          serveChartPage(client);
+        }
+
+        if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+        {
+          debugSerialPrintf("TIMING: HTTP Handler: %lu us\n", micros() - http_handler_start);
+          debugSerialPrintf("TIMING: HTTP Parse+Process: %lu us\n", micros() - http_parse_start);
+        }
+#endif
+
+        delay(10);
+        client.stop();
+        releaseSPIBus();
+        if (logVerbosity >= LOG_INFO)
+        {
+          debugSerialPrintln("HTTP: WiFi client closed");
+        }
       }
-      delay(1);
-      static_cast<Client *>(client)->stop();
     }
+
     if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
     {
       debugSerialPrintf("TIMING: HTTP Networking: %lu us\n", micros() - block_start_time);
+      debugSerialPrintf("HTTP Stats: accepted=%lu softResync=%lu hardResync=%lu maxNoClientLoops=%lu\n",
+                        (unsigned long)httpAcceptedClients,
+                        (unsigned long)httpSoftResyncCount,
+                        (unsigned long)httpHardResyncCount,
+                        (unsigned long)httpMaxNoClientLoops);
     }
   }
 
-#if ENABLE_TOUCH
-  // TIMING BLOCK 4: Touch Input Handling
-  block_start_time = micros();
-  // Handle touch input for mode selection menu
+  // ----------------------------------------------------------------------------------
+  // TOUCH INPUTE CONTROL
+  // Handle touch input for mode changes and menu interactions, with timing measurement
+  // ----------------------------------------------------------------------------------
+  // TIMING BLOCK 6: TOUCH INPUT
+  unsigned long touch_input_start = micros();
   bool mode_changed = handleTouchInput(mode);
+  if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+  {
+    debugSerialPrintf("TIMING: Touch Input: %lu us\n", micros() - touch_input_start);
+  }
+  // ----------------------------------------------------------------------------
+  // MODE CONTROL
+  // Update display mode based on touch input or webpage selection and manage
+  // mode-specific initialization and state
+  // ----------------------------------------------------------------------------
+  // TIMING BLOCK 7: MODE CONTROL
+  unsigned long mode_control_start = micros();
+  if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+  {
+    debugSerialPrintf("TIMING: Mode Control: %lu us\n", micros() - mode_control_start);
+  }
   if (mode_changed)
   {
     // Reset mode-specific flags when mode changes
-    text_mode_initialized = false;
-    waveform_initialized = false;
-    mode23_screen_cleared = false;
+    mode_initialized = false;
   }
 
   // Track mode transitions for display control
@@ -3892,47 +4356,48 @@ void loop()
     trigger_touch_calibration = false;
     debugPrintf("Starting touch calibration with %d points...\\n", NUM_CALIB_POINTS);
     calibrateTouchController();
-    tft.fillScreen(ILI9341_BLACK);
+    tft.fillScreen(TFT_BLACK);
     tft.setCursor(0, 0);
     // Reset display mode flags
-    text_mode_initialized = false;
-    waveform_initialized = false;
-    mode23_screen_cleared = false;
+    mode_initialized = false;
   }
 
-  // Entering mode -1: turn off display
-  if (mode == -1 && previous_mode != -1)
+  // Mode has changed, reset scrolling and manage display power based on mode
+  if (mode != previous_mode)
   {
-    debugPrintln("Switching to mode -1: turning off display");
-    tft.fillScreen(ILI9341_BLACK);
-    tft.scrollTo(0);
-    setBacklight(0.0); // Turn off backlight
-  }
-
-  // Leaving mode -1: turn on display
-  if (mode != -1 && previous_mode == -1)
-  {
-    debugPrintf("Leaving mode -1, switching to mode %d: turning on display\n", mode);
-    setBacklight(1.0); // Use full brightness first to ensure GPIO is set
-    delay(10);
-    setBacklight(0.25); // Then set to desired brightness
+    scrollDisplay(0); // Reset scrolling
+    if (mode == -1)
+    {
+      // Entering mode -1: turn off display
+      debugPrintln("Switching to mode -1: turning off display");
+      tft.fillScreen(TFT_BLACK);
+      disableBacklight();
+    }
+    else
+    {
+      // Leaving mode -1: turn on display
+      unsigned long backlight_start = micros();
+      debugPrintf("Leaving mode -1, switching to mode %d: turning on display\n", mode);
+      /*     setBacklight(1.0); // Use full brightness first to ensure GPIO is set
+          delay(10);
+          setBacklight(0.25); // Then set to desired brightness
+       */
+      enableBacklight();
+      if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+      {
+        debugSerialPrintf("TIMING: Backlight Setup: %lu us\n", micros() - backlight_start);
+      }
+    }
   }
 
   previous_mode = mode;
-  if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
-  {
-    debugSerialPrintf("TIMING: Touch Input: %lu us\n", micros() - block_start_time);
-  }
-#endif
 
-  if (mode == -1)
+  // ----------------------------------------------------------------------------
+  // DISPLAY RENDERING AND UPDATE
+  // ----------------------------------------------------------------------------
+  if (mode != -1)
   {
-    // Mode -1: Display off mode - do nothing
-  }
-  else
-  {
-#if ENABLE_TFT
-    // TIMING BLOCK 5: Display Updates
+    // TIMING BLOCK 8: Display Updates
     block_start_time = micros();
     static int last_trigger_sample = -10000; // Track when we last triggered
 
@@ -3957,9 +4422,9 @@ void loop()
         // Output statistics with timing information (in yellow) if log level is DEBUG
         if (logVerbosity >= LOG_DEBUG)
         {
-          debugPrintfColor(ILI9341_YELLOW, "Event: out=%lums in=%lums\n", crossing_time_out, crossing_time_in);
-          debugPrintfColor(ILI9341_YELLOW, "Duration=%lums samples=%d\n", crossing_time_in - crossing_time_out, n);
-          debugPrintfColor(ILI9341_YELLOW, "Mean=%d RMS=%d\n", sum / n, (int)sqrtf(((float)sumsq) / n));
+          debugPrintfColor(TFT_YELLOW, "Event: out=%lums in=%lums\n", crossing_time_out, crossing_time_in);
+          debugPrintfColor(TFT_YELLOW, "Duration=%lums samples=%d\n", crossing_time_in - crossing_time_out, n);
+          debugPrintfColor(TFT_YELLOW, "Mean=%d RMS=%d\n", sum / n, (int)sqrtf(((float)sumsq) / n));
         }
       }
     }
@@ -3967,22 +4432,22 @@ void loop()
     if (mode == 0)
     {
       // Mode 0: Statistics text mode
-      if (!text_mode_initialized)
+      if (!mode_initialized)
       {
-        tft.fillScreen(ILI9341_BLACK);
+        tft.fillScreen(TFT_BLACK);
         disp_column = 0;         // Reset scroll position tracking
+        scrollDisplay(0);        // Reset scrolling
         saved_scroll_offset = 0; // Keep menu/icon anchored
-        tft.scrollTo(0);         // Reset scroll position
-        tft.setTextColor(ILI9341_GREEN);
+        tft.setTextColor(TFT_GREEN);
         tft.setTextSize(TFT_TEXT_SIZE);
         tft.setCursor(0, 0);
-        drawMenuIndicator(0); // Draw menu access indicator at top-left
-        text_mode_initialized = true;
+        drawMenuIndicator(disp_column); // Draw menu access indicator at top-left
+        mode_initialized = true;
       }
 
       // Display statistics periodically
       static unsigned long last_stats_update = 0;
-      if (millis() - last_stats_update >= 1000)
+      if (millis() - last_stats_update >= 1000 / TEXT_DISPLAY_REFRESH_RATE)
       {
         char buf[128];
 
@@ -4029,51 +4494,47 @@ void loop()
     else if (mode == 1)
     {
       // Initialize waveform display on first entry to mode 1
-      if (!waveform_initialized)
+      if (!mode_initialized)
       {
+        scrollDisplay(0); // Reset scrolling
         setup_waveform();
-        tft.scrollTo(0);                // Reset scroll position
         drawMenuIndicator(disp_column); // Draw menu access indicator
-        waveform_initialized = true;
+        mode_initialized = true;
       }
 
       // Throttle display updates to ~10 Hz to allow fast data acquisition
       static unsigned long last_display_update_mode1 = 0;
-      if (millis() - last_display_update_mode1 >= 100)
+      if (millis() - last_display_update_mode1 >= 1000 / TFT_DISPLAY_REFRESH_RATE)
       {
         // Get data for display
         buffer_get_latest(input_shorts_buf, waveform_w, 0);
 
-        waveform_display(input_shorts_buf, waveform_w, ILI9341_YELLOW);
+        waveform_display(input_shorts_buf, waveform_w, TFT_YELLOW);
 
         last_display_update_mode1 = millis();
       }
     }
-    else if (mode == 2 || mode == 3)
+    else if (mode == 2)
     {
       // Clear screen once when entering FFT mode and draw frequency axis
-      if (!mode23_screen_cleared)
+      if (!mode_initialized)
       {
-        tft.fillScreen(ILI9341_BLACK);
-        tft.scrollTo(0); // Reset scroll position when switching to mode 2 or 3
-        disp_column = 0; // Reset spectrogram column position
-        if (mode == 2)
-        {
-          draw_fft_frequency_axis(); // Draw frequency labels for FFT mode
-        }
-        drawMenuIndicator(disp_column); // Draw menu access indicator
-        mode23_screen_cleared = true;
+        tft.fillScreen(TFT_BLACK);
+        disp_column = SCROLL_TOP_FIXED_AREA; // Reset spectrogram column position
+        scrollDisplay(0);                    // Reset scrolling
+        draw_fft_frequency_axis();           // Draw frequency labels for FFT mode
+        drawMenuIndicator(disp_column);      // Draw menu access indicator
+        mode_initialized = true;
       }
 
       // Throttle display updates to ~10 Hz to allow fast data acquisition
-      static unsigned long last_display_update_mode23 = 0;
-      if (millis() - last_display_update_mode23 >= 100)
+      static unsigned long last_display_update_mode2 = 0;
+      if (millis() - last_display_update_mode2 >= 1000 / TFT_DISPLAY_REFRESH_RATE)
       {
         // Get data for display
         buffer_get_latest(input_shorts_buf, FFT_SIZE, /* lshift_bits */ 0);
 
         // Convert shorts to float with proper scaling for ADC values
-        // ADC values are in range ~±2000, scale to make better use of float range
         for (int i = 0; i < FFT_SIZE; i++)
         {
           input_buf[i] = (float)input_shorts_buf[i];
@@ -4082,25 +4543,53 @@ void loop()
         int npts = magnitude_spectrum(input_buf, mag_spec, mag_spec_len);
 
         sample_to_short(mag_spec, mag_spec_short, npts);
-        if (mode == 2)
+        waveform_display(mag_spec_short, npts, TFT_YELLOW, false); // Don't draw triggers in FFT mode
+
+        last_display_update_mode2 = millis();
+      }
+    }
+    else if (mode == 3)
+    {
+      // Clear screen once when entering spectrogram mode
+      if (!mode_initialized)
+      {
+        tft.fillScreen(TFT_BLACK);
+        disp_column = SCROLL_TOP_FIXED_AREA; // Reset spectrogram column position
+        scrollDisplay(0);                    // Reset scrolling
+        drawMenuIndicator(disp_column);      // Draw menu access indicator
+        mode_initialized = true;
+      }
+
+      // Throttle display updates to ~10 Hz to allow fast data acquisition
+      static unsigned long last_display_update_mode3 = 0;
+      if (millis() - last_display_update_mode3 >= 1000 / TFT_DISPLAY_REFRESH_RATE)
+      {
+        // Get data for display
+        buffer_get_latest(input_shorts_buf, FFT_SIZE, /* lshift_bits */ 0);
+
+        // Convert shorts to float with proper scaling for ADC values
+        for (int i = 0; i < FFT_SIZE; i++)
         {
-          waveform_display(mag_spec_short, npts, ILI9341_YELLOW, false); // Don't draw triggers in FFT mode
-        }
-        else
-        {
-          add_display_column(mag_spec_short, npts);
+          input_buf[i] = (float)input_shorts_buf[i];
         }
 
-        last_display_update_mode23 = millis();
+        int npts = magnitude_spectrum(input_buf, mag_spec, mag_spec_len);
+
+        sample_to_short(mag_spec, mag_spec_short, npts);
+        add_display_column(mag_spec_short, npts);
+
+        last_display_update_mode3 = millis();
       }
     }
     if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
     {
       debugSerialPrintf("TIMING: Display Updates: %lu us\n", micros() - block_start_time);
     }
-#endif
   }
 
+  // ----------------------------------------------------------------------------
+  // LOOP TIMING AND REPORTING
+  // ----------------------------------------------------------------------------
   // TIMING REPORT: Total loop time
   if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
   {
@@ -4109,4 +4598,7 @@ void loop()
     debugSerialPrintf("======\n");
     last_timing_report = millis();
   }
+
+  // Release SPI bus at end of loop after all display operations to prevent socket corruption
+  releaseSPIBus();
 }

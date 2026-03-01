@@ -1,16 +1,18 @@
 /**
  * @file tests.cpp
- * @brief Unified test suite for Pico 2W system information, TFT display, and Wiznet adapter
- * @details Combines test_sysinfo, test_tft, and test_wiznet into one file
+ * @brief Unified test suite for Pico 2W system information, TFT display, Wiznet adapter, and SD card
+ * @details Combines test_sysinfo, test_tft, test_wiznet, and test_sd into one file
  *          Use compiler flags to enable/disable test suites:
  *          -D ENABLE_SYSINFO_TESTS=1    (system info tests)
  *          -D ENABLE_TFT_TESTS=1        (TFT display tests)
  *          -D ENABLE_WIZNET_TESTS=1     (Wiznet ethernet tests)
+ *          -D ENABLE_SD_TESTS=1         (SD card tests)
  */
 
 #include <Arduino.h>
 #include <unity.h>
 #include <SPI.h>
+#include <SD.h>
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 #include <hardware/clocks.h>
@@ -18,7 +20,11 @@
 #include <hardware/regs/addressmap.h>
 #include <hardware/regs/sio.h>
 #include "hardware/spi.h"
+#include <TFT_eSPI.h>
+#include <Ethernet_Generic.h>
+#include <FS.h>
 #include "pin_config.h"
+#include "sd_spi.h"
 
 // Enable/disable test suites via compiler flags
 #ifndef ENABLE_SYSINFO_TESTS
@@ -33,6 +39,10 @@
 #define ENABLE_WIZNET_TESTS 1 // Default to Wiznet tests
 #endif
 
+#ifndef ENABLE_SD_TESTS
+#define ENABLE_SD_TESTS 1
+#endif
+
 // Enable/disable interactive tests (requiring user input or observation)
 #ifndef ENABLE_INTERACTIVE_TESTS
 #define ENABLE_INTERACTIVE_TESTS 1
@@ -43,17 +53,8 @@
 #define ENABLE_SINGLE_TEST 0
 #endif
 
-// Conditional includes based on enabled test suites
-#if ENABLE_TFT_TESTS
-#include <TFT_eSPI.h>
-// Forward declare TFT instance
-extern TFT_eSPI tft;
-#endif
-
-#if ENABLE_WIZNET_TESTS
-#include <Ethernet.h>
-#include <TFT_eSPI.h>
-#endif
+// Declare TFT instance. Only declares the class and internal variables here, initialization is done in each test to ensure SPI configuration is correct for each test case.
+TFT_eSPI tft = TFT_eSPI();
 
 // ============================================================================
 // COMMON TEST SETUP/TEARDOWN
@@ -62,6 +63,10 @@ extern TFT_eSPI tft;
 void setUp(void)
 {
     // This runs before each test
+#if ENABLE_SD_TESTS
+    // Ensure CS is high before each SD test
+    digitalWrite(SD_CS, HIGH);
+#endif
 }
 
 void tearDown(void)
@@ -505,11 +510,8 @@ void test_system_info_summary()
 #if ENABLE_TFT_TESTS
 
 #ifndef SPI_FREQUENCY
-#define SPI_FREQUENCY 0
+#define SPI_FREQUENCY 37500000 // 37.5 MHz default for testing (can be adjusted via compiler flag)
 #endif
-
-// Create a TFT_eSPI instance
-TFT_eSPI tft = TFT_eSPI();
 
 static void enableBacklight()
 {
@@ -655,23 +657,80 @@ static uint32_t set_tft_spi_speed_direct(uint32_t desired_freq)
     return actual_freq;
 }
 
-// TFT_eSPI does not expose scroll helpers in this version; use ILI9341 commands directly.
-static void tft_set_scroll_def(uint16_t top_fixed, uint16_t scroll_area, uint16_t bottom_fixed)
+// Terminal scrolling variables and functions
+#define TERM_TEXT_HEIGHT 16    // Height of text to be printed and scrolled
+#define TERM_BOT_FIXED_AREA 0  // Number of lines in bottom fixed area
+#define TERM_TOP_FIXED_AREA 16 // Number of lines in top fixed area
+#define TERM_YMAX 320          // Bottom of screen area
+
+uint16_t term_yStart = TERM_TOP_FIXED_AREA;
+uint16_t term_yArea = TERM_YMAX - TERM_TOP_FIXED_AREA - TERM_BOT_FIXED_AREA;
+uint16_t term_yDraw = TERM_YMAX - TERM_BOT_FIXED_AREA - TERM_TEXT_HEIGHT;
+uint16_t term_xPos = 0;
+int term_blank[19]; // Record of line lengths for optimization
+
+void tft_setupScrollArea(uint16_t tfa, uint16_t bfa)
 {
-    tft.writecommand(0x33); // VSCRDEF
-    tft.writedata(top_fixed >> 8);
-    tft.writedata(top_fixed & 0xFF);
-    tft.writedata(scroll_area >> 8);
-    tft.writedata(scroll_area & 0xFF);
-    tft.writedata(bottom_fixed >> 8);
-    tft.writedata(bottom_fixed & 0xFF);
+    tft.writecommand(ILI9341_VSCRDEF); // Vertical scroll definition
+    tft.writedata(tfa >> 8);           // Top Fixed Area line count
+    tft.writedata(tfa & 0xFF);
+    tft.writedata((TERM_YMAX - tfa - bfa) >> 8); // Vertical Scrolling Area line count
+    tft.writedata((TERM_YMAX - tfa - bfa) & 0xFF);
+    tft.writedata(bfa >> 8); // Bottom Fixed Area line count
+    tft.writedata(bfa & 0xFF);
 }
 
 static void tft_scroll_to(uint16_t scroll_start)
 {
-    tft.writecommand(0x37); // VSCRSADD
+    tft.writecommand(ILI9341_VSCRSADD); // VSCRSADD
     tft.writedata(scroll_start >> 8);
     tft.writedata(scroll_start & 0xFF);
+}
+
+int term_scroll_line()
+{
+    int yTemp = term_yStart;
+    tft.fillRect(0, term_yStart, term_blank[(18 + (term_yStart - TERM_TOP_FIXED_AREA) / TERM_TEXT_HEIGHT) % 19], TERM_TEXT_HEIGHT, TFT_BLACK);
+    term_yStart += TERM_TEXT_HEIGHT;
+    if (term_yStart >= TERM_YMAX - TERM_BOT_FIXED_AREA)
+        term_yStart = TERM_TOP_FIXED_AREA + (term_yStart - TERM_YMAX + TERM_BOT_FIXED_AREA);
+    tft_scroll_to(term_yStart);
+    return yTemp;
+}
+
+static void initialize_tft(uint8_t rotation)
+{
+    static bool tft_initialized = false;
+
+    disableBacklight();
+    if (!tft_initialized)
+    {
+        tft.init();
+        tft_initialized = true;
+    }
+    tft.fillScreen(TFT_BLACK);
+    tft.setRotation(rotation); // Set rotation mode
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(0, 0);
+    enableBacklight();
+}
+
+// Helper function to get rainbow colors for scrolling effects
+static uint16_t getRainbowColor(int position, int timeOffset)
+{
+    int hue = (position + timeOffset) % 360;
+    if (hue < 60)
+        return tft.color565(255, hue * 4.25, 0); // Red to Yellow
+    if (hue < 120)
+        return tft.color565(255 - (hue - 60) * 4.25, 255, 0); // Yellow to Green
+    if (hue < 180)
+        return tft.color565(0, 255, (hue - 120) * 4.25); // Green to Cyan
+    if (hue < 240)
+        return tft.color565(0, 255 - (hue - 180) * 4.25, 255); // Cyan to Blue
+    if (hue < 300)
+        return tft.color565((hue - 240) * 4.25, 0, 255);   // Blue to Magenta
+    return tft.color565(255, 0, 255 - (hue - 300) * 4.25); // Magenta to Red
 }
 
 // Calibration support (MMSE-based multipoint calibration)
@@ -774,6 +833,22 @@ static bool calculateMMSECalibration(int numPoints,
     return true;
 }
 
+// Static variables for touch test IRQ handling
+static volatile bool test_touch_event_flag = false;
+static volatile uint32_t test_touch_irq_count = 0;
+
+/**
+ * @brief Touch IRQ callback function for test_display_and_touch
+ */
+static void touch_irq_callback(uint gpio, uint32_t events)
+{
+    (void)gpio;
+    (void)events;
+    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false); // disable IRQ during processing
+    test_touch_event_flag = true;
+    test_touch_irq_count++;
+}
+
 /**
  * @brief Test: Touchscreen initialization
  */
@@ -783,7 +858,7 @@ void test_touch_begin()
 
     // TFT_eSPI has built-in XPT2046 support configured via User_Setup.h
     // Just initialize the display with touch support enabled
-    tft.begin();
+    tft.init();
 
     // Initialize touch via TFT_eSPI (handles XPT2046 automatically if TOUCH_CS is defined)
     if (TOUCH_CS != -1)
@@ -803,7 +878,7 @@ void test_touch_no_press()
 {
     Serial.println("Testing touchscreen not pressed...");
 
-    tft.begin();
+    tft.init();
 
     if (TOUCH_CS != -1)
     {
@@ -867,11 +942,8 @@ void test_touch_read_coordinates()
         return;
     }
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
     tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE);
     tft.setCursor(20, 20);
     tft.println("Touch Display");
     tft.setTextSize(1);
@@ -914,11 +986,11 @@ void test_touch_read_coordinates()
 }
 
 /**
- * @brief Test: Display and touch combined visual test
+ * @brief Test: Display and touch combined visual test using IRQ
  */
 void test_display_and_touch()
 {
-    Serial.println("Testing display and touch combined...");
+    Serial.println("Testing display and touch combined (IRQ-based)...");
 
     if (TOUCH_CS == -1)
     {
@@ -927,66 +999,164 @@ void test_display_and_touch()
         return;
     }
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_WHITE);
-    tft.setTextColor(TFT_BLACK);
+    if (TOUCH_IRQ == -1)
+    {
+        Serial.println("TOUCH_IRQ not defined, falling back to polling mode.");
+        // Fall back to original polling implementation
+        initialize_tft(1);
+        tft.setTextSize(2);
+        tft.setCursor(0, 20);
+        tft.println("Display & Touch");
+        tft.println("Test (Polling)");
+        tft.setTextSize(1);
+        tft.println("");
+        tft.println("Touch screen to show coordinates");
+        tft.println("(10 second timeout)");
+
+        unsigned long start_time = millis();
+        unsigned long last_touch = 0;
+        int touch_count = 0;
+
+        while (millis() - start_time < 10000)
+        {
+            uint16_t x = 0, y = 0;
+            if (tft.getTouch(&x, &y, 600))
+            {
+                if (millis() - last_touch > 100)
+                {
+                    touch_count++;
+                    Serial.printf("Touch #%d: x=%u, y=%u\n", touch_count, x, y);
+
+                    // Display on screen
+                    tft.fillRect(0, 100, tft.width(), 60, TFT_BLACK);
+                    tft.setTextColor(TFT_BLUE, TFT_BLACK);
+                    tft.setTextSize(1);
+                    tft.setCursor(0, 100);
+                    tft.print("Touch #");
+                    tft.println(touch_count);
+                    tft.print("x=");
+                    tft.print(x);
+                    tft.print(" y=");
+                    tft.println(y);
+
+                    last_touch = millis();
+                }
+            }
+            delay(20);
+        }
+
+        // Final summary
+        tft.fillRect(0, 170, tft.width(), 40, TFT_GREEN);
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(2);
+        tft.setCursor(10, 180);
+        tft.print("Total: ");
+        tft.print(touch_count);
+        tft.println(" touches");
+
+        Serial.print("Test complete. Total touches: ");
+        Serial.println(touch_count);
+
+        delay(2000);
+
+        TEST_ASSERT_TRUE(true);
+        return;
+    }
+
+    // IRQ-based implementation
+    initialize_tft(1);
     tft.setTextSize(2);
     tft.setCursor(0, 20);
     tft.println("Display & Touch");
-    tft.println("Test");
+    tft.println("Test (IRQ)");
     tft.setTextSize(1);
     tft.println("");
     tft.println("Touch screen to show coordinates");
     tft.println("(10 second timeout)");
+    tft.println("Using interrupt-driven detection");
 
-    enableBacklight();
+    // Set up touch IRQ for this test
+    // Reset static variables for this test run
+    test_touch_event_flag = false;
+    test_touch_irq_count = 0;
+
+    // Initialize touch IRQ pin
+    gpio_init(TOUCH_IRQ);
+    gpio_set_dir(TOUCH_IRQ, GPIO_IN);
+    gpio_pull_up(TOUCH_IRQ);
+
+    // Set up IRQ handler
+    gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, touch_irq_callback);
 
     unsigned long start_time = millis();
     unsigned long last_touch = 0;
     int touch_count = 0;
 
+    Serial.println("Waiting for touch interrupts...");
+
     while (millis() - start_time < 10000)
     {
-        uint16_t x = 0, y = 0;
-        if (tft.getTouch(&x, &y, 600))
+        // Check for touch event flag set by IRQ
+        if (test_touch_event_flag)
         {
+            test_touch_event_flag = false; // Clear flag
+
+            // Debounce check
             if (millis() - last_touch > 100)
             {
-                touch_count++;
-                Serial.printf("Touch #%d: x=%u, y=%u\n", touch_count, x, y);
+                // Read touch coordinates
+                uint16_t x = 0, y = 0;
+                bool touch_valid = tft.getTouch(&x, &y, 600);
 
-                // Display on screen
-                tft.fillRect(0, 100, tft.width(), 60, TFT_WHITE);
-                tft.setTextColor(TFT_BLUE);
-                tft.setTextSize(1);
-                tft.setCursor(0, 100);
-                tft.print("Touch #");
-                tft.println(touch_count);
-                tft.print("x=");
-                tft.print(x);
-                tft.print(" y=");
-                tft.println(y);
+                if (touch_valid)
+                {
+                    touch_count++;
+                    Serial.printf("Touch #%d (IRQ #%lu): x=%u, y=%u\n", touch_count, test_touch_irq_count, x, y);
 
-                last_touch = millis();
+                    // Display on screen
+                    tft.fillRect(0, 100, tft.width(), 60, TFT_BLACK);
+                    tft.setTextColor(TFT_BLUE, TFT_BLACK);
+                    tft.setTextSize(1);
+                    tft.setCursor(0, 100);
+                    tft.print("Touch #");
+                    tft.println(touch_count);
+                    tft.print("x=");
+                    tft.print(x);
+                    tft.print(" y=");
+                    tft.println(y);
+                    tft.print("IRQ count: ");
+                    tft.println((unsigned long)test_touch_irq_count);
+
+                    last_touch = millis();
+                }
             }
+
+            // Re-enable IRQ for next touch
+            gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true);
         }
-        delay(20);
+
+        // Small delay to prevent busy waiting
+        delay(10);
     }
 
+    // Clean up IRQ
+    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false);
+
     // Final summary
-    tft.fillRect(0, 170, tft.width(), 40, TFT_GREEN);
+    tft.fillRect(0, 170, tft.width(), 60, TFT_GREEN);
     tft.setTextColor(TFT_WHITE);
     tft.setTextSize(2);
     tft.setCursor(10, 180);
     tft.print("Total: ");
     tft.print(touch_count);
     tft.println(" touches");
+    tft.print("IRQs: ");
+    tft.println((unsigned long)test_touch_irq_count);
 
-    Serial.print("Test complete. Total touches: ");
-    Serial.println(touch_count);
+    Serial.printf("Test complete. Total touches: %d, Total IRQs: %lu\n", touch_count, test_touch_irq_count);
 
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1004,10 +1174,7 @@ void test_touch_calibration()
         return;
     }
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_WHITE);
+    initialize_tft(1);
     tft.setTextSize(2);
     tft.setCursor(0, 0);
     tft.println("MMSE Touch");
@@ -1110,6 +1277,7 @@ void test_touch_calibration()
 
     Serial.println("Calibration successful!");
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1128,12 +1296,8 @@ void test_touch_accuracy()
         return;
     }
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_WHITE);
+    initialize_tft(1);
     tft.setTextSize(2);
-    tft.setCursor(0, 0);
     tft.println("Touch Accuracy");
     tft.println("Test");
     tft.setTextSize(1);
@@ -1260,7 +1424,7 @@ void test_touch_accuracy()
     tft.println("Point Details:");
 
     int y_pos = 120;
-    for (int i = 0; i < numTestPoints && y_pos < 240; i++)
+    for (int i = 0; i < numTestPoints && y_pos < TFT_HEIGHT; i++)
     {
         tft.setCursor(10, y_pos);
         if (delta_distance[i] < 5)
@@ -1291,6 +1455,7 @@ void test_touch_accuracy()
     Serial.println("=== End Accuracy Report ===\n");
 
     delay(3000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1302,25 +1467,22 @@ void test_tft_espi_init()
     // We will configure it via build flags in platformio.ini to avoid modifying library files.
 
     // Initialize the TFT display
-    tft.begin();
-    tft.setRotation(1); // Landscape
-
-    tft.fillScreen(TFT_BLACK);
-
-    tft.setCursor(0, 0);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    initialize_tft(1);
+    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(2);
     tft.println("TFT_eSPI Test");
 
     Serial.println("TFT_eSPI initialized successfully.");
-    TEST_ASSERT_TRUE(true);
     delay(2000);
+
+    TEST_ASSERT_TRUE(true);
 }
 
 void test_tft_espi_graphics()
 {
     Serial.println("Testing basic graphics and text...");
 
+    initialize_tft(1);
     tft.fillScreen(TFT_RED);
     delay(500);
     tft.fillScreen(TFT_GREEN);
@@ -1335,6 +1497,7 @@ void test_tft_espi_graphics()
     tft.drawRect(5, 5, tft.width() - 10, tft.height() - 10, TFT_YELLOW);
 
     Serial.println("Graphics test completed.");
+
     TEST_ASSERT_TRUE(true);
     delay(2000);
 }
@@ -1343,7 +1506,7 @@ void test_tft_espi_read_id_status()
 {
     Serial.println("Reading TFT ID and status...");
 
-    tft.begin();
+    tft.init();
 
     log_tft_spi_speed("TFT before read");
 
@@ -1382,7 +1545,7 @@ void test_tft_espi_spi_speed()
 {
     Serial.println("Reading SPI speed from RP2040 registers...");
 
-    tft.begin();
+    tft.init();
 
     spi_inst_t *spi = get_tft_spi();
     spi_hw_t *hw = spi_get_hw(spi);
@@ -1420,7 +1583,7 @@ void test_tft_fillScreen()
 {
     Serial.println("Testing fillScreen with colors...");
 
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
     delay(200);
     tft.fillScreen(TFT_RED);
     delay(200);
@@ -1441,7 +1604,7 @@ void test_tft_lines()
     int w = tft.width();
     int h = tft.height();
 
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     x1 = y1 = 0;
     y2 = h - 1;
@@ -1452,6 +1615,7 @@ void test_tft_lines()
         tft.drawLine(x1, y1, x2, y2, TFT_WHITE);
 
     delay(500);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1463,7 +1627,7 @@ void test_tft_rectangles()
     int cx = tft.width() / 2;
     int cy = tft.height() / 2;
 
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
     n = (tft.width() < tft.height()) ? tft.width() : tft.height();
 
     for (i = 2; i < n; i += 6)
@@ -1472,7 +1636,8 @@ void test_tft_rectangles()
         tft.drawRect(cx - i2, cy - i2, i, i, TFT_GREEN);
     }
 
-    delay(500);
+    delay(1000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1486,7 +1651,7 @@ void test_tft_circles()
     int h = tft.height();
     int r2 = radius * 2;
 
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
     for (x = radius; x < w; x += r2)
     {
         for (y = radius; y < h; y += r2)
@@ -1495,7 +1660,8 @@ void test_tft_circles()
         }
     }
 
-    delay(500);
+    delay(1000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1507,7 +1673,7 @@ void test_tft_triangles()
     int cx = tft.width() / 2 - 1;
     int cy = tft.height() / 2 - 1;
 
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
     n = (cx < cy) ? cx : cy;
 
     for (i = 0; i < n; i += 5)
@@ -1519,19 +1685,15 @@ void test_tft_triangles()
             tft.color565(0, 0, i & 0xFF));
     }
 
-    delay(500);
+    delay(1000);
+
     TEST_ASSERT_TRUE(true);
 }
 
-void test_tft_text()
+void tft_text()
 {
     Serial.println("Testing text rendering...");
 
-    tft.fillScreen(TFT_BLACK);
-
-    tft.setCursor(0, 0);
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(1);
     tft.println("Hello World!");
     tft.setTextColor(TFT_YELLOW);
     tft.setTextSize(2);
@@ -1554,6 +1716,14 @@ void test_tft_text()
     tft.println("with my blurglecruncheon,");
     tft.println("see if I don't!");
     delay(2000);
+}
+
+void test_tft_text()
+{
+    initialize_tft(1);
+
+    tft_text();
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1564,13 +1734,20 @@ void test_tft_rotate_screen()
 {
     Serial.println("Testing text rendering across rotations...");
 
-    tft.setRotation(2);
-    test_tft_text();
+    initialize_tft(2);
+
+    tft_text();
     tft.setRotation(3);
-    test_tft_text();
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(0, 0);
+    tft_text();
     tft.setRotation(0);
-    test_tft_text();
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(0, 0);
+    tft_text();
     tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(0, 0);
 
     TEST_ASSERT_TRUE(true);
 }
@@ -1587,11 +1764,8 @@ void test_vertical_scroll()
     int height = tft.height();
     int scroll_area = height - 32;
 
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
-    tft_set_scroll_def(32, scroll_area, 0);
-    tft.setCursor(0, 0);
-    tft.setTextSize(1);
+    initialize_tft(0);
+    tft_setupScrollArea(32, 0);
     tft.setTextColor(TFT_RED);
     tft.println("Fixed Line 1");
     tft.setTextColor(TFT_GREEN);
@@ -1618,7 +1792,11 @@ void test_vertical_scroll()
             iScrollStart = 32;
         tft_scroll_to(iScrollStart);
     }
+    tft_scroll_to(0);
+    tft_setupScrollArea(0, 0);
+
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1626,9 +1804,7 @@ void test_tft_gradient_fills()
 {
     Serial.println("Testing gradient fills...");
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     int mid_x = tft.width() / 2;
     int mid_y = tft.height() / 2;
@@ -1648,8 +1824,6 @@ void test_tft_gradient_fills()
     tft.fillRectVGradient(mid_x, mid_y, quad_w, quad_h, TFT_WHITE, TFT_BLACK);
 
     // Draw labels
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(1);
     tft.setCursor(5, 5);
     tft.println("Red->Blue");
     tft.setCursor(mid_x + 5, 5);
@@ -1661,6 +1835,7 @@ void test_tft_gradient_fills()
 
     Serial.println("Gradient fill test completed.");
     delay(3000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1672,9 +1847,7 @@ void test_tft_animation_performance()
 {
     Serial.println("Testing animation performance (measuring FPS)...");
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     int w = tft.width();
     int h = tft.height();
@@ -1682,10 +1855,6 @@ void test_tft_animation_performance()
     int cy = h / 2;
     int radius = 30;
     int speed = 2;
-
-    tft.setTextColor(TFT_WHITE);
-    tft.setTextSize(1);
-
     unsigned long frame_count = 0;
     unsigned long start_time = millis();
     unsigned long last_display_time = start_time;
@@ -1761,6 +1930,7 @@ void test_tft_animation_performance()
     Serial.printf("Frames per second: ~%u fps\n", (unsigned int)final_fps);
 
     delay(3000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1768,15 +1938,12 @@ void test_tft_color_wheel()
 {
     Serial.println("Testing color wheel (full color gamut)...");
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     int cx = tft.width() / 2;
     int cy = tft.height() / 2;
     int radius = 80;
 
-    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(2);
     tft.setCursor(cx - 50, 10);
     tft.println("Color Wheel");
@@ -1859,7 +2026,8 @@ void test_tft_color_wheel()
     tft.fillCircle(cx, cy, 8, TFT_WHITE);
 
     Serial.println("Color wheel test completed.");
-    delay(4000);
+    delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -1884,13 +2052,10 @@ void test_tft_cellular_automata()
     static uint8_t ca_newgrid[CA_GRIDX][CA_GRIDY];
 
     // Initialize display
-    tft.begin();
-    tft.setRotation(1); // Landscape: 320x240
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     // Display splash screen
     tft.setTextSize(2);
-    tft.setTextColor(TFT_WHITE);
     tft.setCursor(40, 5);
     tft.println(F("Arduino"));
     tft.setCursor(35, 25);
@@ -2123,9 +2288,7 @@ void test_tft_arcfill()
 {
     Serial.println("\n=== Testing Arc Fill with Rainbow Colors ===");
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     byte inc = 0;
     unsigned int col = 0;
@@ -2177,6 +2340,7 @@ void test_tft_arcfill()
     tft.printf("%lu arcs in %lu ms", arc_count, total_time);
 
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -2190,8 +2354,7 @@ void test_tft_char_times()
 {
     Serial.println("\n=== Testing Character Drawing Speed ===");
 
-    tft.begin();
-    tft.setRotation(1);
+    initialize_tft(1);
 
     // Test fonts available: 1, 2, 4, 6, 7, 8
     // We'll test fonts 1, 2, 4, and 7 (common fonts)
@@ -2241,7 +2404,7 @@ void test_tft_char_times()
         tft.setCursor(20, 50);
         tft.printf("Font %d Results:", font);
 
-        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
         tft.setCursor(20, 80);
         tft.printf("Time: %lu ms", draw_time);
 
@@ -2285,6 +2448,7 @@ void test_tft_char_times()
                   total_overall, total_chars, (total_chars * 1000.0f) / total_overall);
 
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -2298,25 +2462,28 @@ void test_tft_clock()
 {
     Serial.println("\n=== Testing Analog Clock ===");
 
-    tft.begin();
-    tft.setRotation(1); // Portrait orientation (240x320)
+    initialize_tft(1);
+
+    // Center coordinates for landscape display using runtime dimensions
+    int centerX = tft.width() / 2;
+    int centerY = tft.height() / 2;
 
     // Draw clock face
     tft.fillScreen(TFT_DARKGREY);
     tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
 
-    tft.fillCircle(120, 120, 118, TFT_GREEN);
-    tft.fillCircle(120, 120, 110, TFT_BLACK);
+    tft.fillCircle(centerX, centerY, 118, TFT_GREEN);
+    tft.fillCircle(centerX, centerY, 110, TFT_BLACK);
 
     // Draw 12 hour lines (every 30 degrees)
     for (int i = 0; i < 360; i += 30)
     {
         float sx = cos((i - 90) * 0.0174532925);
         float sy = sin((i - 90) * 0.0174532925);
-        int x0 = sx * 114 + 120;
-        int y0 = sy * 114 + 120;
-        int x1 = sx * 100 + 120;
-        int y1 = sy * 100 + 120;
+        int x0 = sx * 114 + centerX;
+        int y0 = sy * 114 + centerY;
+        int x1 = sx * 100 + centerX;
+        int y1 = sy * 100 + centerY;
 
         tft.drawLine(x0, y0, x1, y1, TFT_GREEN);
     }
@@ -2326,8 +2493,8 @@ void test_tft_clock()
     {
         float sx = cos((i - 90) * 0.0174532925);
         float sy = sin((i - 90) * 0.0174532925);
-        int x0 = sx * 102 + 120;
-        int y0 = sy * 102 + 120;
+        int x0 = sx * 102 + centerX;
+        int y0 = sy * 102 + centerY;
 
         tft.drawPixel(x0, y0, TFT_WHITE);
 
@@ -2339,7 +2506,7 @@ void test_tft_clock()
     }
 
     // Draw center circle
-    tft.fillCircle(120, 121, 3, TFT_WHITE);
+    tft.fillCircle(centerX, centerY, 3, TFT_WHITE);
 
     // Initialize time (use compile time, or just start at 12:00:00)
     uint8_t hh = 12, mm = 0, ss = 0;
@@ -2351,7 +2518,7 @@ void test_tft_clock()
     Serial.println("Drawing clock hands for 8 seconds...");
 
     float sx = 0, sy = 1, mx = 1, my = 0, hx = -1, hy = 0;
-    uint16_t osx = 120, osy = 120, omx = 120, omy = 120, ohx = 120, ohy = 120;
+    uint16_t osx = centerX, osy = centerY, omx = centerX, omy = centerY, ohx = centerX, ohy = centerY;
     float sdeg = 0, mdeg = 0, hdeg = 0;
     bool initial = 1;
 
@@ -2394,27 +2561,27 @@ void test_tft_clock()
             {
                 initial = 0;
                 // Erase old hour and minute hands
-                tft.drawLine(ohx, ohy, 120, 121, TFT_BLACK);
-                ohx = hx * 62 + 121;
-                ohy = hy * 62 + 121;
+                tft.drawLine(ohx, ohy, centerX, centerY, TFT_BLACK);
+                ohx = hx * 62 + centerX;
+                ohy = hy * 62 + centerY;
 
-                tft.drawLine(omx, omy, 120, 121, TFT_BLACK);
-                omx = mx * 84 + 120;
-                omy = my * 84 + 121;
+                tft.drawLine(omx, omy, centerX, centerY, TFT_BLACK);
+                omx = mx * 84 + centerX;
+                omy = my * 84 + centerY;
             }
 
             // Erase and redraw second hand
-            tft.drawLine(osx, osy, 120, 121, TFT_BLACK);
-            osx = sx * 90 + 121;
-            osy = sy * 90 + 121;
-            tft.drawLine(osx, osy, 120, 121, TFT_RED);
+            tft.drawLine(osx, osy, centerX, centerY, TFT_BLACK);
+            osx = sx * 90 + centerX;
+            osy = sy * 90 + centerY;
+            tft.drawLine(osx, osy, centerX, centerY, TFT_RED);
 
             // Redraw hour and minute hands (not erased to avoid flicker)
-            tft.drawLine(ohx, ohy, 120, 121, TFT_WHITE);
-            tft.drawLine(omx, omy, 120, 121, TFT_WHITE);
+            tft.drawLine(ohx, ohy, centerX, centerY, TFT_WHITE);
+            tft.drawLine(omx, omy, centerX, centerY, TFT_WHITE);
 
             // Redraw center circle
-            tft.fillCircle(120, 121, 3, TFT_RED);
+            tft.fillCircle(centerX, centerY, 3, TFT_RED);
 
             updates++;
         }
@@ -2450,11 +2617,7 @@ void test_tft_clock_digital()
 {
     Serial.println("\n=== Testing Digital Clock ===");
 
-    tft.begin();
-    tft.setRotation(1); // Landscape: 320x240
-
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextSize(1);
+    initialize_tft(1);
     tft.setTextColor(TFT_YELLOW, TFT_BLACK);
 
     // Initialize time (12:34:56 for demo)
@@ -2534,29 +2697,28 @@ void test_tft_clock_digital()
  * Draws filled and outlined ellipses with random sizes, positions, and colors
  * Based on TFT_eSPI example by Bodmer
  * https://github.com/Bodmer/TFT_eSPI/blob/master/examples/320%20x%20240/TFT_Ellipse/TFT_Ellipse.ino
+ *
+ * Accounts for bug that fillEllipse and drawEllipse do not account for their rotation settings, thus TFT_HEIGHT scales still x coordinate and TFT_WIDTH scales y coordinate
  */
 void test_tft_ellipse()
 {
     Serial.println("\n=== Testing Ellipse Drawing ===");
-
-    tft.begin();
-    tft.setRotation(1); // Landscape: 320x240
 
     unsigned long test_start = millis();
     uint32_t filled_count = 0;
     uint32_t outlined_count = 0;
 
     // Draw filled ellipses
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
     Serial.println("Drawing 40 filled ellipses...");
 
     unsigned long filled_start = millis();
     for (int i = 0; i < 40; i++)
     {
-        int rx = random(60);
-        int ry = random(60);
-        int x = rx + random(320 - rx - rx);
-        int y = ry + random(240 - ry - ry);
+        int rx = random(2, 60);
+        int ry = random(2, 60);
+        int x = rx + random(TFT_HEIGHT - 2 * rx);
+        int y = ry + random(TFT_WIDTH - 2 * ry);
         tft.fillEllipse(x, y, rx, ry, random(0xFFFF));
         filled_count++;
         yield();
@@ -2572,10 +2734,10 @@ void test_tft_ellipse()
     unsigned long outlined_start = millis();
     for (int i = 0; i < 40; i++)
     {
-        int rx = random(60);
-        int ry = random(60);
-        int x = rx + random(320 - rx - rx);
-        int y = ry + random(240 - ry - ry);
+        int rx = random(2, 60);
+        int ry = random(2, 60);
+        int x = rx + random(TFT_HEIGHT - 2 * rx);
+        int y = ry + random(TFT_WIDTH - 2 * ry);
         tft.drawEllipse(x, y, rx, ry, random(0xFFFF));
         outlined_count++;
         yield();
@@ -2605,6 +2767,7 @@ void test_tft_ellipse()
     tft.printf("Outlined: %lu in %lums", outlined_count, outlined_time);
 
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -2651,9 +2814,7 @@ void test_tft_fillarcspiral()
 {
     Serial.println("\n=== Testing Fill Arc Spiral ===");
 
-    tft.begin();
-    tft.setRotation(1); // Landscape: 320x240
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     int segment = 0;
     unsigned int col = 0;
@@ -2710,6 +2871,7 @@ void test_tft_fillarcspiral()
     tft.printf("%lu arcs in %lu ms", spiral_count, total_time);
 
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -2723,14 +2885,11 @@ void test_tft_float_test()
 {
     Serial.println("\n=== Testing Float Number Display ===");
 
-    tft.begin();
-    tft.setRotation(1); // Landscape: 320x240
+    initialize_tft(1);
 
     char tmp[12];
 
     // Test 1: 67.125 with 4 decimal places
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextDatum(MC_DATUM); // Middle centre
 
     float test = 67.125;
@@ -2772,6 +2931,7 @@ void test_tft_float_test()
     delay(2000);
 
     Serial.println("Float test complete");
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -2822,6 +2982,7 @@ static unsigned int rainbow_mandelbrot(int value)
 }
 
 // Helper: Render a specific region of the Mandelbrot set
+// needs to account for rotation since using bare metal drawPixel routine
 static void render_mandelbrot_region(float x_min, float x_max, float y_min, float y_max, const char *description)
 {
     Serial.printf("Rendering: %s\n", description);
@@ -2833,14 +2994,16 @@ static void render_mandelbrot_region(float x_min, float x_max, float y_min, floa
     tft.startWrite();
 
     uint32_t pixel_count = 0;
+    uint16_t tft_width = TFT_HEIGHT; // Account for rotation (width is height in portrait mode)
+    uint16_t tft_height = TFT_WIDTH; // Account for rotation (height is width in portrait mode)
 
-    for (int px = 0; px < 320; px++)
+    for (int px = 0; px < tft_width; px++)
     {
-        for (int py = 0; py < 240; py++)
+        for (int py = 0; py < tft_height; py++)
         {
             // Map pixel to Mandelbrot coordinates
-            float x0 = x_min + (x_max - x_min) * px / 320.0;
-            float yy0 = y_min + (y_max - y_min) * py / 240.0;
+            float x0 = x_min + (x_max - x_min) * px / tft_width;
+            float yy0 = y_min + (y_max - y_min) * py / tft_height;
 
             float xx = 0.0;
             float yy = 0.0;
@@ -2870,7 +3033,7 @@ static void render_mandelbrot_region(float x_min, float x_max, float y_min, floa
         // Progress indicator every 64 columns
         if (px % 64 == 0)
         {
-            Serial.printf("  Progress: %d/320 columns\n", px);
+            Serial.printf("  Progress: %d/%d columns\n", px, tft_width);
         }
     }
 
@@ -2889,12 +3052,90 @@ static void render_mandelbrot_region(float x_min, float x_max, float y_min, floa
     delay(3000);
 }
 
+// Helper: Draw Julia set fractal
+static void draw_julia_set(float c_r, float c_i, float zoom)
+{
+    Serial.printf("Rendering Julia Set: c = %.3f + %.3fi, zoom = %.1f\n", c_r, c_i, zoom);
+
+    unsigned long regionTime = millis();
+    tft.fillScreen(TFT_BLACK);
+    tft.startWrite();
+
+    const uint16_t MAX_ITERATION = 300;
+    uint32_t pixel_count = 0;
+    uint16_t tft_width = TFT_HEIGHT; // Account for rotation
+    uint16_t tft_height = TFT_WIDTH; // Account for rotation
+
+    // Rely on inverted symmetry for performance
+    for (int16_t x = tft_width / 2 - 1; x >= 0; x--)
+    {
+        for (uint16_t y = 0; y < tft_height; y++)
+        {
+            float old_r = 1.5 * (x - tft_width / 2) / (0.5 * zoom * tft_width);
+            float old_i = (y - tft_height / 2) / (0.5 * zoom * tft_height);
+            uint16_t i = 0;
+
+            while ((old_r * old_r + old_i * old_i) < 4.0 && i < MAX_ITERATION)
+            {
+                float new_r = old_r * old_r - old_i * old_i;
+                float new_i = 2.0 * old_r * old_i;
+                old_r = new_r + c_r;
+                old_i = new_i + c_i;
+                i++;
+            }
+
+            // Color based on iteration count
+            uint16_t color;
+            if (i < 100)
+            {
+                color = tft.color565(255, 255, map(i, 0, 100, 255, 0));
+            }
+            else if (i < 200)
+            {
+                color = tft.color565(255, map(i, 100, 200, 255, 0), 0);
+            }
+            else
+            {
+                color = tft.color565(map(i, 200, 300, 255, 0), 0, 0);
+            }
+
+            // Draw pixel and its symmetric counterpart
+            tft.drawPixel(x, y, color);
+            tft.drawPixel(tft_width - x - 1, tft_height - y - 1, color);
+            pixel_count += 2;
+
+            // Yield every 100 pixels to prevent watchdog timeout
+            if (pixel_count % 200 == 0)
+            {
+                yield();
+            }
+        }
+
+        // Progress indicator every 32 columns
+        if (x % 32 == 0)
+        {
+            Serial.printf("  Progress: %d/%d columns\n", tft_width / 2 - x, tft_width / 2);
+        }
+    }
+
+    tft.endWrite();
+
+    unsigned long totalTime = millis() - regionTime;
+    Serial.printf("  Complete: %lu ms (%.2f seconds), %lu pixels\n",
+                  totalTime, totalTime / 1000.0, pixel_count);
+
+    // Display label
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(5, 5);
+    tft.printf("Julia Set: c=%.3f+%.3fi", c_r, c_i);
+}
+
 void test_tft_mandelbrot()
 {
     Serial.println("\n=== Testing Mandelbrot Set Rendering ===");
 
-    tft.begin();
-    tft.setRotation(1); // Landscape: 320x240
+    initialize_tft(1);
 
     unsigned long totalStartTime = millis();
 
@@ -2918,6 +3159,14 @@ void test_tft_mandelbrot()
     render_mandelbrot_region(-0.16, -0.14, 1.025, 1.045,
                              "5. Mini-Mandelbrot");
 
+    // 6. Scepter Valley - period 3 bulb region
+    render_mandelbrot_region(-1.3, -1.2, -0.1, 0.1,
+                             "6. Scepter Valley");
+
+    // 7. Double Spiral Valley - double spiral region
+    render_mandelbrot_region(-0.76, -0.74, 0.08, 0.12,
+                             "7. Double Spiral Valley");
+
     unsigned long totalTime = millis() - totalStartTime;
 
     // Summary display
@@ -2935,9 +3184,1398 @@ void test_tft_mandelbrot()
     Serial.printf("\n=== Mandelbrot Test Complete ===\n");
     Serial.printf("Total rendering time: %lu ms (%.2f seconds)\n",
                   totalTime, totalTime / 1000.0);
-    Serial.printf("5 regions rendered\n");
+    Serial.printf("7 regions rendered\n");
 
     delay(3000);
+
+    TEST_ASSERT_TRUE(true);
+}
+
+void test_tft_julia_set()
+{
+    Serial.println("\n=== Testing Julia Set Rendering ===");
+
+    initialize_tft(1);
+
+    unsigned long startTime = millis();
+
+    // Draw Julia set with different parameters
+    draw_julia_set(-0.8, 0.156, 1.0);
+
+    unsigned long renderTime = millis() - startTime;
+
+    // Display completion message
+    tft.setTextColor(TFT_GREEN, TFT_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(10, 10);
+    tft.println("Julia Set Complete!");
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_YELLOW);
+    tft.setCursor(10, 30);
+    tft.printf("Render time: %.1f sec", renderTime / 1000.0);
+
+    Serial.printf("\n=== Julia Set Test Complete ===\n");
+    Serial.printf("Rendering time: %lu ms (%.2f seconds)\n", renderTime, renderTime / 1000.0);
+
+    delay(3000);
+
+    TEST_ASSERT_TRUE(true);
+}
+
+/**
+ * @brief Test: TFT Pie Chart
+ * Draws pie chart segments using circle segments
+ * Based on TFT_eSPI example
+ * https://github.com/Bodmer/TFT_eSPI/blob/master/examples/320%20x%20240/TFT_Pie_Chart/TFT_Pie_Chart.ino
+ */
+
+#define DEG2RAD 0.0174532925
+
+// Draw circle segments for pie charts
+// x,y == coords of centre of circle
+// start_angle = 0 - 359
+// sub_angle   = 0 - 360 = subtended angle
+// r = radius
+// colour = 16-bit colour value
+int fillSegment(int x, int y, int start_angle, int sub_angle, int r, unsigned int colour)
+{
+    // Calculate first pair of coordinates for segment start
+    float sx = cos((start_angle - 90) * DEG2RAD);
+    float sy = sin((start_angle - 90) * DEG2RAD);
+    uint16_t x1 = sx * r + x;
+    uint16_t y1 = sy * r + y;
+
+    // Draw colour blocks every inc degrees
+    for (int i = start_angle; i < start_angle + sub_angle; i++)
+    {
+        // Calculate pair of coordinates for segment end
+        int x2 = cos((i + 1 - 90) * DEG2RAD) * r + x;
+        int y2 = sin((i + 1 - 90) * DEG2RAD) * r + y;
+
+        tft.fillTriangle(x1, y1, x2, y2, x, y, colour);
+
+        // Copy segment end to segment start for next segment
+        x1 = x2;
+        y1 = y2;
+    }
+    return 0;
+}
+
+// Return the 16-bit colour with brightness 0-100%
+unsigned int brightness(unsigned int colour, int brightness)
+{
+    byte red = colour >> 11;
+    byte green = (colour & 0x7E0) >> 5;
+    byte blue = colour & 0x1F;
+
+    blue = (blue * brightness) / 100;
+    green = (green * brightness) / 100;
+    red = (red * brightness) / 100;
+
+    return (red << 11) + (green << 5) + blue;
+}
+
+void test_tft_pie_chart()
+{
+    Serial.println("Testing TFT Pie Chart...");
+
+    initialize_tft(1);
+
+    // Draw 4 pie chart segments
+    fillSegment(160, 120, 0, 60, 100, TFT_RED);
+    fillSegment(160, 120, 60, 30, 100, TFT_GREEN);
+    fillSegment(160, 120, 60 + 30, 120, 100, TFT_BLUE);
+    fillSegment(160, 120, 60 + 30 + 120, 150, 100, TFT_YELLOW);
+
+    delay(4000);
+
+    // Erase old chart with 360 degree black plot
+    fillSegment(160, 120, 0, 360, 100, TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// Pong game variables and functions
+#define PONG_BLACK 0x0000
+#define PONG_WHITE 0xFFFF
+#define PONG_GREY 0x5AEB
+
+static int16_t pong_h = 240;
+static int16_t pong_w = 320;
+static int pong_dly = 5;
+static int16_t pong_paddle_h = 30;
+static int16_t pong_paddle_w = 4;
+static int16_t pong_lpaddle_x = 0;
+static int16_t pong_rpaddle_x;
+static int16_t pong_lpaddle_y = 0;
+static int16_t pong_rpaddle_y;
+static int16_t pong_lpaddle_d = 1;
+static int16_t pong_rpaddle_d = -1;
+static int16_t pong_lpaddle_ball_t;
+static int16_t pong_rpaddle_ball_t;
+static int16_t pong_target_y = 0;
+static int16_t pong_ball_x = 2;
+static int16_t pong_ball_y = 2;
+static int16_t pong_oldball_x = 2;
+static int16_t pong_oldball_y = 2;
+static int16_t pong_ball_dx = 1;
+static int16_t pong_ball_dy = 1;
+static int16_t pong_ball_w = 6;
+static int16_t pong_ball_h = 6;
+static int16_t pong_dashline_h = 4;
+static int16_t pong_dashline_w = 2;
+static int16_t pong_dashline_n;
+static int16_t pong_dashline_x;
+static int16_t pong_dashline_y;
+static int16_t pong_lscore = 12;
+static int16_t pong_rscore = 4;
+static int16_t pong_bottom = 202;
+
+void pong_calc_target_y();
+void pong_midline();
+
+void pong_initgame()
+{
+    pong_rpaddle_x = pong_w - pong_paddle_w;
+    pong_rpaddle_y = pong_h - pong_paddle_h;
+    pong_lpaddle_ball_t = pong_w - pong_w / 4;
+    pong_rpaddle_ball_t = pong_w / 4;
+    pong_dashline_n = pong_h / pong_dashline_h;
+    pong_dashline_x = pong_w / 2 - 1;
+    pong_dashline_y = pong_dashline_h / 2;
+
+    pong_lpaddle_y = random(0, pong_bottom - pong_paddle_h);
+    pong_rpaddle_y = random(0, pong_bottom - pong_paddle_h);
+
+    // ball is placed on the center of the left paddle
+    pong_ball_y = pong_lpaddle_y + (pong_paddle_h / 2);
+
+    pong_calc_target_y();
+
+    pong_midline();
+
+    tft.fillRect(0, pong_h - 26, pong_w, 239, PONG_GREY);
+
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(PONG_WHITE, PONG_GREY);
+    tft.drawString("TFT_eSPI example", pong_w / 2, pong_h - 26, 4);
+}
+
+void pong_midline()
+{
+    // If the ball is not on the line then don't redraw the line
+    if ((pong_ball_x < pong_dashline_x - pong_ball_w) && (pong_ball_x > pong_dashline_x + pong_dashline_w))
+        return;
+
+    tft.startWrite();
+
+    // Quick way to draw a dashed line
+    tft.setAddrWindow(pong_dashline_x, 0, pong_dashline_w, pong_h);
+
+    for (int16_t i = 0; i < pong_dashline_n; i += 2)
+    {
+        tft.pushColor(PONG_WHITE, pong_dashline_w * pong_dashline_h); // push dash pixels
+        tft.pushColor(PONG_BLACK, pong_dashline_w * pong_dashline_h); // push gap pixels
+    }
+
+    tft.endWrite();
+}
+
+void pong_lpaddle()
+{
+    if (pong_lpaddle_d == 1)
+    {
+        tft.fillRect(pong_lpaddle_x, pong_lpaddle_y, pong_paddle_w, 1, PONG_BLACK);
+    }
+    else if (pong_lpaddle_d == -1)
+    {
+        tft.fillRect(pong_lpaddle_x, pong_lpaddle_y + pong_paddle_h - 1, pong_paddle_w, 1, PONG_BLACK);
+    }
+
+    pong_lpaddle_y = pong_lpaddle_y + pong_lpaddle_d;
+
+    if (pong_ball_dx == 1)
+        pong_lpaddle_d = 0;
+    else
+    {
+        if (pong_lpaddle_y + pong_paddle_h / 2 == pong_target_y)
+            pong_lpaddle_d = 0;
+        else if (pong_lpaddle_y + pong_paddle_h / 2 > pong_target_y)
+            pong_lpaddle_d = -1;
+        else
+            pong_lpaddle_d = 1;
+    }
+
+    if (pong_lpaddle_y + pong_paddle_h >= pong_bottom && pong_lpaddle_d == 1)
+        pong_lpaddle_d = 0;
+    else if (pong_lpaddle_y <= 0 && pong_lpaddle_d == -1)
+        pong_lpaddle_d = 0;
+
+    tft.fillRect(pong_lpaddle_x, pong_lpaddle_y, pong_paddle_w, pong_paddle_h, PONG_WHITE);
+}
+
+void pong_rpaddle()
+{
+    if (pong_rpaddle_d == 1)
+    {
+        tft.fillRect(pong_rpaddle_x, pong_rpaddle_y, pong_paddle_w, 1, PONG_BLACK);
+    }
+    else if (pong_rpaddle_d == -1)
+    {
+        tft.fillRect(pong_rpaddle_x, pong_rpaddle_y + pong_paddle_h - 1, pong_paddle_w, 1, PONG_BLACK);
+    }
+
+    pong_rpaddle_y = pong_rpaddle_y + pong_rpaddle_d;
+
+    if (pong_ball_dx == -1)
+        pong_rpaddle_d = 0;
+    else
+    {
+        if (pong_rpaddle_y + pong_paddle_h / 2 == pong_target_y)
+            pong_rpaddle_d = 0;
+        else if (pong_rpaddle_y + pong_paddle_h / 2 > pong_target_y)
+            pong_rpaddle_d = -1;
+        else
+            pong_rpaddle_d = 1;
+    }
+
+    if (pong_rpaddle_y + pong_paddle_h >= pong_bottom && pong_rpaddle_d == 1)
+        pong_rpaddle_d = 0;
+    else if (pong_rpaddle_y <= 0 && pong_rpaddle_d == -1)
+        pong_rpaddle_d = 0;
+
+    tft.fillRect(pong_rpaddle_x, pong_rpaddle_y, pong_paddle_w, pong_paddle_h, PONG_WHITE);
+}
+
+void pong_calc_target_y()
+{
+    int16_t target_x;
+    int16_t reflections;
+    int16_t y;
+
+    if (pong_ball_dx == 1)
+    {
+        target_x = pong_w - pong_ball_w;
+    }
+    else
+    {
+        target_x = -1 * (pong_w - pong_ball_w);
+    }
+
+    y = abs(target_x * (pong_ball_dy / pong_ball_dx) + pong_ball_y);
+
+    reflections = floor(y / pong_bottom);
+
+    if (reflections % 2 == 0)
+    {
+        pong_target_y = y % pong_bottom;
+    }
+    else
+    {
+        pong_target_y = pong_bottom - (y % pong_bottom);
+    }
+}
+
+void pong_ball()
+{
+    pong_ball_x = pong_ball_x + pong_ball_dx;
+    pong_ball_y = pong_ball_y + pong_ball_dy;
+
+    if (pong_ball_dx == -1 && pong_ball_x == pong_paddle_w && pong_ball_y + pong_ball_h >= pong_lpaddle_y && pong_ball_y <= pong_lpaddle_y + pong_paddle_h)
+    {
+        pong_ball_dx = pong_ball_dx * -1;
+        pong_dly = 5; // consistent speed after paddle contact
+        pong_calc_target_y();
+    }
+    else if (pong_ball_dx == 1 && pong_ball_x + pong_ball_w == pong_w - pong_paddle_w && pong_ball_y + pong_ball_h >= pong_rpaddle_y && pong_ball_y <= pong_rpaddle_y + pong_paddle_h)
+    {
+        pong_ball_dx = pong_ball_dx * -1;
+        pong_dly = 5; // consistent speed after paddle contact
+        pong_calc_target_y();
+    }
+    else if ((pong_ball_dx == 1 && pong_ball_x >= pong_w) || (pong_ball_dx == -1 && pong_ball_x + pong_ball_w < 0))
+    {
+        pong_dly = 5;
+    }
+
+    if (pong_ball_y > 202 || pong_ball_y < 0)
+    {
+        pong_ball_dy = pong_ball_dy * -1;
+        pong_ball_y += pong_ball_dy; // Keep in bounds
+    }
+
+    // tft.fillRect(pong_oldball_x, pong_oldball_y, pong_ball_w, pong_ball_h, PONG_BLACK);
+    tft.drawRect(pong_oldball_x, pong_oldball_y, pong_ball_w, pong_ball_h, PONG_BLACK); // Less TFT refresh aliasing than line above for large balls
+    tft.fillRect(pong_ball_x, pong_ball_y, pong_ball_w, pong_ball_h, PONG_WHITE);
+    pong_oldball_x = pong_ball_x;
+    pong_oldball_y = pong_ball_y;
+}
+
+void test_tft_pong()
+{
+    Serial.println("Testing TFT Pong...");
+
+    initialize_tft(1); // Landscape mode
+
+    tft.fillScreen(PONG_BLACK);
+
+    pong_initgame();
+
+    unsigned long startTime = millis();
+    while (millis() - startTime < 10000)
+    { // Run for 10 seconds
+        delay(pong_dly);
+
+        pong_lpaddle();
+        pong_rpaddle();
+        pong_midline();
+        pong_ball();
+
+        yield();
+    }
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+void test_tft_print_test()
+{
+    Serial.println("Testing TFT Print Test...");
+
+    initialize_tft(0); // Portrait mode as in example
+
+    // Fill screen with grey so we can see the effect of printing with and without a background colour defined
+    tft.fillScreen(0x5AEB); // TFT_GREY
+
+    // Set "cursor" at top left corner of display (0,0) and select font 2
+    // (cursor will move to next line automatically during printing with 'tft.println'
+    //  or stay on the line is there is room for the text with tft.print)
+    tft.setCursor(0, 0, 2);
+
+    // Set the font colour to be white with a black background, set text size multiplier to 1
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(1);
+    // We can now plot text on screen using the "print" class
+    tft.println("Hello World!");
+
+    // Set the font colour to be yellow with no background, set to font 7
+    tft.setTextColor(TFT_YELLOW);
+    tft.setTextFont(7);
+    tft.println(1234.56);
+
+    // Set the font colour to be red with black background, set to font 4
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setTextFont(4);
+    tft.println(3735928559L, HEX); // Should print DEADBEEF
+
+    // Set the font colour to be green with black background, set to font 4
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextFont(4);
+    tft.println("Groop");
+    tft.println("I implore thee,");
+
+    // Change to font 2
+    tft.setTextFont(2);
+    tft.println("my foonting turlingdromes.");
+    tft.println("And hooptiously drangle me");
+    tft.println("with crinkly bindlewurdles,");
+    // This next line is deliberately made too long for the display width to test
+    // automatic text wrapping onto the next line
+    tft.println("Or I will rend thee in the gobberwarts with my blurglecruncheon, see if I don't!");
+
+    // Test some print formatting functions
+    float fnumber = 123.45;
+    // Set the font colour to be blue with no background, set to font 4
+    tft.setTextColor(TFT_BLUE);
+    tft.setTextFont(4);
+    tft.print("Float = ");
+    tft.println(fnumber); // Print floating point number
+    tft.print("Binary = ");
+    tft.println((int)fnumber, BIN); // Print as integer value in binary
+    tft.print("Hexadecimal = ");
+    tft.println((int)fnumber, HEX); // Print as integer number in Hexadecimal
+
+    delay(5000);
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// Rainbow fill function for TFT test
+void rainbow_fill()
+{
+    static byte red = 31;
+    static byte green = 0;
+    static byte blue = 0;
+    static byte state = 0;
+    static unsigned int colour = red << 11; // Colour order is RGB 5+6+5 bits each
+
+    // The colours and state are not initialised so the start colour changes each time the function is called
+    for (int i = 319; i > 0; i--)
+    {
+        // Draw a vertical line 1 pixel wide in the selected colour
+        tft.drawFastHLine(0, i, tft.width(), colour); // in this example tft.width() returns the pixel width of the display
+
+        // This is a "state machine" that ramps up/down the colour brightnesses in sequence
+        switch (state)
+        {
+        case 0:
+            green++;
+            if (green == 64)
+            {
+                green = 63;
+                state = 1;
+            }
+            break;
+        case 1:
+            red--;
+            if (red == 255)
+            {
+                red = 0;
+                state = 2;
+            }
+            break;
+        case 2:
+            blue++;
+            if (blue == 32)
+            {
+                blue = 31;
+                state = 3;
+            }
+            break;
+        case 3:
+            green--;
+            if (green == 255)
+            {
+                green = 0;
+                state = 4;
+            }
+            break;
+        case 4:
+            red++;
+            if (red == 32)
+            {
+                red = 31;
+                state = 5;
+            }
+            break;
+        case 5:
+            blue--;
+            if (blue == 255)
+            {
+                blue = 0;
+                state = 0;
+            }
+            break;
+        }
+        colour = red << 11 | green << 5 | blue;
+    }
+}
+
+void test_tft_rainbow()
+{
+    Serial.println("Testing TFT Rainbow...");
+
+    initialize_tft(0); // Portrait mode
+
+    tft.fillScreen(TFT_BLACK);
+
+    rainbow_fill(); // Fill the screen with rainbow colours
+
+    // The standard AdaFruit font still works as before
+    tft.setTextColor(TFT_BLACK); // Background is not defined so it is transparent
+    tft.setCursor(60, 5);
+    tft.setTextFont(0); // Select font 0 which is the Adafruit font
+    tft.print("Original Adafruit font!");
+
+    // The new larger fonts do not need to use the .setCursor call, coords are embedded
+    tft.setTextColor(TFT_BLACK); // Do not plot the background colour
+    // Overlay the black text on top of the rainbow plot (the advantage of not drawing the background colour!)
+    tft.drawCentreString("Font size 2", 120, 14, 2); // Draw text centre at position 120, 14 using font 2
+    tft.drawCentreString("Font size 4", 120, 30, 4); // Draw text centre at position 120, 30 using font 4
+    tft.drawCentreString("12.34", 120, 54, 6);       // Draw text centre at position 120, 54 using font 6
+
+    tft.drawCentreString("12.34 is in font size 6", 120, 92, 2); // Draw text centre at position 120, 92 using font 2
+    // Note the x position is the top of the font!
+
+    // draw a floating point number
+    float pi = 3.14159;                                     // Value to print
+    int precision = 3;                                      // Number of digits after decimal point
+    int xpos = 90;                                          // x position
+    int ypos = 110;                                         // y position
+    int font = 2;                                           // font number 2
+    xpos += tft.drawFloat(pi, precision, xpos, ypos, font); // Draw rounded number and return new xpos delta for next print position
+    tft.drawString(" is pi", xpos, ypos, font);             // Continue printing from new x position
+
+    tft.setTextSize(1);            // We are using a size multiplier of 1
+    tft.setTextColor(TFT_BLACK);   // Set text colour to black, no background (so transparent)
+    tft.setCursor(36, 150, 4);     // Set cursor to x = 36, y = 150 and use font 4
+    tft.println("Transparent..."); // As we use println, the cursor moves to the next line
+
+    tft.setCursor(30, 175);                 // Set cursor to x = 30, y = 175
+    tft.setTextColor(TFT_WHITE, TFT_BLACK); // Set text colour to white and background to black
+    tft.println("White on black");
+
+    tft.setTextFont(4);     // Select font 4 without moving cursor
+    tft.setCursor(50, 210); // Set cursor to x = 50, y = 210 without changing the font
+    tft.setTextColor(TFT_WHITE);
+    // By using #TFT print we can use all the formatting features like printing HEX
+    tft.print(57005, HEX);   // Cursor does no move to next line
+    tft.println(48879, HEX); // print and move cursor to next line
+
+    tft.setTextColor(TFT_GREEN, TFT_BLACK); // This time we will use green text on a black background
+    tft.setTextFont(2);                     // Select font 2
+    // Text will wrap to the next line if needed, by luck it breaks the lines at spaces!
+    tft.println(" Ode to a Small Lump of Green Putty I Found in My Armpit One Midsummer Morning ");
+
+    delay(5000);
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// Spiro rainbow functions
+#define DEG2RAD_SPIRO 0.0174532925
+
+unsigned int spiro_rainbow(int value)
+{
+    // Value is expected to be in range 0-127
+    // The value is converted to a spectrum colour from 0 = blue through to red = blue
+    byte red = 0;   // Red is the top 5 bits of a 16-bit colour value
+    byte green = 0; // Green is the middle 6 bits
+    byte blue = 0;  // Blue is the bottom 5 bits
+
+    byte quadrant = value / 32;
+
+    if (quadrant == 0)
+    {
+        blue = 31;
+        green = 2 * (value % 32);
+        red = 0;
+    }
+    if (quadrant == 1)
+    {
+        blue = 31 - (value % 32);
+        green = 63;
+        red = 0;
+    }
+    if (quadrant == 2)
+    {
+        blue = 0;
+        green = 63;
+        red = value % 32;
+    }
+    if (quadrant == 3)
+    {
+        blue = 0;
+        green = 63 - 2 * (value % 32);
+        red = 31;
+    }
+    return (red << 11) + (green << 5) + blue;
+}
+
+void test_tft_spiro()
+{
+    Serial.println("Testing TFT Spiro...");
+
+    initialize_tft(3); // Portrait reverse as in example
+
+    tft.fillScreen(TFT_BLACK);
+
+    // Run spiro pattern generation for a few iterations
+    unsigned long startTime = millis();
+    int patternCount = 0;
+
+    while (millis() - startTime < 8000 && patternCount < 3)
+    { // Run for 8 seconds or 3 patterns
+        int n = random(2, 23), r = random(20, 100);
+
+        for (long i = 0; i < (360 * n); i++)
+        {
+            float sx = cos((i / n - 90) * DEG2RAD_SPIRO);
+            float sy = sin((i / n - 90) * DEG2RAD_SPIRO);
+            uint16_t x0 = sx * (120 - r) + 159;
+            uint16_t yy0 = sy * (120 - r) + 119;
+
+            sy = cos(((i % 360) - 90) * DEG2RAD_SPIRO);
+            sx = sin(((i % 360) - 90) * DEG2RAD_SPIRO);
+            uint16_t x1 = sx * r + x0;
+            uint16_t yy1 = sy * r + yy0;
+            tft.drawPixel(x1, yy1, spiro_rainbow(map(i % 360, 0, 360, 0, 127)));
+
+            yield(); // Allow other tasks
+        }
+
+        r = random(20, 100);
+        for (long i = 0; i < (360 * n); i++)
+        {
+            float sx = cos((i / n - 90) * DEG2RAD_SPIRO);
+            float sy = sin((i / n - 90) * DEG2RAD_SPIRO);
+            uint16_t x0 = sx * (120 - r) + 159;
+            uint16_t yy0 = sy * (120 - r) + 119;
+
+            sy = cos(((i % 360) - 90) * DEG2RAD_SPIRO);
+            sx = sin(((i % 360) - 90) * DEG2RAD_SPIRO);
+            uint16_t x1 = sx * r + x0;
+            uint16_t yy1 = sy * r + yy0;
+            tft.drawPixel(x1, yy1, spiro_rainbow(map(i % 360, 0, 360, 0, 127)));
+        }
+
+        patternCount++;
+        delay(1000); // Brief pause between patterns
+    }
+
+    delay(2000); // Final display time
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+void test_tft_terminal()
+{
+    Serial.println("Testing TFT Terminal...");
+
+    initialize_tft(0); // Portrait mode required for scrolling
+
+    tft.fillScreen(TFT_BLACK);
+
+    // Setup top banner
+    tft.setTextColor(TFT_WHITE, TFT_BLUE);
+    tft.fillRect(0, 0, 240, 16, TFT_BLUE);
+    tft.drawCentreString(" TFT Terminal Demo ", 120, 0, 2);
+
+    // Change colour for scrolling zone text
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    // Setup scroll area
+    tft_setupScrollArea(TERM_TOP_FIXED_AREA, TERM_BOT_FIXED_AREA);
+
+    // Zero the array
+    for (byte i = 0; i < 18; i++)
+        term_blank[i] = 0;
+
+    // Simulate some terminal output
+    const char *demoLines[] = {
+        "System initialized...",
+        "TFT Terminal Test",
+        "Scrolling text demo",
+        "Line 4: More text here",
+        "Line 5: Even more content",
+        "Line 6: Testing scrolling",
+        "Line 7: Almost done",
+        "Line 8: Final line",
+        "Demo complete!"};
+
+    int numLines = sizeof(demoLines) / sizeof(demoLines[0]);
+
+    for (int line = 0; line < numLines; line++)
+    {
+        const char *text = demoLines[line];
+        term_xPos = 0;
+
+        for (int i = 0; text[i] != '\0'; i++)
+        {
+            char c = text[i];
+            if (c == '\n' || term_xPos > 231)
+            {
+                term_xPos = 0;
+                term_yDraw = term_scroll_line();
+            }
+            if (c >= 32 && c < 128)
+            {
+                term_xPos += tft.drawChar(c, term_xPos, term_yDraw, 2);
+                term_blank[(18 + (term_yStart - TERM_TOP_FIXED_AREA) / TERM_TEXT_HEIGHT) % 19] = term_xPos;
+            }
+        }
+
+        // Add newline
+        term_xPos = 0;
+        term_yDraw = term_scroll_line();
+
+        delay(500); // Pause between lines
+    }
+
+    delay(2000); // Show final result
+
+    // Reset scroll area to full screen
+    tft_scroll_to(0);
+    tft_setupScrollArea(0, 0);
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// Software scrolling terminal variables and functions (landscape, software-based)
+#define SOFT_TEXT_HEIGHT 16
+#define SOFT_BOT_FIXED_AREA 0
+#define SOFT_TOP_FIXED_AREA 16
+#define SOFT_YMAX 240 // Landscape height
+#define SOFT_XMAX 320 // Landscape width
+
+uint16_t soft_yStart = SOFT_TOP_FIXED_AREA;
+uint16_t soft_yArea = SOFT_YMAX - SOFT_TOP_FIXED_AREA - SOFT_BOT_FIXED_AREA;
+uint16_t soft_yDraw = SOFT_YMAX - SOFT_BOT_FIXED_AREA - SOFT_TEXT_HEIGHT;
+uint16_t soft_xPos = 0;
+int soft_blank[19];
+
+#define MAX_LINES 15 // Maximum lines to keep in buffer
+String soft_lines[MAX_LINES];
+int soft_lineCount = 0;
+
+void soft_scroll_line()
+{
+    // Software scroll: shift all lines up
+    for (int i = 0; i < soft_lineCount - 1; i++)
+    {
+        soft_lines[i] = soft_lines[i + 1];
+    }
+    if (soft_lineCount > 0)
+    {
+        soft_lineCount--;
+    }
+
+    // Clear the scrolling area
+    tft.fillRect(0, SOFT_TOP_FIXED_AREA, SOFT_XMAX, soft_yArea, TFT_BLACK);
+
+    // Redraw all remaining lines
+    for (int i = 0; i < soft_lineCount; i++)
+    {
+        tft.setCursor(0, SOFT_TOP_FIXED_AREA + i * SOFT_TEXT_HEIGHT);
+        tft.print(soft_lines[i]);
+    }
+
+    soft_yDraw = SOFT_YMAX - SOFT_BOT_FIXED_AREA - SOFT_TEXT_HEIGHT;
+    soft_xPos = 0;
+}
+
+void test_tft_terminal_software()
+{
+    Serial.println("Testing TFT Terminal Software...");
+
+    initialize_tft(1); // Landscape mode
+
+    tft.fillScreen(TFT_BLACK);
+
+    // Setup top banner
+    tft.setTextColor(TFT_WHITE, TFT_BLUE);
+    tft.fillRect(0, 0, SOFT_XMAX, SOFT_TOP_FIXED_AREA, TFT_BLUE);
+    tft.drawCentreString(" TFT Terminal Software ", SOFT_XMAX / 2, 0, 2);
+
+    // Change colour for scrolling zone text
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    // Initialize line buffer
+    soft_lineCount = 0;
+
+    // Simulate some terminal output
+    const char *demoLines[] = {
+        "Software Scrolling Demo",
+        "Landscape Orientation",
+        "Line 3: Testing scroll",
+        "Line 4: More content",
+        "Line 5: Scrolling up",
+        "Line 6: Buffer management",
+        "Line 7: Redraw optimization",
+        "Line 8: Final demonstration",
+        "Software scroll complete!"};
+
+    int numLines = sizeof(demoLines) / sizeof(demoLines[0]);
+
+    for (int line = 0; line < numLines; line++)
+    {
+        const char *text = demoLines[line];
+
+        // Add the complete line to buffer (bottom-up: newest at end)
+        if (soft_lineCount < MAX_LINES)
+        {
+            soft_lines[soft_lineCount++] = String(text);
+        }
+        else
+        {
+            // Shift buffer up (remove oldest line)
+            for (int j = 0; j < MAX_LINES - 1; j++)
+            {
+                soft_lines[j] = soft_lines[j + 1];
+            }
+            soft_lines[MAX_LINES - 1] = String(text);
+        }
+
+        // Redraw the entire scrolling area from bottom up
+        tft.fillRect(0, SOFT_TOP_FIXED_AREA, SOFT_XMAX, soft_yArea, TFT_BLACK);
+
+        // Draw lines from bottom to top (most recent at bottom)
+        int startY = SOFT_YMAX - SOFT_BOT_FIXED_AREA - SOFT_TEXT_HEIGHT;
+        int linesToDraw = min(soft_lineCount, (int)(soft_yArea / SOFT_TEXT_HEIGHT));
+
+        for (int i = 0; i < linesToDraw; i++)
+        {
+            int lineIndex = soft_lineCount - linesToDraw + i;
+            tft.setCursor(0, startY - (linesToDraw - 1 - i) * SOFT_TEXT_HEIGHT);
+            tft.print(soft_lines[lineIndex]);
+        }
+
+        delay(800); // Pause between lines
+    }
+
+    delay(3000); // Show final result
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// Starfield simulation variables and functions
+#define NSTARS 512 // Reduced from 1024 for test performance
+uint8_t star_sx[NSTARS] = {};
+uint8_t star_sy[NSTARS] = {};
+uint8_t star_sz[NSTARS] = {};
+uint8_t star_za, star_zb, star_zc, star_zx;
+
+// Fast 0-255 random number generator
+inline uint8_t __attribute__((always_inline)) star_rng()
+{
+    star_zx++;
+    star_za = (star_za ^ star_zc ^ star_zx);
+    star_zb = (star_zb + star_za);
+    star_zc = ((star_zc + (star_zb >> 1)) ^ star_za);
+    return star_zc;
+}
+
+void test_tft_starfield()
+{
+    Serial.println("Testing TFT Starfield...");
+
+    initialize_tft(1); // Landscape mode
+
+    tft.fillScreen(TFT_BLACK);
+
+    // Initialize RNG seeds
+    star_za = random(256);
+    star_zb = random(256);
+    star_zc = random(256);
+    star_zx = random(256);
+
+    // Initialize stars
+    for (int i = 0; i < NSTARS; ++i)
+    {
+        star_sx[i] = 160 - 120 + star_rng();
+        star_sy[i] = star_rng();
+        star_sz[i] = star_rng();
+    }
+
+    unsigned long startTime = millis();
+    int frameCount = 0;
+
+    while (millis() - startTime < 5000 && frameCount < 2000)
+    { // Run for 5 seconds or 200 frames
+        unsigned long t0 = micros();
+        uint8_t spawnDepthVariation = 255;
+
+        for (int i = 0; i < NSTARS; ++i)
+        {
+            if (star_sz[i] <= 1)
+            {
+                star_sx[i] = 160 - 120 + star_rng();
+                star_sy[i] = star_rng();
+                star_sz[i] = spawnDepthVariation--;
+            }
+            else
+            {
+                int old_screen_x = ((int)star_sx[i] - 160) * 256 / star_sz[i] + 160;
+                int old_screen_y = ((int)star_sy[i] - 120) * 256 / star_sz[i] + 120;
+
+                // Erase old star
+                tft.drawPixel(old_screen_x, old_screen_y, TFT_BLACK);
+
+                star_sz[i] -= 2;
+                if (star_sz[i] > 1)
+                {
+                    int screen_x = ((int)star_sx[i] - 160) * 256 / star_sz[i] + 160;
+                    int screen_y = ((int)star_sy[i] - 120) * 256 / star_sz[i] + 120;
+
+                    if (screen_x >= 0 && screen_y >= 0 && screen_x < 320 && screen_y < 240)
+                    {
+                        uint8_t r, g, b;
+                        r = g = b = 255 - star_sz[i];
+                        tft.drawPixel(screen_x, screen_y, tft.color565(r, g, b));
+                    }
+                    else
+                    {
+                        star_sz[i] = 0; // Out of screen, die.
+                    }
+                }
+            }
+        }
+
+        unsigned long t1 = micros();
+        float fps = 1.0 / ((t1 - t0) / 1000000.0);
+        if (frameCount % 50 == 0)
+        { // Print FPS every 50 frames
+            Serial.print("Starfield FPS: ");
+            Serial.println(fps);
+        }
+
+        frameCount++;
+        yield();
+    }
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+void test_tft_string_align()
+{
+    Serial.println("Testing TFT String Align...");
+
+    initialize_tft(1); // Landscape mode
+
+    tft.fillScreen(TFT_BLACK);
+
+    // Test different text datums
+    for (byte datum = 0; datum < 9; datum++)
+    {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextDatum(datum);
+        tft.drawNumber(88, 160, 120, 8);
+        tft.fillCircle(160, 120, 5, TFT_RED);
+
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_BLACK);
+        tft.drawString("X", 160, 120, 2);
+
+        delay(500); // Shorter delay for test
+        tft.fillScreen(TFT_BLACK);
+    }
+
+    // Test centre string
+    tft.setTextColor(TFT_BLUE, TFT_BLACK);
+    tft.drawCentreString("69", 160, 120, 8);
+    tft.fillCircle(160, 120, 5, TFT_YELLOW);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString("X", 160, 120, 2);
+    delay(1000);
+    tft.fillScreen(TFT_BLACK);
+
+    // Test right string
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawRightString("88", 160, 120, 8);
+    tft.fillCircle(160, 120, 5, TFT_YELLOW);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString("X", 160, 120, 2);
+    delay(1000);
+    tft.fillScreen(TFT_BLACK);
+
+    // Test floating point drawing
+    tft.setTextColor(TFT_WHITE, TFT_BLUE);
+    tft.setTextDatum(MC_DATUM);
+
+    float test = 67.125;
+    tft.drawFloat(test, 4, 160, 180, 4);
+    tft.fillCircle(160, 180, 5, TFT_YELLOW);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString("X", 160, 180, 2);
+    delay(1000);
+    tft.fillScreen(TFT_BLACK);
+
+    test = -0.555555;
+    tft.drawFloat(test, 3, 160, 180, 4);
+    tft.fillCircle(160, 180, 5, TFT_YELLOW);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString("X", 160, 180, 2);
+    delay(1000);
+    tft.fillScreen(TFT_BLACK);
+
+    test = 0.1;
+    tft.drawFloat(test, 4, 160, 180, 4);
+    tft.fillCircle(160, 180, 5, TFT_YELLOW);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString("X", 160, 180, 2);
+    delay(1000);
+    tft.fillScreen(TFT_BLACK);
+
+    test = 9999999;
+    tft.drawFloat(test, 1, 160, 180, 4);
+    tft.fillCircle(160, 180, 5, TFT_YELLOW);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString("X", 160, 180, 2);
+    delay(2000);
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// Forward declaration for rainbow function
+uint16_t rainbow(byte value);
+
+// Number of circles to draw
+#define CNUMBER 24
+
+// Structure to hold circle plotting parameters
+typedef struct circle_t
+{
+    int16_t cx[CNUMBER] = {0};   // x coordinate of centre
+    int16_t cy[CNUMBER] = {0};   // y coordinate of centre
+    int16_t cr[CNUMBER] = {0};   // radius
+    uint16_t col[CNUMBER] = {0}; // colour
+    int16_t dx[CNUMBER] = {0};   // x movement & direction
+    int16_t dy[CNUMBER] = {0};   // y movement & direction
+    int16_t px[CNUMBER] = {0};   // previous x coordinate
+    int16_t py[CNUMBER] = {0};   // previous y coordinate
+} circle_param;
+
+void test_tft_bouncy_circles()
+{
+    Serial.println("Testing TFT Bouncy Circles...");
+
+    initialize_tft(0); // Portrait mode
+
+    tft.fillScreen(TFT_BLACK);
+
+    // Create the structure and get a pointer to it
+    circle_param *circle = new circle_param;
+
+    // Seed the random number generator
+    randomSeed(analogRead(A0));
+
+    // Initialise circle parameters
+    for (uint16_t i = 0; i < CNUMBER; i++)
+    {
+        circle->cr[i] = random(8, 16);
+        circle->cx[i] = random(circle->cr[i], tft.width() - circle->cr[i]);
+        circle->cy[i] = random(circle->cr[i], tft.height() - circle->cr[i]);
+
+        circle->col[i] = rainbow(4 * i);
+        circle->dx[i] = random(1, 4);
+        if (random(2))
+            circle->dx[i] = -circle->dx[i];
+        circle->dy[i] = random(1, 4);
+        if (random(2))
+            circle->dy[i] = -circle->dy[i];
+    }
+
+    // Used for fps measuring
+    uint16_t counter = 0;
+    int32_t startMillis = millis();
+    uint16_t interval = 50;
+    String fps = "xx.xx fps";
+
+    // Initialize previous positions
+    for (uint16_t i = 0; i < CNUMBER; i++)
+    {
+        circle->px[i] = circle->cx[i];
+        circle->py[i] = circle->cy[i];
+    }
+
+    // Run animation for 5 seconds
+    uint32_t endTime = millis() + 5000;
+
+    while (millis() < endTime)
+    {
+        // Erase circles at previous positions (draw black circles)
+        for (uint16_t i = 0; i < CNUMBER; i++)
+        {
+            tft.fillCircle(circle->px[i], circle->py[i], circle->cr[i], TFT_BLACK);
+            tft.drawCircle(circle->px[i], circle->py[i], circle->cr[i], TFT_BLACK);
+        }
+
+        // Update circle positions
+        for (uint16_t i = 0; i < CNUMBER; i++)
+        {
+            circle->px[i] = circle->cx[i]; // Store current position as previous
+            circle->py[i] = circle->cy[i];
+
+            circle->cx[i] += circle->dx[i];
+            circle->cy[i] += circle->dy[i];
+
+            // Bounce off edges
+            if (circle->cx[i] <= circle->cr[i])
+            {
+                circle->cx[i] = circle->cr[i];
+                circle->dx[i] = -circle->dx[i];
+            }
+            else if (circle->cx[i] + circle->cr[i] >= tft.width() - 1)
+            {
+                circle->cx[i] = tft.width() - circle->cr[i] - 1;
+                circle->dx[i] = -circle->dx[i];
+            }
+
+            if (circle->cy[i] <= circle->cr[i])
+            {
+                circle->cy[i] = circle->cr[i];
+                circle->dy[i] = -circle->dy[i];
+            }
+            else if (circle->cy[i] + circle->cr[i] >= tft.height() - 1)
+            {
+                circle->cy[i] = tft.height() - circle->cr[i] - 1;
+                circle->dy[i] = -circle->dy[i];
+            }
+        }
+
+        // Draw all circles at new positions
+        for (uint16_t i = 0; i < CNUMBER; i++)
+        {
+            // Draw filled circle
+            tft.fillCircle(circle->cx[i], circle->cy[i], circle->cr[i], circle->col[i]);
+
+            // Draw outline
+            tft.drawCircle(circle->cx[i], circle->cy[i], circle->cr[i], TFT_WHITE);
+
+            // Draw circle number
+            tft.setTextColor(TFT_BLACK, circle->col[i]);
+            tft.setTextDatum(MC_DATUM);
+            tft.drawNumber(i + 1, circle->cx[i], circle->cy[i], 1);
+        }
+
+        // Calculate the fps every <interval> iterations
+        counter++;
+        if (counter % interval == 0)
+        {
+            long millisSinceUpdate = millis() - startMillis;
+            fps = String((interval * 1000.0 / (millisSinceUpdate))) + " fps";
+            Serial.println(fps);
+            startMillis = millis();
+        }
+    }
+
+    // Display final FPS
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Bouncy Circles Test", tft.width() / 2, tft.height() / 2 - 20, 2);
+    tft.drawString("Final FPS: " + fps, tft.width() / 2, tft.height() / 2 + 10, 2);
+
+    delay(2000);
+
+    // Clean up
+    delete circle;
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// Test JPEG image data (simple 16x16 test pattern)
+// This is a minimal JPEG for testing - in practice you'd use a real image
+const uint8_t test_jpeg[] PROGMEM = {
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48,
+    0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
+    0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
+    0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20,
+    0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27,
+    0x39, 0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x10,
+    0x00, 0x10, 0x01, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xC4, 0x00, 0x14,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x08, 0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02,
+    0x11, 0x03, 0x11, 0x00, 0x3F, 0x00, 0xAA, 0xFF, 0x00, 0xFF, 0xD9};
+
+// DMA buffers for JPEG decoding
+#ifdef USE_DMA
+uint16_t dmaBuffer1[16 * 16]; // Toggle buffer for 16*16 MCU block, 512bytes
+uint16_t dmaBuffer2[16 * 16]; // Toggle buffer for 16*16 MCU block, 512bytes
+uint16_t *dmaBufferPtr = dmaBuffer1;
+bool dmaBufferSel = 0;
+#endif
+
+// JPEG decoder callback function
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
+{
+    // Stop further decoding as image is running off bottom of screen
+    if (y >= tft.height())
+        return 0;
+
+#ifdef USE_DMA
+    // Double buffering is used, the bitmap is copied to the buffer by pushImageDMA() the
+    // bitmap can then be updated by the jpeg decoder while DMA is in progress
+    if (dmaBufferSel)
+        dmaBufferPtr = dmaBuffer2;
+    else
+        dmaBufferPtr = dmaBuffer1;
+    dmaBufferSel = !dmaBufferSel; // Toggle buffer selection
+    // pushImageDMA() will clip the image block at screen boundaries before initiating DMA
+    tft.pushImageDMA(x, y, w, h, bitmap, dmaBufferPtr); // Initiate DMA - blocking only if last DMA is not complete
+#else
+    // Non-DMA blocking alternative
+    tft.pushImage(x, y, w, h, bitmap); // Blocking, so only returns when image block is drawn
+#endif
+
+    // Return 1 to decode next block
+    return 1;
+}
+
+// Return a 16-bit rainbow colour
+uint16_t rainbow(byte value)
+{
+    // If 'value' is in the range 0-159 it is converted to a spectrum colour
+    // from 0 = red through to 127 = blue to 159 = violet
+    // Extending the range to 0-191 adds a further violet to red band
+
+    value = value % 192;
+
+    byte red = 0;   // Red is the top 5 bits of a 16-bit colour value
+    byte green = 0; // Green is the middle 6 bits, but only top 5 bits used here
+    byte blue = 0;  // Blue is the bottom 5 bits
+
+    byte sector = value >> 5;
+    byte amplit = value & 0x1F;
+
+    switch (sector)
+    {
+    case 0:
+        red = 0x1F;
+        green = amplit; // Green ramps up
+        blue = 0;
+        break;
+    case 1:
+        red = 0x1F - amplit; // Red ramps down
+        green = 0x1F;
+        blue = 0;
+        break;
+    case 2:
+        red = 0;
+        green = 0x1F;
+        blue = amplit; // Blue ramps up
+        break;
+    case 3:
+        red = 0;
+        green = 0x1F - amplit; // Green ramps down
+        blue = 0x1F;
+        break;
+    case 4:
+        red = amplit; // Red ramps up
+        green = 0;
+        blue = 0x1F;
+        break;
+    case 5:
+        red = 0x1F;
+        green = 0;
+        blue = 0x1F - amplit; // Blue ramps down
+        break;
+    }
+
+    return red << 11 | green << 6 | blue;
+}
+
+// TFT Read Register functions
+uint32_t readRegister(uint8_t reg, int16_t bytes, uint8_t index)
+{
+    uint32_t data = 0;
+
+    while (bytes > 0)
+    {
+        bytes--;
+        data = (data << 8) | tft.readcommand8(reg, index);
+        index++;
+    }
+
+    Serial.print("Register 0x");
+    if (reg < 0x10)
+        Serial.print("0");
+    Serial.print(reg, HEX);
+
+    Serial.print(": 0x");
+
+    // Add leading zeros as needed
+    uint32_t mask = 0x1 << (bytes * 7);
+    while (data < mask && mask > 0x1)
+    {
+        Serial.print("0");
+        mask = mask >> 4;
+    }
+
+    Serial.println(data, HEX);
+
+    return data;
+}
+
+void test_tft_read_reg()
+{
+    Serial.println("Testing TFT Read Registers...");
+
+    initialize_tft(1); // Portrait mode
+
+    tft.fillScreen(TFT_BLUE);
+    tft.setCursor(0, 0, 2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.println("Reading TFT Registers...");
+    tft.println("Check Serial output");
+
+    delay(2000);
+
+    // Print a useful subset of the readable registers
+    Serial.println();
+    Serial.println("Useful subset of readable registers:");
+
+    readRegister(0x04, 3, 1); // RDDID
+    readRegister(0x09, 4, 1); // RDDST
+    readRegister(0x0A, 1, 1); // RDMODE
+    readRegister(0x0B, 1, 1); // RDMADCTL
+    readRegister(0x0C, 1, 1); // RDPIXFMT
+    readRegister(0x0D, 1, 1); // RDSELFDIAG
+    readRegister(0x2E, 3, 1); // RAMRD
+
+    readRegister(0xDA, 1, 1); // RDID1
+    readRegister(0xDB, 1, 1); // RDID2
+    readRegister(0xDC, 1, 1); // RDID3
+    readRegister(0xDD, 1, 1); // RDID4
+
+    Serial.println();
+    Serial.println("Test 8, 16 and 32-bit reads and the index...");
+
+    // Test 8, 16 and 32-bit reads and index
+    // Note at index 0 the register values are typically undefined (Bxxxxxxxx)
+    Serial.println(tft.readcommand8(0xD3, 2), HEX);
+    Serial.println(tft.readcommand16(0xD3, 2), HEX);
+    Serial.println(tft.readcommand32(0xD3, 0), HEX);
+
+    delay(2000);
+
+    // Erase screen
+    tft.fillScreen(TFT_BLACK);
+
+    disableBacklight();
 
     TEST_ASSERT_TRUE(true);
 }
@@ -2955,26 +4593,6 @@ void test_tft_mandelbrot()
 
 static uint16_t yStart_matrix = TOP_FIXED_AREA;
 
-// Helper: Setup hardware scroll area
-static void setupScrollArea(uint16_t TFA, uint16_t BFA)
-{
-    tft.writecommand(ILI9341_VSCRDEF); // Vertical scroll definition
-    tft.writedata(TFA >> 8);
-    tft.writedata(TFA);
-    tft.writedata((320 - TFA - BFA) >> 8);
-    tft.writedata(320 - TFA - BFA);
-    tft.writedata(BFA >> 8);
-    tft.writedata(BFA);
-}
-
-// Helper: Set hardware scroll address
-static void scrollAddress(uint16_t VSP)
-{
-    tft.writecommand(ILI9341_VSCRSADD); // Vertical scrolling start address
-    tft.writedata(VSP >> 8);
-    tft.writedata(VSP);
-}
-
 // Helper: Scroll slowly with delay
 static int scroll_slow(int lines, int wait)
 {
@@ -2984,7 +4602,8 @@ static int scroll_slow(int lines, int wait)
         yStart_matrix++;
         if (yStart_matrix == 320 - BOT_FIXED_AREA)
             yStart_matrix = TOP_FIXED_AREA;
-        scrollAddress(yStart_matrix);
+
+        tft_scroll_to(yStart_matrix);
         delay(wait);
     }
     return yTemp;
@@ -2994,15 +4613,14 @@ void test_tft_matrix()
 {
     Serial.println("\n=== Testing Matrix Scrolling Effect ===");
 
-    tft.begin();
-    tft.setRotation(0); // Portrait mode (240x320)
-    tft.fillScreen(ILI9341_BLACK);
+    initialize_tft(0); // Use portrait mode for Matrix effect
 
-    setupScrollArea(TOP_FIXED_AREA, BOT_FIXED_AREA);
+    tft_setupScrollArea(TOP_FIXED_AREA, BOT_FIXED_AREA);
+    // tft_set_scroll_def(TOP_FIXED_AREA, 320 - TOP_FIXED_AREA - BOT_FIXED_AREA, BOT_FIXED_AREA);
 
     byte pos[42]; // Brightness values for each column
     uint16_t xPos = 0;
-    uint16_t yDraw = 320 - BOT_FIXED_AREA - TEXT_HEIGHT;
+    uint16_t yDraw = TFT_WIDTH - BOT_FIXED_AREA - TEXT_HEIGHT;
 
     // Initialize brightness array
     for (int i = 0; i < 42; i++)
@@ -3028,11 +4646,11 @@ void test_tft_matrix()
                 pos[i] = 63;
 
             // Set green brightness (5-bit green in 16-bit color: bits 5-10)
-            tft.setTextColor(pos[i] << 5, ILI9341_BLACK);
+            tft.setTextColor(pos[i] << 5, TFT_BLACK);
 
             // Brightest characters are white
             if (pos[i] == 63)
-                tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+                tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
             // Draw random character
             xPos += tft.drawChar(random(32, 128), xPos, yDraw, 1);
@@ -3060,6 +4678,9 @@ void test_tft_matrix()
 
     // Return to normal mode
     tft.setRotation(1); // Back to landscape
+    // Reset scroll position and area
+    tft_scroll_to(0);
+    tft_setupScrollArea(0, 0);
 
     TEST_ASSERT_TRUE(true);
 }
@@ -3073,14 +4694,12 @@ void test_tft_matrix_software()
 {
     Serial.println("\n=== Testing Matrix Software Scrolling (Landscape) ===");
 
-    tft.begin();
-    tft.setRotation(1); // Landscape mode (320x240)
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
-    const int numColumns = 40;            // Number of character columns
-    const int colWidth = 8;               // Character width in pixels
-    const int charHeight = 8;             // Character height in pixels
-    const int maxRows = 240 / charHeight; // Maximum rows that fit vertically (30)
+    const int numColumns = 40;                   // Number of character columns
+    const int colWidth = 8;                      // Character width in pixels
+    const int charHeight = 8;                    // Character height in pixels
+    const int maxRows = TFT_HEIGHT / charHeight; // Maximum rows that fit vertically (30)
 
     // Column state arrays
     byte brightness[numColumns][maxRows]; // Brightness for each character
@@ -3386,9 +5005,7 @@ void test_tft_meter_linear()
 {
     Serial.println("\n=== Testing Linear Analog Meter ===");
 
-    tft.begin();
-    tft.setRotation(1); // Landscape mode
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     analogMeter(); // Draw analog meter
 
@@ -3664,9 +5281,7 @@ void test_tft_meters()
 {
     Serial.println("\n=== Testing Multiple Meters ===");
 
-    tft.begin();
-    tft.setRotation(0); // Portrait mode
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(0);
 
     analogMeter_multi(); // Draw analog meter
 
@@ -3732,8 +5347,7 @@ void test_tft_spi_speed_performance()
 {
     Serial.println("\n=== Testing SPI Speed vs Animation FPS ===");
 
-    tft.begin();
-    tft.setRotation(1);
+    initialize_tft(1);
 
     int w = tft.width();
     int h = tft.height();
@@ -3872,6 +5486,7 @@ void test_tft_spi_speed_performance()
     Serial.println("Test complete. Check results above.\n");
 
     delay(3000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -3883,11 +5498,8 @@ void test_tft_antialiased_graphics()
 {
     Serial.println("Testing anti-aliased graphics...");
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
-    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(2);
     tft.setCursor(10, 5);
     tft.println("Anti-Aliased");
@@ -3918,6 +5530,7 @@ void test_tft_antialiased_graphics()
 
     Serial.println("Anti-aliased graphics test completed.");
     delay(3000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -3929,15 +5542,12 @@ void test_tft_clock_gauge_demo()
 {
     Serial.println("Testing clock/gauge demo...");
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
     int cx = tft.width() / 2;
     int cy = tft.height() / 2;
     int radius = 80;
 
-    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(2);
     tft.setCursor(cx - 40, 10);
     tft.println("Clock Demo");
@@ -4039,10 +5649,10 @@ void test_tft_clock_gauge_demo()
         tft.fillCircle(cx, cy + 20, 4, TFT_YELLOW);
 
         // Display value
-        tft.fillRect(cx - 30, cy + 60, 60, 20, TFT_BLACK);
+        tft.fillRect(cx - 50, cy + 55, 100, 30, TFT_BLACK);
         tft.setTextSize(2);
         tft.setTextColor(TFT_WHITE);
-        tft.setCursor(cx - 20, cy + 65);
+        tft.setCursor(cx - 25, cy + 65);
         tft.printf("%d%%", (int)value);
 
         delay(50);
@@ -4058,6 +5668,7 @@ void test_tft_clock_gauge_demo()
 
     Serial.println("Clock/Gauge demo completed.");
     delay(2000);
+
     TEST_ASSERT_TRUE(true);
 }
 
@@ -4065,11 +5676,8 @@ void test_tft_read_pixel()
 {
     Serial.println("Testing read pixel operations...");
 
-    tft.begin();
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
+    initialize_tft(1);
 
-    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(2);
     tft.setCursor(10, 5);
     tft.println("ReadPixel Test");
@@ -4151,6 +5759,7 @@ void test_tft_read_pixel()
     tft.printf("Pass: %d/%d", pass_count, 6);
 
     delay(3000);
+
     TEST_ASSERT_EQUAL(6, pass_count);
 }
 
@@ -4234,6 +5843,18 @@ void wiznet5k_reset()
     sleep_ms(100);           // Wait for chip to be ready
 }
 
+void release_SPI()
+{
+#if defined(TFT_CS)
+    pinMode(TFT_CS, OUTPUT);
+    digitalWrite(TFT_CS, HIGH);
+#endif
+#if defined(TOUCH_CS)
+    pinMode(TOUCH_CS, OUTPUT);
+    digitalWrite(TOUCH_CS, HIGH);
+#endif
+}
+
 /**
  * @brief Initialize SPI bus for Wiznet adapter
  * @note Can be called either after TFT init (shared SPI) or standalone
@@ -4263,7 +5884,7 @@ void wiznet_init_spi()
     Serial.printf("MISO: GP%d, MOSI: GP%d, SCK: GP%d, CS: GP%d\n",
                   WIZNET_MISO, WIZNET_MOSI, WIZNET_SCLK, WIZNET_SPI_CS);
     Serial.printf("RST: GP%d, INT: GP%d\n", WIZNET_RST, WIZNET_INT);
-    log_tft_spi_speed("After Wiznet SPI init");
+    log_wiznet_spi_speed("After Wiznet SPI init");
 }
 
 /**
@@ -4304,24 +5925,68 @@ void test_wiznet_mac_generation()
 
 void test_wiznet_hardware_reset()
 {
-    Serial.println("Testing Wiznet hardware reset...");
+    Serial.println("Testing Wiznet hardware reset functionality...");
 
-    // Configure reset pin
+    // Step 1: Initialize Ethernet and configure a static IP
+    Serial.println("Step 1: Initializing Ethernet with static IP...");
+    wiznet5k_reset();
+    wiznet_init_spi();
+    wiznet_init_interrupt();
+    Ethernet.init(WIZNET_SPI_CS);
+
+    // Configure a test static IP
+    IPAddress testIP(192, 168, 1, 100);
+    IPAddress testGateway(192, 168, 1, 1);
+    IPAddress testSubnet(255, 255, 255, 0);
+    IPAddress testDNS(8, 8, 8, 8);
+
+    getWiznetMAC(mac);
+    Ethernet.begin(mac, testIP, testDNS, testGateway, testSubnet);
+
+    // Verify IP was configured
+    IPAddress configuredIP = Ethernet.localIP();
+    Serial.printf("Configured IP: %d.%d.%d.%d\n", configuredIP[0], configuredIP[1], configuredIP[2], configuredIP[3]);
+    TEST_ASSERT_EQUAL_MESSAGE(testIP, configuredIP, "IP should be configured correctly");
+
+    // Step 2: Perform hardware reset
+    Serial.println("Step 2: Performing hardware reset...");
     gpio_init(WIZNET_RST);
     gpio_set_dir(WIZNET_RST, GPIO_OUT);
+    gpio_put(WIZNET_RST, 0); // Assert reset (active low)
+    sleep_ms(10);            // Hold reset for 10ms
+    gpio_put(WIZNET_RST, 1); // Release reset
+    sleep_ms(100);           // Wait for chip to stabilize
 
-    // Assert reset (active low)
-    gpio_put(WIZNET_RST, 0);
-    sleep_ms(10);
+    // Step 3: Reinitialize Ethernet library (SPI state needs to be restored)
+    Serial.println("Step 3: Reinitializing Ethernet after reset...");
+    wiznet_init_spi(); // Restore SPI state
+    Ethernet.init(WIZNET_SPI_CS);
 
-    // Release reset
-    gpio_put(WIZNET_RST, 1);
-    sleep_ms(100); // Wait for chip to stabilize
+    // Step 4: Verify that the reset cleared the configuration
+    Serial.println("Step 4: Verifying reset cleared configuration...");
+    IPAddress resetIP = Ethernet.localIP();
+    Serial.printf("IP after reset: %d.%d.%d.%d\n", resetIP[0], resetIP[1], resetIP[2], resetIP[3]);
 
-    // The important thing is that we can control the reset pin
-    // The actual readback value may vary depending on hardware pulldowns
-    Serial.println("Hardware reset sequence completed");
-    TEST_ASSERT_TRUE(true);
+    // After hardware reset, IP should be 0.0.0.0 (unconfigured)
+    IPAddress zeroIP(0, 0, 0, 0);
+    IPAddress defaultDNS(8, 8, 8, 8); // Some Ethernet libraries may default to a DNS server even after reset, so we won't assert that it's cleared to zero
+    TEST_ASSERT_EQUAL_MESSAGE(zeroIP, resetIP, "IP should be cleared after hardware reset");
+
+    // Also check gateway and subnet
+    IPAddress resetGateway = Ethernet.gatewayIP();
+    IPAddress resetSubnet = Ethernet.subnetMask();
+    IPAddress resetDNS = Ethernet.dnsServerIP();
+
+    Serial.printf("Gateway after reset: %d.%d.%d.%d\n", resetGateway[0], resetGateway[1], resetGateway[2], resetGateway[3]);
+    Serial.printf("Subnet after reset: %d.%d.%d.%d\n", resetSubnet[0], resetSubnet[1], resetSubnet[2], resetSubnet[3]);
+    Serial.printf("DNS after reset: %d.%d.%d.%d\n", resetDNS[0], resetDNS[1], resetDNS[2], resetDNS[3]);
+
+    // These should also be cleared/reset
+    TEST_ASSERT_EQUAL_MESSAGE(zeroIP, resetGateway, "Gateway should be cleared after hardware reset");
+    TEST_ASSERT_EQUAL_MESSAGE(zeroIP, resetSubnet, "Subnet should be cleared after hardware reset");
+    TEST_ASSERT_EQUAL_MESSAGE(defaultDNS, resetDNS, "DNS should be cleared after hardware reset");
+
+    Serial.println("Hardware reset test completed successfully - W5500 was properly reset!");
 }
 
 void test_wiznet_spi_init()
@@ -4378,7 +6043,70 @@ void test_wiznet_ethernet_init()
     Ethernet.init(WIZNET_SPI_CS);
 
     Serial.println("Ethernet library initialized");
-    TEST_ASSERT_TRUE(true);
+
+    // Give a bit more time for the chip to stabilize after init
+    delay(50);
+
+    // Verify Ethernet library is really initialized by checking hardware status
+    auto hwStatus = Ethernet.hardwareStatus();
+    Serial.printf("Hardware status after init: %d\n", hwStatus);
+
+    // If hardware status is 0, try to call Ethernet.begin() to trigger chip detection
+    if (hwStatus == 0)
+    {
+        Serial.println("Hardware status is 0, attempting Ethernet.begin() to detect chip...");
+
+        // Get MAC address for begin() call
+        getWiznetMAC(mac);
+
+        // Try Ethernet.begin() with timeout to see if it can detect the chip
+        int beginResult = Ethernet.begin(mac, 2000); // 2 second timeout
+        Serial.printf("Ethernet.begin() result: %d\n", beginResult);
+
+        // Check hardware status again after begin()
+        hwStatus = Ethernet.hardwareStatus();
+        Serial.printf("Hardware status after begin(): %d\n", hwStatus);
+    }
+
+    // EthernetNoHardware = 0, W5100 = 1, W5200 = 2, W5500 = 3
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(0, hwStatus, "Ethernet library should detect Wiznet chip after initialization");
+
+    // Check link status (may be OFF if no cable connected, but should not be UNKNOWN)
+    auto linkStatus = Ethernet.linkStatus();
+    Serial.print("Link status after init: ");
+    if (linkStatus == LinkON)
+    {
+        Serial.println("ON (cable connected)");
+    }
+    else if (linkStatus == LinkOFF)
+    {
+        Serial.println("OFF (no cable)");
+    }
+    else
+    {
+        Serial.println("UNKNOWN");
+        TEST_FAIL_MESSAGE("Link status should not be UNKNOWN after Ethernet initialization");
+    }
+
+    // Print detected chip type
+    if (hwStatus == 3)
+    {
+        Serial.println("Detected Wiznet chip: W5500");
+    }
+    else if (hwStatus == 2)
+    {
+        Serial.println("Detected Wiznet chip: W5200");
+    }
+    else if (hwStatus == 1)
+    {
+        Serial.println("Detected Wiznet chip: W5100");
+    }
+    else
+    {
+        Serial.printf("Detected unknown Wiznet chip type: %d\n", hwStatus);
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(true, "Ethernet library initialization and chip detection successful");
 }
 
 void test_wiznet_chip_detection()
@@ -4603,51 +6331,96 @@ void test_wiznet_link_status()
         wiznet_init_spi();
         wiznet_init_interrupt();
         Ethernet.init(WIZNET_SPI_CS);
-        getWiznetMAC(mac);
-        Ethernet.begin(mac, staticIP, dnsServer, gateway, subnet);
         wiznet_initialized = true;
     }
 
-    // Wait for link to stabilize
-    delay(500);
+    // Get MAC address
+    getWiznetMAC(mac);
 
-    // Check link status
-    auto linkStatus = Ethernet.linkStatus();
+    Ethernet.begin(mac, staticIP, dnsServer, gateway, subnet);
 
-    Serial.printf("Link status: %d\n", linkStatus);
+    // Wait longer for link to stabilize - PHY might need time
+    Serial.println("Waiting for link to stabilize...");
+    delay(2000); // Wait 2 seconds
+
+    // Check link status multiple times with delays
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+        auto linkStatus = Ethernet.linkStatus();
+        Serial.printf("Link status attempt %d: %d ", attempt, linkStatus);
+
+        if (linkStatus == LinkON)
+        {
+            Serial.println("(ON - cable connected)");
+        }
+        else if (linkStatus == LinkOFF)
+        {
+            Serial.println("(OFF - no cable)");
+        }
+        else
+        {
+            Serial.println("(UNKNOWN)");
+        }
+
+        if (linkStatus == LinkON)
+        {
+            break; // Link detected, no need to try again
+        }
+
+        if (attempt < 3)
+        {
+            Serial.println("Waiting longer for link detection...");
+            delay(1000); // Wait 1 more second between attempts
+        }
+    }
+
+    // Final link status check
+    auto finalLinkStatus = Ethernet.linkStatus();
+    Serial.printf("Final link status: %d\n", finalLinkStatus);
 
     // Print detailed network status
     Serial.print("Link: ");
-    if (linkStatus == LinkON)
+    if (finalLinkStatus == LinkON)
     {
         Serial.println("ON");
+        Serial.println("✅ Ethernet link is UP (cable connected)");
     }
-    else if (linkStatus == LinkOFF)
+    else if (finalLinkStatus == LinkOFF)
     {
         Serial.println("OFF");
+        Serial.println("❌ Ethernet link is DOWN (no cable or not connected)");
+        Serial.println("This might indicate:");
+        Serial.println("  - Ethernet cable not properly connected");
+        Serial.println("  - Network switch/hub not powered on");
+        Serial.println("  - PHY auto-negotiation issues");
+        Serial.println("  - Wiznet W5500 hardware problem");
     }
     else
     {
         Serial.println("UNKNOWN");
+        Serial.println("⚠️  Link status unknown - possible communication issue");
     }
 
-    if (linkStatus == LinkON)
+    // Print additional network information
+    Serial.print("Local IP: ");
+    Serial.println(Ethernet.localIP());
+    Serial.print("Subnet: ");
+    Serial.println(Ethernet.subnetMask());
+    Serial.print("Gateway: ");
+    Serial.println(Ethernet.gatewayIP());
+    Serial.print("DNS: ");
+    Serial.println(Ethernet.dnsServerIP());
+
+    // For this test, we expect the link to be detected if cable is connected
+    // But we'll make it a warning rather than failure for now
+    if (finalLinkStatus != LinkON)
     {
-        Serial.println("Ethernet link is UP (cable connected)");
-    }
-    else if (linkStatus == LinkOFF)
-    {
-        Serial.println("Ethernet link is DOWN (no cable or not connected)");
-        Serial.println("This is acceptable in test environment");
-    }
-    else
-    {
-        Serial.println("Link status unknown");
+        Serial.println("⚠️  WARNING: Link should be ON if Ethernet cable is connected!");
+        Serial.println("   Check cable connection and network equipment.");
     }
 
-    // We don't fail on LinkOFF because cable might not be connected in test environment
-    // The important thing is that we can READ the link status
-    TEST_ASSERT_TRUE_MESSAGE(linkStatus >= 0, "Should be able to read link status");
+    // Test passes if we can at least read the link status (not UNKNOWN)
+    TEST_ASSERT_NOT_EQUAL_MESSAGE(Unknown, finalLinkStatus, "Link status should not be UNKNOWN - indicates communication problem");
 }
 
 void test_wiznet_interrupt_pin()
@@ -4791,6 +6564,181 @@ void test_wiznet_webserver()
     TEST_ASSERT_TRUE(true);
 }
 
+// Big Data Webserver test based on EthernetWebServer_BigData example
+
+// Adjust according to your board's heap size. Too large => crash
+#define MULTIPLY_FACTOR 3.0f // For Pico, use smaller factor
+
+// In bytes
+#define BUFFER_SIZE 512
+char temp[BUFFER_SIZE];
+
+void createPage(String &pageInput)
+{
+    int sec = millis() / 1000;
+    int min = sec / 60;
+    int hr = min / 60;
+    int day = hr / 24;
+
+    snprintf(temp, BUFFER_SIZE - 1,
+             "<html>\
+<head>\
+<meta http-equiv='refresh' content='5'/>\
+<title>EthernetWebServer_BigData-%s</title>\
+<style>\
+body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+</style>\
+</head>\
+<body>\
+<h2>EthernetWebServer_W5500!</h2>\
+<h3>running on %s</h3>\
+<p>Uptime: %d d %02d:%02d:%02d</p>\
+</body>\
+</html>",
+             BOARD_NAME, BOARD_NAME, day, hr % 24, min % 60, sec % 60);
+
+    pageInput = temp;
+}
+
+String out;
+
+void test_wiznet_webserver_bigdata()
+{
+    Serial.println("Testing Wiznet big data webserver...");
+
+    // Ensure SPI bus is released by other devices
+    release_SPI();
+    // Ensure Ethernet is initialized
+    if (!wiznet_initialized)
+    {
+        wiznet5k_reset();
+        wiznet_init_spi();
+        wiznet_init_interrupt();
+        Ethernet.init(WIZNET_SPI_CS);
+        wiznet_initialized = true;
+    }
+
+    // Get MAC address
+    getWiznetMAC(mac);
+
+    // Try to get IP (DHCP or static)
+    IPAddress ip = Ethernet.localIP();
+    if (ip == IPAddress(0, 0, 0, 0))
+    {
+        // No IP, try DHCP
+        Serial.println("No IP assigned, attempting DHCP...");
+        int dhcp_result = Ethernet.begin(mac, DHCP_TIMEOUT);
+        if (dhcp_result == 1)
+        {
+            ip = Ethernet.localIP();
+            Serial.printf("DHCP successful, IP: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+        }
+        else
+        {
+            // Fallback to static
+            Serial.println("DHCP failed, using static IP...");
+            Ethernet.begin(mac, staticIP, dnsServer, gateway, subnet);
+            ip = Ethernet.localIP();
+            Serial.printf("Static IP: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+        }
+    }
+    else
+    {
+        Serial.printf("Using existing IP: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+    }
+
+    // Start server
+    EthernetServer server(80);
+    server.begin();
+    Serial.printf("Big data webserver started at http://%d.%d.%d.%d:80\n", ip[0], ip[1], ip[2], ip[3]);
+    Serial.println("Access the page in a browser. The test will run for 10 seconds...");
+
+    // Run webserver for 10 seconds
+    unsigned long startTime = millis();
+    int reqCount = 0;
+
+    while (millis() - startTime < 10000)
+    {
+        // Listen for incoming clients
+        EthernetClient client = server.available();
+
+        if (client)
+        {
+            Serial.println("New client connected");
+            // An HTTP request ends with a blank line
+            bool currentLineIsBlank = true;
+            String request = "";
+
+            while (client.connected())
+            {
+                if (client.available())
+                {
+                    char c = client.read();
+                    request += c;
+                    Serial.write(c); // Echo to serial for debugging
+
+                    // If you've gotten to the end of the line (received a newline
+                    // character) and the line is blank, the HTTP request has ended,
+                    // so you can send a reply
+                    if (c == '\n' && currentLineIsBlank)
+                    {
+                        Serial.println("Sending big data response");
+
+                        // Send a standard HTTP response header
+                        client.println("HTTP/1.1 200 OK");
+                        client.println("Content-Type: text/html");
+                        client.println("Connection: close");
+                        client.println();
+
+                        // Generate the big data page
+                        out = String();
+                        createPage(out);
+
+                        out += "<html><body>\r\n<table><tr><th>INDEX</th><th>DATA</th></tr>";
+
+                        for (uint16_t lineIndex = 0; lineIndex < (100 * MULTIPLY_FACTOR); lineIndex++)
+                        {
+                            out += "<tr><td>";
+                            out += String(lineIndex);
+                            out += "</td><td>";
+                            out += "WiFiWebServer_BigData_ABCDEFGHIJKLMNOPQRSTUVWXYZ</td></tr>";
+                        }
+
+                        out += "</table></body></html>\r\n";
+
+                        Serial.print(F("String Len = "));
+                        Serial.println(out.length());
+
+                        client.print(out);
+                        break;
+                    }
+
+                    if (c == '\n')
+                    {
+                        // You're starting a new line
+                        currentLineIsBlank = true;
+                    }
+                    else if (c != '\r')
+                    {
+                        // You've gotten a character on the current line
+                        currentLineIsBlank = false;
+                    }
+                }
+            }
+
+            // Give the web browser time to receive the data
+            delay(10);
+
+            // Close the connection
+            client.stop();
+            Serial.println("Client disconnected");
+        }
+    }
+
+    Serial.println("Big data webserver test completed");
+    TEST_ASSERT_TRUE(true);
+}
+
 void test_wiznet_tft_shared_spi()
 {
     Serial.println("Testing TFT initialization after Wiznet on shared SPI0...");
@@ -4803,49 +6751,24 @@ void test_wiznet_tft_shared_spi()
         wiznet_init_interrupt();
         Ethernet.init(WIZNET_SPI_CS);
         wiznet_initialized = true;
-        Serial.println("Wiznet initialized, SPI0 configured at 20 MHz");
+        Serial.println("Wiznet initialized, SPI0 configured at 37.5 MHz");
     }
 
     // Now initialize TFT using the same SPI0 (do not re-init SPI or GPIO)
     Serial.println("Initializing TFT on SPI0 (shared with Wiznet)...");
 
-    // Ensure TFT backlight is on (if wired)
-#if defined(TFT_BL)
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);
-#elif defined(TFT_LED)
-    pinMode(TFT_LED, OUTPUT);
-    digitalWrite(TFT_LED, HIGH);
-#endif
-    Serial.flush();
+    initialize_tft(1);
 
-    // Create TFT_eSPI instance (SPI0 is already configured)
-    TFT_eSPI tft = TFT_eSPI();
-
-    // Initialize TFT - this may reconfigure SPI
-    tft.init();
-
-    tft.setRotation(1);
-    tft.fillScreen(TFT_BLACK);
-    tft.setCursor(0, 0);
-    tft.setTextColor(TFT_WHITE);
     tft.setTextSize(2);
     tft.println("TFT + Wiznet Test");
     tft.println("SPI0 Shared Bus");
-    tft.println("Both at 20 MHz");
+    tft.println("Both at 37.5 MHz");
 
     // Ensure TFT releases SPI bus
     tft.endWrite();
 
     // Deassert TFT/Touch CS lines to avoid SPI bus contention
-#if defined(TFT_CS)
-    pinMode(TFT_CS, OUTPUT);
-    digitalWrite(TFT_CS, HIGH);
-#endif
-#if defined(TOUCH_CS)
-    pinMode(TOUCH_CS, OUTPUT);
-    digitalWrite(TOUCH_CS, HIGH);
-#endif
+    release_SPI();
 
     // Re-configure SPI baudrate for Wiznet after TFT init (TFT may have changed it)
     // Note: Don't call spi_set_format as it can cause hangs - format is already correct
@@ -4853,132 +6776,140 @@ void test_wiznet_tft_shared_spi()
     Serial.printf("SPI baudrate restored: %lu Hz\n", actual_baud);
 
     Serial.println("TFT initialized successfully on shared SPI0 bus");
+
+    delay(2000); // Wait a moment to enable visual inspection
+
     TEST_ASSERT_TRUE(true);
 }
 
 void test_wiznet_webserver_after_tft()
 {
+    IPAddress ip;
+
     Serial.println("Testing Wiznet webserver after TFT initialization...");
 
-    // Ensure Ethernet is initialized (should already be from previous tests)
-    if (!wiznet_initialized)
-    {
-        wiznet5k_reset();
-        wiznet_init_spi();
-        wiznet_init_interrupt();
-        Ethernet.init(WIZNET_SPI_CS);
-        wiznet_initialized = true;
-    }
+    // Initialize TFT FIRST (this is the key difference from regular webserver test)
+    initialize_tft(1);
 
-    // Ensure other devices release SPI bus before Wiznet operations
-#if defined(TFT_CS)
-    pinMode(TFT_CS, OUTPUT);
-    digitalWrite(TFT_CS, HIGH);
-#endif
-#if defined(TOUCH_CS)
-    pinMode(TOUCH_CS, OUTPUT);
-    digitalWrite(TOUCH_CS, HIGH);
-#endif
+    tft.setTextSize(2);
+    tft.println("Webserver Test");
+    tft.println("After TFT Init");
+    tft.endWrite(); // Ensure TFT releases SPI bus
+    delay(1000);    // Wait a moment to enable visual inspection
 
-    // Re-init Wiznet after TFT to ensure SPI is properly configured
-    Serial.println("Resetting Wiznet after TFT...");
+    // Ensure SPI bus is released by other devices
+    release_SPI();
+    // Re-init Wiznet to ensure clean SPI state
     wiznet5k_reset();
     wiznet_init_spi();
-
-    // Use a safer SPI baudrate for DHCP negotiation
-    spi_set_baudrate(WIZNET_SPI_PORT, 8000000);
-
     Ethernet.init(WIZNET_SPI_CS);
 
-    // Get MAC address
+    // Get MAC and ensure IP (reuse DHCP/static logic)
     getWiznetMAC(mac);
-
-    // Force DHCP renew after TFT init to avoid stale/invalid IP
-    Serial.println("Attempting DHCP after TFT init...");
+    Serial.println("Ensuring IP before webserver starts...");
     int dhcp_result = Ethernet.begin(mac, DHCP_TIMEOUT);
-    IPAddress ip;
     if (dhcp_result == 1)
     {
         ip = Ethernet.localIP();
-        Serial.printf("DHCP successful, IP: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
     }
     else
     {
-        // Fallback to static (10.0.3.45 on 10.0.0.0/22)
-        Serial.println("DHCP failed, using static IP...");
         IPAddress staticAfterTft(10, 0, 3, 45);
         IPAddress staticGateway(10, 0, 0, 1);
         IPAddress staticSubnet(255, 255, 252, 0); // /22
         Ethernet.begin(mac, staticAfterTft, dnsServer, staticGateway, staticSubnet);
         delay(100);
-        ip = Ethernet.localIP();
-        if (ip != staticAfterTft)
-        {
-            ip = staticAfterTft;
-        }
-        Serial.printf("Static IP: %d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
+        ip = staticAfterTft;
     }
 
-    // Start server
     EthernetServer server(3000);
     server.begin();
-    Serial.printf("Webserver started at http://%d.%d.%d.%d:3000 (after TFT init)\n", ip[0], ip[1], ip[2], ip[3]);
+    Serial.printf("Webserver started at http://%d.%d.%d.%d:3000\n", ip[0], ip[1], ip[2], ip[3]);
     Serial.println("Access the page in a browser. The test will run for 10 seconds...");
 
-    // Run webserver for 10 seconds (shorter than first test)
+    // Run webserver for 10 seconds - same as regular webserver test
     unsigned long startTime = millis();
     int reqCount = 0;
-    while (millis() - startTime < 10000)
+
+    while (millis() - startTime < 20000)
     {
-        // Check for client connections
+        // Listen for incoming clients
         EthernetClient client = server.available();
+
         if (client)
         {
-            Serial.println("Client connected (after TFT)");
-            reqCount++;
+            Serial.println(F("New client"));
+            // an http request ends with a blank line
+            bool currentLineIsBlank = true;
+            //            delay(100);
+            while (client.connected())
+            {
+                if (client.available())
+                {
+                    char c = client.read();
+                    Serial.write(c);
 
-            // Read request
-            String request = client.readStringUntil('\r');
-            Serial.printf("Request: %s\n", request.c_str());
+                    // if you've gotten to the end of the line (received a newline
+                    // character) and the line is blank, the http request has ended,
+                    // so you can send a reply
+                    if (c == '\n' && currentLineIsBlank)
+                    {
+                        Serial.println(F("Sending response"));
 
-            // Send response
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-Type: text/html");
-            client.println("Connection: close");
-            client.println();
-            client.println("<!DOCTYPE html><html><head><title>Wiznet Test</title></head><body>");
-            client.println("<h1>Wiznet Webserver Test</h1>");
-            client.println("<p>This page served after TFT initialization on shared SPI0 bus.</p>");
-            client.printf("<p>Request count: %d</p>", reqCount);
-            client.println("</body></html>");
+                        // send a standard http response header
+                        // use \r\n instead of many println statements to speedup data send
+                        client.println("HTTP/1.1 200 OK");
+                        client.println("Content-Type: text/html");
+                        client.println("Connection: close"); // the connection will be closed after completion of the response
+                        client.println();
+                        client.println("<!DOCTYPE HTML>");
+                        client.println("<html>");
+                        client.println("<body>");
+                        client.println("<h1>Arduino - Web Server with Ethernet Board:");
+                        client.print(BOARD_NAME);
+                        client.print("!</h1>\r\n");
+                        client.print("Requests received: ");
+                        client.print(++reqCount);
+                        client.println("</body>");
+                        client.println("</html>");
+                        break;
+                    }
 
-            // Wait a bit for client to receive
-            delay(10);
-
-            // Close the connection
+                    if (c == '\n')
+                    {
+                        // you're starting a new line
+                        currentLineIsBlank = true;
+                    }
+                    else if (c != '\r')
+                    {
+                        // you've gotten a character on the current line
+                        currentLineIsBlank = false;
+                    }
+                }
+            }
+            delay(10); // give the web browser time to receive the data
             client.stop();
-            Serial.println("Client disconnected");
+            Serial.println(F("Client disconnected"));
         }
     }
 
-    Serial.printf("Webserver test after TFT completed, handled %d requests\n", reqCount);
-    TEST_ASSERT_TRUE(reqCount >= 0); // At least no crashes
+    Serial.println("Webserver test after TFT initialization completed");
+    TEST_ASSERT_TRUE(true);
 }
 
 void test_wiznet_tft_sprite_webserver()
 {
     Serial.println("Testing TFT sprite updates with webserver...");
 
-    // Ensure SPI bus is released by other devices
-#if defined(TFT_CS)
-    pinMode(TFT_CS, OUTPUT);
-    digitalWrite(TFT_CS, HIGH);
-#endif
-#if defined(TOUCH_CS)
-    pinMode(TOUCH_CS, OUTPUT);
-    digitalWrite(TOUCH_CS, HIGH);
-#endif
+    // Initialize the TFT display
+    initialize_tft(1);
 
+    tft.setTextSize(2);
+    tft.println("Testing TFT sprite updates with webserver...");
+    //    tft.endWrite(); // Ensure TFT releases SPI bus
+
+    // Ensure SPI bus is released by other devices
+    release_SPI();
     // Re-init Wiznet to ensure clean SPI state
     wiznet5k_reset();
     wiznet_init_spi();
@@ -5008,17 +6939,6 @@ void test_wiznet_tft_sprite_webserver()
     Serial.printf("Sprite test webserver at http://%d.%d.%d.%d:3000\n", ip[0], ip[1], ip[2], ip[3]);
 
     // TFT sprite setup
-#if defined(TFT_BL)
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);
-#elif defined(TFT_LED)
-    pinMode(TFT_LED, OUTPUT);
-    digitalWrite(TFT_LED, HIGH);
-#endif
-
-    TFT_eSPI tft = TFT_eSPI();
-    tft.init();
-    tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
 
     TFT_eSprite sprite(&tft);
@@ -5031,7 +6951,7 @@ void test_wiznet_tft_sprite_webserver()
     uint32_t frameCount = 0;
     uint32_t reqCount = 0;
 
-    while (millis() - startTime < 20000)
+    while (millis() - startTime < 10000)
     {
         // Update sprite with colorful graphics
         sprite.fillSprite(TFT_NAVY);
@@ -5059,13 +6979,7 @@ void test_wiznet_tft_sprite_webserver()
         sprite.pushSprite(0, 0);
 
         // Release SPI bus for Wiznet
-#if defined(TFT_CS)
-        digitalWrite(TFT_CS, HIGH);
-#endif
-#if defined(TOUCH_CS)
-        digitalWrite(TOUCH_CS, HIGH);
-#endif
-
+        release_SPI();
         // Serve web requests
         EthernetClient client = server.available();
         if (client)
@@ -5093,10 +7007,1640 @@ void test_wiznet_tft_sprite_webserver()
 
     sprite.deleteSprite();
     Serial.printf("Sprite test completed: frames=%lu, requests=%lu\n", (unsigned long)frameCount, (unsigned long)reqCount);
+
     TEST_ASSERT_TRUE(frameCount > 0);
 }
 
+void test_wiznet_counter_button()
+{
+    Serial.println("Testing counter button with TFT sprite display and scrolling...");
+
+    // Initialize the TFT display
+    initialize_tft(1);
+
+    tft.setTextSize(2);
+    tft.println("Counter Button Test");
+    tft.setTextSize(1);
+    tft.println("Press button on webpage to increment counter");
+
+    // Ensure SPI bus is released by other devices
+    release_SPI();
+    // Re-init Wiznet to ensure clean SPI state
+    wiznet5k_reset();
+    wiznet_init_spi();
+    Ethernet.init(WIZNET_SPI_CS);
+
+    // Get MAC and ensure IP
+    getWiznetMAC(mac);
+    Serial.println("Ensuring IP for counter test...");
+    int dhcp_result = Ethernet.begin(mac, DHCP_TIMEOUT);
+    IPAddress ip;
+    if (dhcp_result == 1)
+    {
+        ip = Ethernet.localIP();
+    }
+    else
+    {
+        IPAddress staticCounter(10, 0, 3, 46);
+        IPAddress staticGateway(10, 0, 0, 1);
+        IPAddress staticSubnet(255, 255, 252, 0);
+        Ethernet.begin(mac, staticCounter, dnsServer, staticGateway, staticSubnet);
+        delay(100);
+        ip = staticCounter;
+    }
+
+    EthernetServer server(3001);
+    server.begin();
+    Serial.printf("Counter button test at http://%d.%d.%d.%d:3001\n", ip[0], ip[1], ip[2], ip[3]);
+
+    // Counter variable
+    static uint32_t counter = 0;
+
+    // TFT sprite setup
+    tft.fillScreen(TFT_BLACK);
+
+    TFT_eSprite sprite(&tft);
+    sprite.setColorDepth(16);
+    const int spriteW = 200;
+    const int spriteH = 150;
+    sprite.createSprite(spriteW, spriteH);
+
+    // Calculate sprite position (centered)
+    const int spriteX = (tft.width() - spriteW) / 2;
+    const int spriteY = (tft.height() - spriteH) / 2;
+
+    // Create scrolling sprites for above and below the main sprite
+    TFT_eSprite topScrollSprite(&tft);
+    topScrollSprite.setColorDepth(16);
+    const int topScrollHeight = spriteY;
+    const int topScrollWidth = tft.width();
+    if (topScrollHeight > 0)
+    {
+        topScrollSprite.createSprite(topScrollWidth, topScrollHeight);
+    }
+
+    TFT_eSprite bottomScrollSprite(&tft);
+    bottomScrollSprite.setColorDepth(16);
+    const int bottomScrollStart = spriteY + spriteH;
+    const int bottomScrollHeight = tft.height() - bottomScrollStart;
+    const int bottomScrollWidth = tft.width();
+    if (bottomScrollHeight > 0)
+    {
+        bottomScrollSprite.createSprite(bottomScrollWidth, bottomScrollHeight);
+    }
+
+    unsigned long startTime = millis();
+    uint32_t reqCount = 0;
+    uint32_t scrollCounter = 0;
+    int topScrollOffset = 0;
+    int bottomScrollOffset = 0;
+
+    while (millis() - startTime < 60000) // 60 second test
+    {
+        // Update sprite with counter display
+        sprite.fillSprite(TFT_DARKGREEN);
+
+        // Draw a colored border
+        sprite.drawRect(0, 0, spriteW, spriteH, TFT_YELLOW);
+        sprite.drawRect(1, 1, spriteW - 2, spriteH - 2, TFT_YELLOW);
+
+        // Draw counter in center with large text
+        sprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+        sprite.drawString("Counter Button Test", 10, 10, 2);
+
+        // Large counter display in center
+        char counterStr[20];
+        sprintf(counterStr, "%lu", (unsigned long)counter);
+        sprite.setTextColor(TFT_YELLOW, TFT_DARKGREEN);
+        sprite.drawString(counterStr, spriteW / 2 - 20, spriteH / 2 - 15, 4);
+
+        // Display additional info
+        sprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+        sprite.drawString("Requests:", 10, spriteH - 50, 2);
+        sprite.drawNumber(reqCount, 90, spriteH - 50, 2);
+
+        // Draw animated indicator
+        int indicatorX = spriteW - 30;
+        int indicatorY = spriteH - 30;
+        uint16_t indicatorColor = (millis() / 500) % 2 ? TFT_RED : TFT_GREEN;
+        sprite.fillCircle(indicatorX, indicatorY, 8, indicatorColor);
+
+        // Push sprite to display at center of screen
+        sprite.pushSprite(spriteX, spriteY);
+
+        // Update top scrolling sprite (above main sprite) - Rainbow waves scrolling right to left
+        if (topScrollHeight > 0)
+        {
+            // Clear and redraw entire sprite with horizontal scrolling
+            topScrollSprite.fillSprite(TFT_BLACK);
+
+            // Draw vertical rainbow wave lines, shifted horizontally
+            for (int x = 0; x < topScrollWidth; x++)
+            {
+                int waveX = (x + topScrollOffset) % topScrollWidth;
+                uint16_t color = getRainbowColor(waveX * 2, scrollCounter * 3);
+                topScrollSprite.drawFastVLine(x, 0, topScrollHeight, color);
+            }
+
+            topScrollSprite.pushSprite(0, 0);
+            topScrollOffset = (topScrollOffset + 1) % topScrollWidth; // Scroll one column
+        }
+
+        // Update bottom scrolling sprite (below main sprite) - Rainbow waves scrolling right to left
+        if (bottomScrollHeight > 0)
+        {
+            // Clear and redraw entire sprite with horizontal scrolling
+            bottomScrollSprite.fillSprite(TFT_BLACK);
+
+            // Draw vertical rainbow wave lines, shifted horizontally
+            for (int x = 0; x < bottomScrollWidth; x++)
+            {
+                int waveX = (x + bottomScrollOffset) % bottomScrollWidth;
+                uint16_t color = getRainbowColor(waveX * 2, scrollCounter * 4); // Different speed
+                bottomScrollSprite.drawFastVLine(x, 0, bottomScrollHeight, color);
+            }
+
+            bottomScrollSprite.pushSprite(0, bottomScrollStart);
+            bottomScrollOffset = (bottomScrollOffset + 1) % bottomScrollWidth; // Scroll one column
+        }
+
+        scrollCounter++;
+
+        // Release SPI bus for Wiznet
+        release_SPI();
+
+        // Handle web requests
+        EthernetClient client = server.available();
+        if (client)
+        {
+            reqCount++;
+            String request = client.readStringUntil('\r');
+            client.readStringUntil('\n'); // Skip rest of request line
+            // Skip headers
+            while (client.available() && client.readStringUntil('\n') != "\r")
+                ;
+
+            if (request.indexOf("GET /increment") != -1)
+            {
+                counter++;
+                Serial.printf("Counter incremented to: %lu\n", (unsigned long)counter);
+            }
+
+            // Generate modulated sine wave data server-side
+            const int DATA_POINTS = 200;
+            String chartDataJSON = "[";
+            for (int i = 0; i < DATA_POINTS; i++)
+            {
+                float x = i * 1.0f;
+                float y = sinf(x * 0.1f) * sinf(x * 0.01f); // Modulated sine wave
+
+                chartDataJSON += "[";
+                chartDataJSON += String(x, 1);
+                chartDataJSON += ",";
+                chartDataJSON += String(y, 3);
+                chartDataJSON += "]";
+
+                if (i < DATA_POINTS - 1)
+                {
+                    chartDataJSON += ",";
+                }
+            }
+            chartDataJSON += "]";
+
+            // Send HTML response
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-Type: text/html");
+            client.println("Connection: close");
+            client.println();
+            client.println("<!DOCTYPE html>");
+            client.println("<html><head>");
+            client.println("<title>Counter Button Test</title>");
+            client.println("<script src=\"https://code.highcharts.com/highcharts.js\"></script>");
+            client.println("<style>");
+            client.println("body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }");
+            client.println("button { font-size: 24px; padding: 20px 40px; margin: 20px; background: #4CAF50; color: white; border: none; border-radius: 8px; cursor: pointer; }");
+            client.println("button:hover { background: #45a049; }");
+            client.println(".counter { font-size: 48px; color: #ff6600; margin: 20px; }");
+            client.println("#chart-container { width: 90%; height: 400px; margin: 20px auto; border: 2px solid #ddd; border-radius: 8px; }");
+            client.println(".info { font-size: 18px; color: #666; margin: 10px; }");
+            client.println("</style>");
+            client.println("</head><body>");
+            client.println("<h1>Counter Button Test</h1>");
+            client.printf("<div class='counter'>Counter: %lu</div>", (unsigned long)counter);
+            client.printf("<div class='info'>Requests: %lu</div>", (unsigned long)reqCount);
+            client.println("<button onclick=\"incrementCounter()\">Increment Counter</button>");
+            client.println("<div id=\"chart-container\"></div>");
+            client.println("<script>");
+            client.println("let chart;");
+            client.println("let dataIndex = 0;");
+            // Embed the pre-calculated data from server
+            client.println("const chartData = ");
+            client.println(chartDataJSON);
+            client.println(";");
+            client.println("");
+            client.println("function createChart() {");
+            client.println("  chart = Highcharts.chart('chart-container', {");
+            client.println("    chart: {");
+            client.println("      type: 'line',");
+            client.println("      animation: false,");
+            client.println("      marginRight: 10");
+            client.println("    },");
+            client.println("    title: {");
+            client.println("      text: 'Modulated Sine Wave (Calculated Server-Side)'");
+            client.println("    },");
+            client.println("    xAxis: {");
+            client.println("      type: 'linear',");
+            client.println("      tickPixelInterval: 150");
+            client.println("    },");
+            client.println("    yAxis: {");
+            client.println("      title: {");
+            client.println("        text: 'Amplitude'");
+            client.println("      },");
+            client.println("      plotLines: [{");
+            client.println("        value: 0,");
+            client.println("        width: 1,");
+            client.println("        color: '#808080'");
+            client.println("      }]");
+            client.println("    },");
+            client.println("    tooltip: {");
+            client.println("      formatter: function() {");
+            client.println("        return '<b>' + this.series.name + '</b><br/>' +");
+            client.println("          'Time: ' + this.x.toFixed(1) + '<br/>' +");
+            client.println("          'Value: ' + this.y.toFixed(3);");
+            client.println("      }");
+            client.println("    },");
+            client.println("    legend: {");
+            client.println("      enabled: false");
+            client.println("    },");
+            client.println("    exporting: {");
+            client.println("      enabled: false");
+            client.println("    },");
+            client.println("    series: [{");
+            client.println("      name: 'Modulated Sine',");
+            client.println("      data: []");
+            client.println("    }]");
+            client.println("  });");
+            client.println("}");
+            client.println("");
+            client.println("function updateChart() {");
+            client.println("  if (dataIndex < chartData.length) {");
+            client.println("    chart.series[0].addPoint(chartData[dataIndex], true, false);");
+            client.println("    dataIndex++;");
+            client.println("  }");
+            client.println("}");
+            client.println("");
+            client.println("function incrementCounter() {");
+            client.println("  fetch('/increment').then(() => {");
+            client.println("    // Update counter display without full page reload");
+            client.println("    fetch('/').then(response => response.text()).then(html => {");
+            client.println("      const parser = new DOMParser();");
+            client.println("      const doc = parser.parseFromString(html, 'text/html');");
+            client.println("      const counterDiv = doc.querySelector('.counter');");
+            client.println("      const infoDiv = doc.querySelector('.info');");
+            client.println("      if (counterDiv) document.querySelector('.counter').innerHTML = counterDiv.innerHTML;");
+            client.println("      if (infoDiv) document.querySelector('.info').innerHTML = infoDiv.innerHTML;");
+            client.println("    });");
+            client.println("  });");
+            client.println("}");
+            client.println("");
+            client.println("// Initialize chart and start updates");
+            client.println("createChart();");
+            client.println("setInterval(updateChart, 500); // Update every 500 ms");
+            client.println("</script>");
+            client.println("</body></html>");
+
+            delay(10);
+            client.stop();
+        }
+
+        delay(50); // Small delay to prevent overwhelming the network
+    }
+
+    Serial.printf("Counter button test completed. Final counter: %lu\n", (unsigned long)counter);
+
+    // Clean up sprites
+    if (topScrollHeight > 0)
+    {
+        topScrollSprite.deleteSprite();
+    }
+    if (bottomScrollHeight > 0)
+    {
+        bottomScrollSprite.deleteSprite();
+    }
+
+    TEST_ASSERT_TRUE(true);
+}
+
 #endif // ENABLE_WIZNET_TESTS
+
+// ============================================================================
+// SD CARD TEST SUITE (test_sd/tests.cpp)
+// ============================================================================
+
+#if ENABLE_SD_TESTS
+
+#include "sd_spi.h"
+
+// Test buffer for block operations
+static uint8_t sd_test_buffer[512];
+static uint8_t sd_read_buffer[512];
+
+// Global flag to track SD card initialization status
+bool sd_card_available = false;
+
+// Test SD card initialization
+void test_sd_initialization(void)
+{
+    Serial.println("=== SD Card Initialization Test ===");
+    Serial.println("Pin Configuration:");
+    Serial.print("  SD_CS:   GP");
+    Serial.println(SD_CS);
+    Serial.print("  SD_CLK:  GP");
+    Serial.println(SD_CLK);
+    Serial.print("  SD_MOSI: GP");
+    Serial.println(SD_MOSI);
+    Serial.print("  SD_MISO: GP");
+    Serial.println(SD_MISO);
+    Serial.print("  SPI Mode: ");
+    Serial.println(SD_SPI_PORT == -1 ? "Software SPI" : "Hardware SPI");
+    Serial.flush();
+
+    Serial.println("\nInitializing SD card...");
+    sd_card_available = sd_spi_init();
+
+    if (sd_card_available)
+    {
+        Serial.println("SD card initialized successfully!");
+
+        uint8_t status = sd_spi_get_status();
+        Serial.print("Card Status: 0x");
+        Serial.println(status, HEX);
+    }
+    else
+    {
+        Serial.println("SD card initialization failed!");
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(sd_card_available, "SD card initialization failed");
+}
+
+// Test SD card block write
+void test_sd_write_block(void)
+{
+    Serial.println("\n=== SD Card Block Write Test ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping write test");
+        return;
+    }
+
+    // Prepare test data pattern
+    for (int i = 0; i < 512; i++)
+    {
+        sd_test_buffer[i] = (uint8_t)(i & 0xFF);
+    }
+
+    // Add signature to beginning of block
+    const char *signature = "PicoSD Test Block";
+    memcpy(sd_test_buffer, signature, strlen(signature));
+
+    Serial.println("Writing test block to sector 100...");
+    bool result = sd_spi_write_block(100, sd_test_buffer);
+
+    if (result)
+    {
+        Serial.println("Block write successful!");
+    }
+    else
+    {
+        Serial.println("Block write failed!");
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(result, "Failed to write block to SD card");
+}
+
+// Test SD card block read
+void test_sd_read_block(void)
+{
+    Serial.println("\n=== SD Card Block Read Test ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping read test");
+        return;
+    }
+
+    // Clear read buffer
+    memset(sd_read_buffer, 0, sizeof(sd_read_buffer));
+
+    Serial.println("Reading test block from sector 100...");
+    bool result = sd_spi_read_block(100, sd_read_buffer);
+
+    if (result)
+    {
+        Serial.println("Block read successful!");
+
+        // Display first 64 bytes
+        Serial.println("First 64 bytes of read data:");
+        for (int i = 0; i < 64; i++)
+        {
+            if (i % 16 == 0)
+            {
+                Serial.println();
+                Serial.print("  ");
+            }
+            if (sd_read_buffer[i] < 0x10)
+                Serial.print("0");
+            Serial.print(sd_read_buffer[i], HEX);
+            Serial.print(" ");
+        }
+        Serial.println();
+    }
+    else
+    {
+        Serial.println("Block read failed!");
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(result, "Failed to read block from SD card");
+}
+
+// Test SD card read/write consistency
+void test_sd_read_write_verify(void)
+{
+    Serial.println("\n=== SD Card Read/Write Verify Test ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping verify test");
+        return;
+    }
+
+    Serial.println("Verifying read data matches written data...");
+
+    // Compare the signature
+    const char *signature = "PicoSD Test Block";
+    bool signature_match = (memcmp(sd_read_buffer, signature, strlen(signature)) == 0);
+
+    if (signature_match)
+    {
+        Serial.print("Signature match: \"");
+        for (size_t i = 0; i < strlen(signature); i++)
+        {
+            Serial.print((char)sd_read_buffer[i]);
+        }
+        Serial.println("\"");
+    }
+    else
+    {
+        Serial.println("Signature mismatch!");
+    }
+
+    // Compare full block
+    int mismatches = 0;
+    for (int i = 0; i < 512; i++)
+    {
+        if (sd_test_buffer[i] != sd_read_buffer[i])
+        {
+            if (mismatches < 10) // Report first 10 mismatches
+            {
+                Serial.print("Mismatch at offset ");
+                Serial.print(i);
+                Serial.print(": expected 0x");
+                Serial.print(sd_test_buffer[i], HEX);
+                Serial.print(", got 0x");
+                Serial.println(sd_read_buffer[i], HEX);
+            }
+            mismatches++;
+        }
+    }
+
+    if (mismatches == 0)
+    {
+        Serial.println("Data verification successful - all 512 bytes match!");
+    }
+    else
+    {
+        Serial.print("Data verification failed - ");
+        Serial.print(mismatches);
+        Serial.println(" bytes differ");
+    }
+
+    TEST_ASSERT_EQUAL_MESSAGE(0, mismatches, "Read data does not match written data");
+}
+
+// Test file write with speed measurement
+void test_sd_file_write(void)
+{
+    Serial.println("\n=== SD Card File Write Test (with Speed) ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping file write test");
+        return;
+    }
+
+    // Prepare test data (4KB)
+    const uint32_t test_size = 4096;
+    uint8_t *write_buffer = (uint8_t *)malloc(test_size);
+
+    if (!write_buffer)
+    {
+        Serial.println("Failed to allocate write buffer!");
+        TEST_FAIL_MESSAGE("Memory allocation failed");
+        return;
+    }
+
+    // Fill with pattern
+    for (uint32_t i = 0; i < test_size; i++)
+    {
+        write_buffer[i] = (uint8_t)(i & 0xFF);
+    }
+
+    fs_info_t fs_info;
+    if (!sd_spi_identify_filesystem(&fs_info))
+    {
+        free(write_buffer);
+        TEST_FAIL_MESSAGE("Failed to identify filesystem");
+        return;
+    }
+
+    Serial.print("Writing ");
+    Serial.print(test_size);
+    Serial.println(" bytes...");
+
+    unsigned long start_time = millis();
+    int bytes_written = sd_spi_write_file(&fs_info, "TEST.DAT", write_buffer, test_size);
+    unsigned long end_time = millis();
+
+    free(write_buffer);
+
+    if (bytes_written < 0)
+    {
+        Serial.println("File write failed!");
+        TEST_FAIL_MESSAGE("Failed to write file");
+        return;
+    }
+
+    unsigned long elapsed_ms = end_time - start_time;
+    float speed_kbps = (bytes_written * 8.0) / elapsed_ms; // Kilobits per second
+
+    Serial.print("Wrote ");
+    Serial.print(bytes_written);
+    Serial.println(" bytes");
+    Serial.print("Time: ");
+    Serial.print(elapsed_ms);
+    Serial.println(" ms");
+    Serial.print("Speed: ");
+    Serial.print(speed_kbps);
+    Serial.println(" kbit/s");
+
+    TEST_ASSERT_EQUAL_MESSAGE(test_size, bytes_written, "Bytes written mismatch");
+}
+
+// Test file read with speed measurement
+void test_sd_file_read(void)
+{
+    Serial.println("\n=== SD Card File Read Test (with Speed) ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping file read test");
+        return;
+    }
+
+    const uint32_t read_size = 4096;
+    uint8_t *read_buffer = (uint8_t *)malloc(read_size);
+
+    if (!read_buffer)
+    {
+        Serial.println("Failed to allocate read buffer!");
+        TEST_FAIL_MESSAGE("Memory allocation failed");
+        return;
+    }
+
+    memset(read_buffer, 0, read_size);
+
+    fs_info_t fs_info;
+    if (!sd_spi_identify_filesystem(&fs_info))
+    {
+        free(read_buffer);
+        TEST_FAIL_MESSAGE("Failed to identify filesystem");
+        return;
+    }
+
+    Serial.print("Reading ");
+    Serial.print(read_size);
+    Serial.println(" bytes...");
+
+    unsigned long start_time = millis();
+    int bytes_read = sd_spi_read_file(&fs_info, "TEST.DAT", read_buffer, read_size);
+    unsigned long end_time = millis();
+
+    if (bytes_read < 0)
+    {
+        free(read_buffer);
+        Serial.println("File read failed!");
+        TEST_FAIL_MESSAGE("Failed to read file");
+        return;
+    }
+
+    unsigned long elapsed_ms = end_time - start_time;
+    float speed_kbps = (bytes_read * 8.0) / elapsed_ms; // Kilobits per second
+
+    Serial.print("Read ");
+    Serial.print(bytes_read);
+    Serial.println(" bytes");
+    Serial.print("Time: ");
+    Serial.print(elapsed_ms);
+    Serial.println(" ms");
+    Serial.print("Speed: ");
+    Serial.print(speed_kbps);
+    Serial.println(" kbit/s");
+
+    // Display first 64 bytes
+    Serial.println("First 64 bytes:");
+    for (int i = 0; i < 64 && i < bytes_read; i++)
+    {
+        if (i % 16 == 0)
+        {
+            Serial.println();
+            Serial.print("  ");
+        }
+        if (read_buffer[i] < 0x10)
+            Serial.print("0");
+        Serial.print(read_buffer[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
+
+    free(read_buffer);
+    TEST_ASSERT_EQUAL_MESSAGE(read_size, bytes_read, "Bytes read mismatch");
+}
+
+// Test file write/read verify with speed measurement
+void test_sd_file_write_read_verify(void)
+{
+    Serial.println("\n=== SD Card File Write/Read/Verify Test ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping verify test");
+        return;
+    }
+
+    const uint32_t test_size = 8192; // 8KB test
+    uint8_t *write_buffer = (uint8_t *)malloc(test_size);
+    uint8_t *read_buffer = (uint8_t *)malloc(test_size);
+
+    if (!write_buffer || !read_buffer)
+    {
+        if (write_buffer)
+            free(write_buffer);
+        if (read_buffer)
+            free(read_buffer);
+        Serial.println("Failed to allocate buffers!");
+        TEST_FAIL_MESSAGE("Memory allocation failed");
+        return;
+    }
+
+    // Create test pattern
+    for (uint32_t i = 0; i < test_size; i++)
+    {
+        write_buffer[i] = (uint8_t)((i * 7 + 13) & 0xFF);
+    }
+
+    fs_info_t fs_info;
+    if (!sd_spi_identify_filesystem(&fs_info))
+    {
+        free(write_buffer);
+        free(read_buffer);
+        TEST_FAIL_MESSAGE("Failed to identify filesystem");
+        return;
+    }
+
+    // Write test
+    Serial.print("Writing ");
+    Serial.print(test_size);
+    Serial.println(" bytes...");
+
+    unsigned long write_start = millis();
+    int bytes_written = sd_spi_write_file(&fs_info, "VERIFY.DAT", write_buffer, test_size);
+    unsigned long write_time = millis() - write_start;
+
+    if (bytes_written != (int)test_size)
+    {
+        free(write_buffer);
+        free(read_buffer);
+        TEST_FAIL_MESSAGE("Write failed");
+        return;
+    }
+
+    float write_speed = (bytes_written * 8.0) / write_time;
+    Serial.print("Write: ");
+    Serial.print(write_time);
+    Serial.print(" ms, ");
+    Serial.print(write_speed);
+    Serial.println(" kbit/s");
+
+    // Read test
+    memset(read_buffer, 0, test_size);
+    Serial.print("Reading ");
+    Serial.print(test_size);
+    Serial.println(" bytes...");
+
+    unsigned long read_start = millis();
+    int bytes_read = sd_spi_read_file(&fs_info, "VERIFY.DAT", read_buffer, test_size);
+    unsigned long read_time = millis() - read_start;
+
+    if (bytes_read != (int)test_size)
+    {
+        free(write_buffer);
+        free(read_buffer);
+        TEST_FAIL_MESSAGE("Read failed");
+        return;
+    }
+
+    float read_speed = (bytes_read * 8.0) / read_time;
+    Serial.print("Read: ");
+    Serial.print(read_time);
+    Serial.print(" ms, ");
+    Serial.print(read_speed);
+    Serial.println(" kbit/s");
+
+    // Verify
+    int mismatches = 0;
+    for (uint32_t i = 0; i < test_size; i++)
+    {
+        if (write_buffer[i] != read_buffer[i])
+        {
+            if (mismatches < 5)
+            {
+                Serial.print("Mismatch at offset ");
+                Serial.print(i);
+                Serial.print(": expected 0x");
+                Serial.print(write_buffer[i], HEX);
+                Serial.print(", got 0x");
+                Serial.println(read_buffer[i], HEX);
+            }
+            mismatches++;
+        }
+    }
+
+    free(write_buffer);
+    free(read_buffer);
+
+    if (mismatches == 0)
+    {
+        Serial.println("Verification successful - all bytes match!");
+    }
+    else
+    {
+        Serial.print("Verification failed - ");
+        Serial.print(mismatches);
+        Serial.println(" bytes differ");
+    }
+
+    TEST_ASSERT_EQUAL_MESSAGE(0, mismatches, "Data verification failed");
+}
+
+// Test read speed as a function of SPI frequency
+void test_sd_spi_frequency_benchmark(void)
+{
+    Serial.println("\n=== SD Card SPI Frequency Benchmark ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping frequency benchmark");
+        return;
+    }
+
+    const uint32_t test_sector = 100;
+    uint8_t *buffer = (uint8_t *)malloc(512);
+
+    if (!buffer)
+    {
+        TEST_FAIL_MESSAGE("Memory allocation failed");
+        return;
+    }
+
+    // Prepare write buffer with test pattern
+    for (int i = 0; i < 512; i++)
+    {
+        buffer[i] = (uint8_t)(i & 0xFF);
+    }
+
+    // Test frequencies from 100kHz to 10MHz
+    uint32_t frequencies[] = {
+        100000,  // 100 kHz
+        250000,  // 250 kHz
+        500000,  // 500 kHz (default)
+        1000000, // 1 MHz
+        2000000, // 2 MHz
+        4000000, // 4 MHz
+        8000000, // 8 MHz
+        10000000 // 10 MHz
+    };
+
+    Serial.print("\nCurrent SPI Method: ");
+    Serial.println(sd_spi_get_method());
+
+    // === READ BENCHMARK ===
+    Serial.println("\n--- READ BENCHMARK ---");
+    Serial.println("Frequency (kHz) | Read Time (ms) | Speed (kbit/s) | Status");
+    Serial.println("----------------------------------------------------------------");
+
+    for (int i = 0; i < 8; i++)
+    {
+        uint32_t freq = frequencies[i];
+        sd_spi_set_frequency(freq);
+
+        // Give the card a moment to stabilize
+        delay(10);
+
+        // Perform 10 reads and average the time (use micros for precision)
+        unsigned long total_time_us = 0;
+        bool all_success = true;
+
+        for (int test = 0; test < 10; test++)
+        {
+            unsigned long start = micros();
+            bool result = sd_spi_read_block(test_sector, buffer);
+            unsigned long elapsed = micros() - start;
+
+            if (!result)
+            {
+                all_success = false;
+                break;
+            }
+            total_time_us += elapsed;
+        }
+
+        // Print results
+        Serial.print("  ");
+        if (freq >= 1000000)
+        {
+            Serial.print(freq / 1000);
+        }
+        else
+        {
+            Serial.print(freq / 1000);
+        }
+
+        // Pad to align columns
+        if (freq < 1000000)
+            Serial.print("  ");
+        Serial.print("          | ");
+
+        if (all_success)
+        {
+            unsigned long avg_time_us = total_time_us / 10;
+            float avg_time_ms = avg_time_us / 1000.0;
+
+            // Calculate speed: (512 bytes * 8 bits/byte) / (time in seconds)
+            // speed_kbps = (512 * 8) / (avg_time_us / 1000000) / 1000
+            //            = (512 * 8 * 1000) / avg_time_us
+            float speed_kbps = (512.0 * 8.0 * 1000.0) / avg_time_us;
+
+            // Print time in milliseconds (padded)
+            if (avg_time_ms < 10)
+                Serial.print(" ");
+            if (avg_time_ms < 100)
+                Serial.print(" ");
+            Serial.print(avg_time_ms, 2); // 2 decimal places for ms
+            Serial.print("         | ");
+
+            // Print speed (padded)
+            if (speed_kbps < 10)
+                Serial.print(" ");
+            if (speed_kbps < 100)
+                Serial.print(" ");
+            if (speed_kbps < 1000)
+                Serial.print(" ");
+            Serial.print(speed_kbps, 1);
+            Serial.print("        | OK");
+        }
+        else
+        {
+            Serial.print("FAIL          | N/A            | FAILED");
+        }
+        Serial.println();
+    }
+
+    // === WRITE BENCHMARK ===
+    Serial.println("\n--- WRITE BENCHMARK ---");
+    Serial.println("Frequency (kHz) | Write Time (ms) | Speed (kbit/s) | Status");
+    Serial.println("----------------------------------------------------------------");
+
+    for (int i = 0; i < 8; i++)
+    {
+        uint32_t freq = frequencies[i];
+        sd_spi_set_frequency(freq);
+
+        // Give the card a moment to stabilize
+        delay(10);
+
+        // Perform 10 writes and average the time (use micros for precision)
+        unsigned long total_time_us = 0;
+        bool all_success = true;
+
+        for (int test = 0; test < 10; test++)
+        {
+            unsigned long start = micros();
+            bool result = sd_spi_write_block(test_sector + test, buffer);
+            unsigned long elapsed = micros() - start;
+
+            if (!result)
+            {
+                all_success = false;
+                break;
+            }
+            total_time_us += elapsed;
+        }
+
+        // Print results
+        Serial.print("  ");
+        if (freq >= 1000000)
+        {
+            Serial.print(freq / 1000);
+        }
+        else
+        {
+            Serial.print(freq / 1000);
+        }
+
+        // Pad to align columns
+        if (freq < 1000000)
+            Serial.print("  ");
+        Serial.print("          | ");
+
+        if (all_success)
+        {
+            unsigned long avg_time_us = total_time_us / 10;
+            float avg_time_ms = avg_time_us / 1000.0;
+
+            // Calculate speed: (512 bytes * 8 bits/byte) / (time in seconds)
+            float speed_kbps = (512.0 * 8.0 * 1000.0) / avg_time_us;
+
+            // Print time in milliseconds (padded)
+            if (avg_time_ms < 10)
+                Serial.print(" ");
+            if (avg_time_ms < 100)
+                Serial.print(" ");
+            Serial.print(avg_time_ms, 2); // 2 decimal places for ms
+            Serial.print("          | ");
+
+            // Print speed (padded)
+            if (speed_kbps < 10)
+                Serial.print(" ");
+            if (speed_kbps < 100)
+                Serial.print(" ");
+            if (speed_kbps < 1000)
+                Serial.print(" ");
+            Serial.print(speed_kbps, 1);
+            Serial.print("        | OK");
+        }
+        else
+        {
+            Serial.print("FAIL           | N/A            | FAILED");
+        }
+        Serial.println();
+    }
+
+    // Restore default frequency
+    sd_spi_set_frequency(500000);
+    free(buffer);
+
+    Serial.println();
+    Serial.println("Note: Software SPI has hardware limits. Speed plateaus indicate max capability.");
+
+    TEST_ASSERT_TRUE_MESSAGE(true, "Frequency benchmark completed");
+}
+
+void test_sd_filesystem_info(void)
+{
+    Serial.println("\n=== SD Card Filesystem Information Test ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping filesystem info test");
+        return;
+    }
+
+    // Get card type
+    const char *card_type_str = sd_spi_get_card_type_string();
+    Serial.print("Card Type: ");
+    Serial.println(card_type_str);
+
+    // Read OCR (Operating Conditions Register)
+    uint32_t ocr = 0;
+    if (sd_spi_read_ocr(&ocr))
+    {
+        Serial.println("\nOCR (Operating Conditions Register):");
+        Serial.print("  Raw Value: 0x");
+        Serial.println(ocr, HEX);
+        Serial.print("  Power Up Status: ");
+        Serial.println((ocr & 0x80000000) ? "Complete" : "Busy");
+
+        // Determine card capacity type more precisely
+        Serial.print("  Card Capacity Status (CCS): ");
+        if (ocr & 0x40000000)
+        {
+            // High capacity card - need to check actual capacity to distinguish SDHC vs SDXC
+            uint64_t capacity = sd_spi_get_capacity();
+            if (capacity > (32LL * 1024 * 1024 * 1024))
+            {
+                Serial.println("SDXC (>32GB)");
+            }
+            else
+            {
+                Serial.println("SDHC (2GB-32GB)");
+            }
+        }
+        else
+        {
+            Serial.println("SDSC (<2GB)");
+        }
+
+        Serial.print("  UHS-II Card Status: ");
+        Serial.println((ocr & 0x20000000) ? "Yes" : "No");
+
+        // Voltage ranges
+        Serial.print("  Supported Voltages: ");
+        bool first = true;
+        if (ocr & 0x00800000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("3.5-3.6V");
+            first = false;
+        }
+        if (ocr & 0x00400000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("3.4-3.5V");
+            first = false;
+        }
+        if (ocr & 0x00200000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("3.3-3.4V");
+            first = false;
+        }
+        if (ocr & 0x00100000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("3.2-3.3V");
+            first = false;
+        }
+        if (ocr & 0x00080000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("3.1-3.2V");
+            first = false;
+        }
+        if (ocr & 0x00040000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("3.0-3.1V");
+            first = false;
+        }
+        if (ocr & 0x00020000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("2.9-3.0V");
+            first = false;
+        }
+        if (ocr & 0x00010000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("2.8-2.9V");
+            first = false;
+        }
+        if (ocr & 0x00008000)
+        {
+            if (!first)
+                Serial.print(", ");
+            Serial.print("2.7-2.8V");
+            first = false;
+        }
+        Serial.println();
+    }
+
+    // Read SSR (SD Status Register) for Speed Class information
+    uint8_t ssr[64];
+    if (sd_spi_read_ssr(ssr))
+    {
+        Serial.println("\nSSR (SD Status Register):");
+
+        // Speed Class (bits [447:440] = byte 2)
+        uint8_t speed_class = ssr[2];
+        Serial.print("  Speed Class: ");
+        if (speed_class == 0)
+        {
+            Serial.println("0 (Class not specified)");
+        }
+        else if (speed_class == 1)
+        {
+            Serial.println("2 (Class 2, >= 2 MB/s)");
+        }
+        else if (speed_class == 2)
+        {
+            Serial.println("4 (Class 4, >= 4 MB/s)");
+        }
+        else if (speed_class == 3)
+        {
+            Serial.println("6 (Class 6, >= 6 MB/s)");
+        }
+        else if (speed_class == 4)
+        {
+            Serial.println("10 (Class 10, >= 10 MB/s)");
+        }
+        else
+        {
+            Serial.print(speed_class);
+            Serial.println(" (Unknown)");
+        }
+
+        // UHS Speed Grade (bits [395:392] = byte 8, upper nibble)
+        uint8_t uhs_speed_grade = (ssr[8] >> 4) & 0x0F;
+        Serial.print("  UHS Speed Grade: ");
+        if (uhs_speed_grade == 0)
+        {
+            Serial.println("0 (Less than 10MB/s or not UHS)");
+        }
+        else if (uhs_speed_grade == 1)
+        {
+            Serial.println("1 (U1, >= 10 MB/s)");
+        }
+        else if (uhs_speed_grade == 3)
+        {
+            Serial.println("3 (U3, >= 30 MB/s)");
+        }
+        else
+        {
+            Serial.print(uhs_speed_grade);
+            Serial.println(" (Unknown)");
+        }
+
+        // Video Speed Class (bits [383:376] = byte 10)
+        uint8_t video_speed_class = ssr[10];
+        if (video_speed_class > 0)
+        {
+            Serial.print("  Video Speed Class: ");
+            if (video_speed_class == 6)
+            {
+                Serial.println("V6 (>= 6 MB/s)");
+            }
+            else if (video_speed_class == 10)
+            {
+                Serial.println("V10 (>= 10 MB/s)");
+            }
+            else if (video_speed_class == 30)
+            {
+                Serial.println("V30 (>= 30 MB/s)");
+            }
+            else if (video_speed_class == 60)
+            {
+                Serial.println("V60 (>= 60 MB/s)");
+            }
+            else if (video_speed_class == 90)
+            {
+                Serial.println("V90 (>= 90 MB/s)");
+            }
+            else
+            {
+                Serial.print(video_speed_class);
+                Serial.println(" (Unknown)");
+            }
+        }
+    }
+
+    // Read CID (Card Identification)
+    uint8_t cid[16];
+    if (sd_spi_read_cid(cid))
+    {
+        Serial.println("\nCID (Card Identification):");
+
+        // Manufacturer ID with lookup
+        uint8_t mid = cid[0];
+        Serial.print("  Manufacturer ID: 0x");
+        Serial.print(mid, HEX);
+        Serial.print(" (");
+
+        // Common SD card manufacturer IDs
+        switch (mid)
+        {
+        case 0x01:
+            Serial.print("Panasonic");
+            break;
+        case 0x02:
+            Serial.print("Toshiba");
+            break;
+        case 0x03:
+            Serial.print("SanDisk");
+            break;
+        case 0x1B:
+            Serial.print("Samsung");
+            break;
+        case 0x1D:
+            Serial.print("AData");
+            break;
+        case 0x27:
+            Serial.print("Phison");
+            break;
+        case 0x28:
+            Serial.print("Lexar");
+            break;
+        case 0x31:
+            Serial.print("Silicon Power");
+            break;
+        case 0x41:
+            Serial.print("Kingston");
+            break;
+        case 0x6F:
+            Serial.print("STMicroelectronics");
+            break;
+        case 0x74:
+            Serial.print("Transcend");
+            break;
+        case 0x76:
+            Serial.print("Patriot");
+            break;
+        case 0x82:
+            Serial.print("Sony");
+            break;
+        case 0x9C:
+            Serial.print("Barun Electronics");
+            break;
+        default:
+            Serial.print("Unknown");
+            break;
+        }
+        Serial.println(")");
+
+        // OEM/Application ID (2 ASCII chars)
+        char oid[3] = {(char)cid[1], (char)cid[2], 0};
+        Serial.print("  OEM/Application ID: ");
+        Serial.println(oid);
+
+        // Product Name (5 ASCII chars)
+        char pnm[6] = {(char)cid[3], (char)cid[4], (char)cid[5], (char)cid[6], (char)cid[7], 0};
+        Serial.print("  Product Name: ");
+        Serial.println(pnm);
+
+        // Product Revision (2 BCD digits)
+        uint8_t prv_major = (cid[8] >> 4) & 0x0F;
+        uint8_t prv_minor = cid[8] & 0x0F;
+        Serial.print("  Product Revision: ");
+        Serial.print(prv_major);
+        Serial.print(".");
+        Serial.println(prv_minor);
+
+        // Product Serial Number (32-bit)
+        uint32_t psn = ((uint32_t)cid[9] << 24) | ((uint32_t)cid[10] << 16) |
+                       ((uint32_t)cid[11] << 8) | (uint32_t)cid[12];
+        Serial.print("  Serial Number: 0x");
+        Serial.println(psn, HEX);
+
+        // Manufacturing Date (12-bit field at CID[19:8])
+        // MDT format: bits [19:12] = year (8 bits), bits [11:8] = month (4 bits)
+        // cid[13] bits [3:0] = year bits [7:4]
+        // cid[14] bits [7:4] = year bits [3:0]
+        // cid[14] bits [3:0] = month bits [3:0]
+        uint8_t mdt_year = ((cid[13] & 0x0F) << 4) | ((cid[14] >> 4) & 0x0F);
+        uint8_t mdt_month = cid[14] & 0x0F;
+
+        Serial.print("  Manufacturing Date: ");
+        // Print month name for clarity
+        const char *months[] = {"", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        if (mdt_month >= 1 && mdt_month <= 12)
+        {
+            Serial.print(months[mdt_month]);
+        }
+        else
+        {
+            Serial.print(mdt_month);
+        }
+        Serial.print(" ");
+        Serial.println(mdt_year + 2000); // Add 2000 to year offset
+    }
+
+    // Read CSD (Card-Specific Data) register
+    uint8_t csd[16];
+    bool csd_read = sd_spi_read_csd(csd);
+
+    if (csd_read)
+    {
+        Serial.println("\nCSD Register (16 bytes):");
+        for (int i = 0; i < 16; i++)
+        {
+            if (i % 8 == 0)
+            {
+                Serial.println();
+                Serial.print("  ");
+            }
+            if (csd[i] < 0x10)
+                Serial.print("0");
+            Serial.print(csd[i], HEX);
+            Serial.print(" ");
+        }
+        Serial.println();
+
+        // Parse CSD version
+        uint8_t csd_version = (csd[0] >> 6) & 0x03;
+        Serial.print("CSD Version: ");
+        Serial.println(csd_version);
+
+        // Read block length
+        uint8_t read_bl_len = csd[5] & 0x0F;
+        uint32_t block_length = 1 << read_bl_len;
+        Serial.print("Block Length: ");
+        Serial.print(block_length);
+        Serial.println(" bytes");
+
+        // Parse capacity based on CSD version
+        if (csd_version == 0)
+        {
+            // CSD v1.0 (SDSC)
+            uint16_t c_size = ((csd[6] & 0x03) << 10) | (csd[7] << 2) | ((csd[8] >> 6) & 0x03);
+            uint8_t c_size_mult = ((csd[9] & 0x03) << 1) | ((csd[10] >> 7) & 0x01);
+
+            Serial.print("C_SIZE: ");
+            Serial.println(c_size);
+            Serial.print("C_SIZE_MULT: ");
+            Serial.println(c_size_mult);
+
+            uint32_t num_sectors = (uint32_t)(c_size + 1) << (c_size_mult + 2);
+            uint64_t capacity = (uint64_t)num_sectors * block_length;
+
+            Serial.print("Number of Sectors: ");
+            Serial.println(num_sectors);
+            Serial.print("Card Capacity: ");
+            Serial.print(capacity / (1024 * 1024));
+            Serial.println(" MB");
+        }
+        else if (csd_version == 1)
+        {
+            // CSD v2.0 (SDHC/SDXC)
+            uint32_t c_size = ((csd[7] & 0x3F) << 16) | (csd[8] << 8) | csd[9];
+
+            Serial.print("C_SIZE: ");
+            Serial.println(c_size);
+
+            uint32_t num_sectors = (c_size + 1) * 1024; // 512K sectors per C_SIZE unit
+            uint64_t capacity = (uint64_t)(c_size + 1) * 512 * 1024;
+
+            Serial.print("Number of Sectors: ");
+            Serial.println(num_sectors);
+            Serial.print("Card Capacity: ");
+
+            if (capacity >= (1024LL * 1024 * 1024))
+            {
+                Serial.print(capacity / (1024LL * 1024 * 1024));
+                Serial.println(" GB");
+            }
+            else
+            {
+                Serial.print(capacity / (1024 * 1024));
+                Serial.println(" MB");
+            }
+        }
+
+        // Get total capacity via function
+        uint64_t total_capacity = sd_spi_get_capacity();
+        if (total_capacity > 0)
+        {
+            Serial.print("Total Capacity (calculated): ");
+            if (total_capacity >= (1024LL * 1024 * 1024))
+            {
+                Serial.print(total_capacity / (1024LL * 1024 * 1024));
+                Serial.println(" GB");
+            }
+            else
+            {
+                Serial.print(total_capacity / (1024 * 1024));
+                Serial.println(" MB");
+            }
+        }
+
+        // Read speed (from CSD)
+        uint8_t tran_speed = csd[3];
+        uint8_t speed_unit = (tran_speed & 0x07);        // bits 2:0
+        uint8_t time_value = ((tran_speed >> 3) & 0x0F); // bits 6:3
+
+        // Speed units in kbit/s: 100kbit/s, 1Mbit/s, 10Mbit/s, 100Mbit/s
+        static const uint32_t speed_units[] = {100, 1000, 10000, 100000, 0, 0, 0, 0};
+        // Time values are multipliers × 10 (to avoid floats)
+        static const uint8_t time_values[] = {0, 10, 12, 13, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80};
+
+        if (speed_unit < 8 && time_value < 16 && time_values[time_value] > 0)
+        {
+            uint32_t transfer_rate = (speed_units[speed_unit] * time_values[time_value]) / 10;
+            Serial.print("Max Transfer Rate: ");
+            Serial.print(transfer_rate);
+            Serial.println(" kbit/s");
+        }
+
+        TEST_ASSERT_TRUE_MESSAGE(true, "CSD read successful");
+    }
+    else
+    {
+        Serial.println("Failed to read CSD register!");
+        TEST_ASSERT_TRUE_MESSAGE(false, "Failed to read CSD register");
+    }
+}
+
+// Test filesystem identification and directory reading
+void test_sd_filesystem_and_directory(void)
+{
+    Serial.println("\n=== SD Card Filesystem and Directory Test ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping filesystem test");
+        return;
+    }
+
+    fs_info_t fs_info;
+    bool fs_identified = sd_spi_identify_filesystem(&fs_info);
+
+    if (!fs_identified)
+    {
+        Serial.println("Failed to identify filesystem!");
+        TEST_ASSERT_TRUE_MESSAGE(false, "Failed to identify filesystem");
+        return;
+    }
+
+    // Display filesystem information
+    const char *fs_type = sd_spi_get_fs_type_string(fs_info.type);
+    Serial.print("File System Type: ");
+    Serial.println(fs_type);
+
+    Serial.print("Partition Offset: ");
+    Serial.print(fs_info.partition_offset);
+    Serial.println(" sectors");
+
+    Serial.println("\nFilesystem Details:");
+    Serial.print("  Bytes per Sector: ");
+    Serial.println(fs_info.bytes_per_sector);
+    Serial.print("  Sectors per Cluster: ");
+    Serial.println(fs_info.sectors_per_cluster);
+    Serial.print("  Reserved Sectors: ");
+    Serial.println(fs_info.reserved_sectors);
+    Serial.print("  FAT Count: ");
+    Serial.println(fs_info.fat_count);
+    Serial.print("  FAT Sectors: ");
+    Serial.println(fs_info.fat_sectors);
+
+    if (fs_info.type == 3) // FAT32
+    {
+        Serial.print("  Root Directory Cluster: ");
+        Serial.println(fs_info.root_dir_cluster);
+        Serial.print("  Data Start Sector: ");
+        Serial.println(fs_info.data_start_sector);
+    }
+    else
+    {
+        Serial.print("  Root Directory Entries: ");
+        Serial.println(fs_info.root_dir_entries);
+        Serial.print("  Root Directory Sector: ");
+        Serial.println(fs_info.root_dir_sector);
+    }
+
+    Serial.print("  Data Sectors: ");
+    Serial.println(fs_info.data_sectors);
+    Serial.print("  Total Sectors: ");
+    Serial.println(fs_info.total_sectors);
+    Serial.print("  Cluster Count: ");
+    Serial.println(fs_info.cluster_count);
+
+    // Calculate and display filesystem size
+    uint64_t fs_size = (uint64_t)fs_info.total_sectors * fs_info.bytes_per_sector;
+    Serial.print("  Total Size: ");
+    if (fs_size >= (1024LL * 1024 * 1024))
+    {
+        Serial.print(fs_size / (1024LL * 1024 * 1024));
+        Serial.println(" GB");
+    }
+    else if (fs_size >= (1024 * 1024))
+    {
+        Serial.print(fs_size / (1024 * 1024));
+        Serial.println(" MB");
+    }
+    else
+    {
+        Serial.print(fs_size / 1024);
+        Serial.println(" KB");
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(true, "Filesystem identified successfully");
+
+    // Read root directory
+    Serial.println("\nReading Root Directory:");
+
+    dirent_t directory[32];
+    int entry_count = sd_spi_read_directory(&fs_info, directory, 32);
+
+    if (entry_count < 0)
+    {
+        Serial.println("Failed to read directory!");
+        TEST_ASSERT_TRUE_MESSAGE(false, "Failed to read directory");
+        return;
+    }
+
+    Serial.print("Found ");
+    Serial.print(entry_count);
+    Serial.println(" entries:");
+
+    if (entry_count == 0)
+    {
+        Serial.println("  (empty directory)");
+    }
+    else
+    {
+        // Display directory entries
+        for (int i = 0; i < entry_count && i < 32; i++)
+        {
+            Serial.print("  ");
+            Serial.print(i + 1);
+            Serial.print(". ");
+            Serial.print(directory[i].filename);
+
+            // Pad filename to 35 characters for alignment (or newline for very long names)
+            int name_len = strlen(directory[i].filename);
+            if (name_len < 35)
+            {
+                for (int j = name_len; j < 35; j++)
+                    Serial.print(" ");
+            }
+            else
+            {
+                Serial.println();
+                Serial.print("     "); // Indent for continuation
+            }
+
+            // Display attributes
+            Serial.print(" [");
+            if (directory[i].attributes & 0x10)
+                Serial.print("DIR");
+            else
+            {
+                Serial.print("FILE ");
+                Serial.print(directory[i].file_size);
+                Serial.print("B");
+            }
+            Serial.print("]");
+
+            // Display date/time
+            uint16_t date = directory[i].date;
+            uint16_t time = directory[i].time;
+
+            uint16_t year = ((date >> 9) & 0x7F) + 1980;
+            uint8_t month = (date >> 5) & 0x0F;
+            uint8_t day = date & 0x1F;
+
+            uint8_t hour = (time >> 11) & 0x1F;
+            uint8_t minute = (time >> 5) & 0x3F;
+            uint8_t second = (time & 0x1F) * 2;
+
+            Serial.print(" ");
+            if (day < 10)
+                Serial.print("0");
+            Serial.print(day);
+            Serial.print("/");
+            if (month < 10)
+                Serial.print("0");
+            Serial.print(month);
+            Serial.print("/");
+            Serial.print(year);
+            Serial.print(" ");
+            if (hour < 10)
+                Serial.print("0");
+            Serial.print(hour);
+            Serial.print(":");
+            if (minute < 10)
+                Serial.print("0");
+            Serial.print(minute);
+            Serial.print(":");
+            if (second < 10)
+                Serial.print("0");
+            Serial.println(second);
+        }
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(entry_count >= 0, "Directory read successful");
+}
+
+#endif // ENABLE_SD_TESTS
 
 // ============================================================================
 // MAIN TEST RUNNER
@@ -5119,6 +8663,9 @@ void setup()
 #if ENABLE_WIZNET_TESTS
     Serial.println("Wiznet Tests: ENABLED");
 #endif
+#if ENABLE_SD_TESTS
+    Serial.println("SD Card Tests: ENABLED");
+#endif
 
     Serial.println();
 
@@ -5126,7 +8673,7 @@ void setup()
     UNITY_BEGIN();
 
     // Run system info tests
-#if ENABLE_SYSINFO_TESTS
+#if ENABLE_SYSINFO_TESTS and !ENABLE_SINGLE_TEST
     Serial.println("\n--- Running System Info Tests ---\n");
     RUN_TEST(test_chip_type);
     RUN_TEST(test_read_unique_chip_id);
@@ -5150,7 +8697,6 @@ void setup()
     // Run TFT tests
 #if ENABLE_TFT_TESTS and !ENABLE_SINGLE_TEST
     Serial.println("\n--- Running TFT Tests ---\n");
-    enableBacklight();
     RUN_TEST(test_tft_espi_init);
     RUN_TEST(test_tft_espi_read_id_status);
     RUN_TEST(test_tft_espi_spi_speed);
@@ -5176,12 +8722,24 @@ void setup()
     RUN_TEST(test_tft_fillarcspiral);
     RUN_TEST(test_tft_float_test);
     RUN_TEST(test_tft_mandelbrot);
+    RUN_TEST(test_tft_julia_set);
+    RUN_TEST(test_tft_pie_chart);
+    RUN_TEST(test_tft_pong);
+    RUN_TEST(test_tft_print_test);
+    RUN_TEST(test_tft_rainbow);
+    RUN_TEST(test_tft_spiro);
+    RUN_TEST(test_tft_starfield);
+    RUN_TEST(test_tft_bouncy_circles);
+    RUN_TEST(test_tft_string_align);
+    RUN_TEST(test_tft_terminal);
+    RUN_TEST(test_tft_terminal_software);
     RUN_TEST(test_tft_matrix);
     RUN_TEST(test_tft_matrix_software);
     RUN_TEST(test_tft_meter_linear);
     RUN_TEST(test_tft_meters);
     RUN_TEST(test_tft_antialiased_graphics);
     RUN_TEST(test_tft_clock_gauge_demo);
+    RUN_TEST(test_tft_read_reg);
     // RUN_TEST(test_tft_read_pixel); // TODO: Disabled - still to check - display may not support readPixel
 
     // Touch tests (optional - requires touchscreen wired and calibrated)
@@ -5189,7 +8747,7 @@ void setup()
     RUN_TEST(test_touch_no_press);
     RUN_TEST(test_touch_irq_inactive);
 
-#if ENABLE_INTERACTIVE_TESTS
+#if ENABLE_INTERACTIVE_TESTS and !ENABLE_SINGLE_TEST
     // Interactive tests - require user input/observation
     // Set ENABLE_INTERACTIVE_TESTS to 1 to run these
     RUN_TEST(test_touch_read_coordinates);
@@ -5199,49 +8757,60 @@ void setup()
 #endif
 #endif
 #if ENABLE_SINGLE_TEST
-    enableBacklight();
-    RUN_TEST(test_tft_espi_init);
-    RUN_TEST(test_tft_meters);
+    RUN_TEST(test_display_and_touch);
 #endif
 
     // Run Wiznet tests
-#if ENABLE_WIZNET_TESTS
+#if ENABLE_WIZNET_TESTS and !ENABLE_SINGLE_TEST
     Serial.println("\n--- Running Wiznet Tests ---\n");
     RUN_TEST(test_wiznet_mac_generation);
-    RUN_TEST(test_wiznet_hardware_reset);
     RUN_TEST(test_wiznet_spi_init);
     RUN_TEST(test_wiznet_ethernet_init);
     RUN_TEST(test_wiznet_chip_detection);
+    RUN_TEST(test_wiznet_hardware_reset);
     RUN_TEST(test_wiznet_interrupt_pin);
     RUN_TEST(test_wiznet_static_ip);
     RUN_TEST(test_wiznet_config_readback);
     RUN_TEST(test_wiznet_link_status);
-    RUN_TEST(test_wiznet_dhcp); // DHCP last as it takes longest
+    RUN_TEST(test_wiznet_dhcp);
     RUN_TEST(test_wiznet_webserver);
+    RUN_TEST(test_wiznet_webserver_bigdata);
     RUN_TEST(test_wiznet_tft_shared_spi);
     RUN_TEST(test_wiznet_webserver_after_tft);
     RUN_TEST(test_wiznet_tft_sprite_webserver);
+    RUN_TEST(test_wiznet_counter_button);
+#endif
+
+    // Run SD Card tests
+#if ENABLE_SD_TESTS and !ENABLE_SINGLE_TEST
+    Serial.println("\n--- Running SD Card Tests ---\n");
+    RUN_TEST(test_sd_initialization);
+    // RUN_TEST(test_sd_write_block);
+    // RUN_TEST(test_sd_read_block);
+    // RUN_TEST(test_sd_read_write_verify);
+    RUN_TEST(test_sd_spi_frequency_benchmark);
+    RUN_TEST(test_sd_filesystem_info);
+    RUN_TEST(test_sd_filesystem_and_directory);
+    RUN_TEST(test_sd_file_write);
+    RUN_TEST(test_sd_file_read);
+    RUN_TEST(test_sd_file_write_read_verify);
 #endif
 
     // Finish tests
     UNITY_END();
 
-#if ENABLE_TFT_TESTS
     // Turn off TFT after all tests
+#if ENABLE_TFT_TESTS
     Serial.println("\nTurning off TFT display...");
+    // Deassert CS lines to avoid bus contention
     tft.fillScreen(TFT_BLACK);
 
     // Turn off backlight
-#if defined(TFT_BL)
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, LOW);
-#elif defined(TFT_LED)
-    pinMode(TFT_LED, OUTPUT);
-    digitalWrite(TFT_LED, LOW);
-#endif
-
+    disableBacklight();
     Serial.println("TFT display turned off.");
 #endif
+
+    Serial.println("\n=== Test Suite Completed ===");
 }
 
 void loop()

@@ -3,7 +3,7 @@
 
 <head>
   <title>Sensor Data Live Chart</title>
-  <script src="https://code.highcharts.com/highcharts.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highcharts@11/highcharts.js"></script>
   <meta http-equiv="refresh" content="3600">
   <style>
     body {
@@ -57,7 +57,9 @@
     &nbsp;|&nbsp;
     Network: <span id="nettype">unknown</span>
     &nbsp;|&nbsp;
-    Display Mode: <span id="current-mode">3</span><br>
+    Display Mode: <span id="current-mode">3</span>
+    &nbsp;|&nbsp;
+    Charts: <span id="highcharts-status" style="color: #ff9800;">Loading...</span><br>
     Spectrogram Scale: <span id="spectrogram-scale">---</span><br>
     Log Level:
     <select id="loglevel-select" onchange="setLogLevel()" style="margin-left:8px;">
@@ -98,6 +100,25 @@
         <button class="stream-btn" onclick="startCalibration()">Calibrate Touch</button><br>
         <button id="calibDataBtn" class="stream-btn" onclick="toggleCalibrationData()">Show Calibration Data</button>
       </div>
+      <div style="margin-top: 20px;">
+        <h3 style="margin: 5px 0;">Data Recording</h3>
+        <button id="miniseedBtn" class="stream-btn disabled" onclick="toggleMiniSEED()">miniSEED: OFF</button><br>
+        <label for="miniseedFormat" style="display:block; margin-top:8px; color:#444;">Format:</label>
+        <select id="miniseedFormat" onchange="setMiniSEEDFormat()" style="margin-top:4px;">
+          <option value="v2" selected>miniSEED v2</option>
+          <option value="v3">miniSEED v3</option>
+        </select>
+        <small style="color: #666; display: block; margin-top: 5px;">Records to SD card in Raspberry Shake<br>compatible
+          miniSEED format</small>
+      </div>
+      <div style="margin-top: 15px;">
+        <h3 style="margin: 5px 0;">SD Card Management</h3>
+        <button id="unmountBtn" class="stream-btn" onclick="unmountSDCard()" style="background: #ff9800;">Unmount SD
+          Card</button><br>
+        <button id="viewMseedBtn" class="stream-btn" onclick="openMseedViewer()" style="background: #2196F3; margin-top: 8px;">View MiniSEED Files</button><br>
+        <small style="color: #666; display: block; margin-top: 5px;">Safely unmount SD card before removal<br>(flushes
+          buffers, closes files)</small>
+      </div>
       <div id="calibDataDisplay" style="margin-top: 10px; display: none; max-width: 400px;">
         <h4 style="margin: 5px 0;">Calibration Data:</h4>
         <pre id="calibDataContent"
@@ -127,6 +148,24 @@
     </div>
   </div>
   <script>
+    // Check if Highcharts loaded successfully and report to server
+    (function () {
+      const statusEl = document.getElementById('highcharts-status');
+      if (typeof Highcharts !== 'undefined') {
+        console.log('Highcharts loaded successfully');
+        statusEl.textContent = 'OK';
+        statusEl.style.color = '#4caf50';
+        fetch('/highcharts?status=ok')
+          .catch(err => console.warn('Could not report Highcharts status:', err));
+      } else {
+        console.error('Highcharts failed to load');
+        statusEl.textContent = 'FAILED';
+        statusEl.style.color = '#f44336';
+        fetch('/highcharts?status=error')
+          .catch(err => console.warn('Could not report Highcharts error:', err));
+      }
+    })();
+
     Highcharts.setOptions({
       global: {
         useUTC: false
@@ -140,6 +179,9 @@
       accelY: false,
       accelZ: false
     };
+
+    let miniSeedRecording = false;
+    let miniSeedFormat = 'v2';
 
     let showSIUnits = true;
 
@@ -176,12 +218,117 @@
       fetch('/udpstream?channel=' + channel + '&enable=' + (udpStreams[channel] ? 1 : 0));
     }
 
+    function toggleMiniSEED() {
+      miniSeedRecording = !miniSeedRecording;
+      const btn = document.getElementById('miniseedBtn');
+      const selectedFormat = document.getElementById('miniseedFormat').value;
+      if (miniSeedRecording) {
+        btn.classList.remove("disabled");
+        btn.classList.add("enabled");
+        btn.textContent = "miniSEED: ON";
+      } else {
+        btn.classList.remove("enabled");
+        btn.classList.add("disabled");
+        btn.textContent = "miniSEED: OFF";
+      }
+      fetch('/miniseed?enable=' + (miniSeedRecording ? 1 : 0) + '&format=' + selectedFormat)
+        .then(response => response.json())
+        .then(result => {
+          console.log('miniSEED control result:', result);
+          miniSeedRecording = !!result.miniSeedRecording;
+          if (result.miniSeedFormat) {
+            miniSeedFormat = result.miniSeedFormat;
+            document.getElementById('miniseedFormat').value = miniSeedFormat;
+          }
+
+          if (miniSeedRecording) {
+            btn.classList.remove("disabled");
+            btn.classList.add("enabled");
+            btn.textContent = "miniSEED: ON";
+          } else {
+            btn.classList.remove("enabled");
+            btn.classList.add("disabled");
+            btn.textContent = "miniSEED: OFF";
+          }
+        })
+        .catch(error => {
+          console.error('Error toggling miniSEED:', error);
+        });
+    }
+
+    function setMiniSEEDFormat() {
+      const selectedFormat = document.getElementById('miniseedFormat').value;
+      fetch('/miniseed?format=' + selectedFormat)
+        .then(response => response.json())
+        .then(result => {
+          console.log('miniSEED format result:', result);
+          if (result.miniSeedFormat) {
+            miniSeedFormat = result.miniSeedFormat;
+            document.getElementById('miniseedFormat').value = miniSeedFormat;
+          }
+          if (result.miniSeedRecording !== undefined) {
+            miniSeedRecording = !!result.miniSeedRecording;
+          }
+        })
+        .catch(error => {
+          console.error('Error setting miniSEED format:', error);
+        });
+    }
+
+    function unmountSDCard() {
+      const btn = document.getElementById('unmountBtn');
+      btn.disabled = true;
+      btn.textContent = "Unmounting...";
+      btn.style.background = "#999";
+
+      fetch('/sdunmount')
+        .then(response => response.json())
+        .then(result => {
+          console.log('SD unmount result:', result);
+          if (result.success) {
+            btn.textContent = "✓ SD Card Unmounted";
+            btn.style.background = "#4caf50";
+            miniSeedRecording = false;
+            const miniBtn = document.getElementById('miniseedBtn');
+            miniBtn.classList.remove("enabled");
+            miniBtn.classList.add("disabled");
+            miniBtn.textContent = "miniSEED: OFF";
+            alert('SD card safely unmounted. You can now remove it.');
+          } else {
+            btn.textContent = "✗ Unmount Failed";
+            btn.style.background = "#f44336";
+            alert('Error: ' + (result.message || 'Unknown error'));
+            setTimeout(() => {
+              btn.disabled = false;
+              btn.textContent = "Unmount SD Card";
+              btn.style.background = "#ff9800";
+            }, 3000);
+          }
+        })
+        .catch(error => {
+          console.error('Error unmounting SD card:', error);
+          btn.textContent = "✗ Network Error";
+          btn.style.background = "#f44336";
+          alert('Network error during unmount');
+          setTimeout(() => {
+            btn.disabled = false;
+            btn.textContent = "Unmount SD Card";
+            btn.style.background = "#ff9800";
+          }, 3000);
+        });
+    }
+
+    function openMseedViewer() {
+      window.open('/mseedviewer', '_blank');
+    }
+
     function setMode(newMode) {
       fetch('/setmode?mode=' + newMode)
         .then(response => response.text())
         .then(result => {
           console.log('Mode set result:', result);
           document.getElementById('current-mode').textContent = newMode;
+          updateModeButtons(newMode);
         })
         .catch(error => {
           console.error('Error setting mode:', error);
@@ -353,10 +500,10 @@
             // Update mode button highlighting
             updateModeButtons(d.mode);
 
-            // Hide/show charts based on mode: show only when display is off (mode -1)
+            // Always show charts on web interface
             const chartContainer = document.getElementById('chart-container');
             if (chartContainer) {
-              chartContainer.style.display = (d.mode === -1) ? 'block' : 'none';
+              chartContainer.style.display = 'block';
             }
 
             // Update spectrogram scale only when in mode 3
@@ -370,6 +517,25 @@
           // Update axis field if present in JSON
           if (d.axis) {
             updateAxisButtons(d.axis);
+          }
+
+          if (d.miniSeedRecording !== undefined) {
+            miniSeedRecording = !!d.miniSeedRecording;
+            const miniBtn = document.getElementById('miniseedBtn');
+            if (miniSeedRecording) {
+              miniBtn.classList.remove('disabled');
+              miniBtn.classList.add('enabled');
+              miniBtn.textContent = 'miniSEED: ON';
+            } else {
+              miniBtn.classList.remove('enabled');
+              miniBtn.classList.add('disabled');
+              miniBtn.textContent = 'miniSEED: OFF';
+            }
+          }
+
+          if (d.miniSeedFormat) {
+            miniSeedFormat = d.miniSeedFormat;
+            document.getElementById('miniseedFormat').value = miniSeedFormat;
           }
         });
     }

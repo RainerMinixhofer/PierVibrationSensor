@@ -190,32 +190,109 @@ extern "C"
     int sd_spi_read_directory(const fs_info_t *fs_info, dirent_t *entries, int max_entries);
 
     /**
-     * @brief Simple file write - creates/overwrites a file with data
+     * @brief Read directory entries for a specific path
+     * @param fs_info Filesystem info from sd_spi_identify_filesystem()
+     * @param path Directory path (e.g., "/data/miniseed")
+     * @param entries Array to store directory entries
+     * @param max_entries Maximum number of entries to read
+     * @return Number of entries read, or -1 on error
+     */
+    int sd_spi_read_directory_path(const fs_info_t *fs_info, const char *path, dirent_t *entries, int max_entries);
+
+    /**
+     * @brief Create a directory in the filesystem
      * @param fs_info Filesystem info
-     * @param filename Filename to create (8.3 format)
+     * @param path Directory path (e.g., "DIRNAME" or "DIR1/DIR2")
+     * @return true if successful, false otherwise
+     */
+    bool sd_spi_create_directory(const fs_info_t *fs_info, const char *path);
+
+    /**
+     * @brief File write with full FAT filesystem support (overwrite/create)
+     * @param fs_info Filesystem info
+     * @param filepath Full file path (e.g., "DIR1/DIR2/FILE.TXT")
      * @param data Data buffer to write
      * @param size Size of data to write
      * @return Number of bytes written, or -1 on error
      */
-    int sd_spi_write_file(const fs_info_t *fs_info, const char *filename, const uint8_t *data, uint32_t size);
+    int sd_spi_write_file(const fs_info_t *fs_info, const char *filepath, const uint8_t *data, uint32_t size);
 
     /**
-     * @brief Simple file read - reads data from an existing file
+     * @brief Append data to an existing file (or create file if it does not exist)
      * @param fs_info Filesystem info
-     * @param filename Filename to read (8.3 format)
+     * @param filepath Full file path (e.g., "DIR1/DIR2/FILE.TXT")
+     * @param data Data buffer to append
+     * @param size Size of data to append
+     * @return Number of appended bytes, or -1 on error
+     * @note WARNING: This function reads entire file into RAM then writes it back. Use sd_spi_append_file_fast() for large files.
+     */
+    int sd_spi_append_file(const fs_info_t *fs_info, const char *filepath, const uint8_t *data, uint32_t size);
+
+    /**
+     * @brief Efficiently append data to an existing file without reading it
+     * @param fs_info Filesystem info
+     * @param filepath Full file path (e.g., "DIR1/DIR2/FILE.TXT")
+     * @param data Data buffer to append
+     * @param size Size of data to append
+     * @return Number of appended bytes, or -1 on error
+     * @note This function performs true incremental append without loading the entire file into RAM.
+     */
+    int sd_spi_append_file_fast(const fs_info_t *fs_info, const char *filepath, const uint8_t *data, uint32_t size);
+
+    /**
+     * @brief File read with full FAT filesystem support
+     * @param fs_info Filesystem info
+     * @param filepath Full file path (e.g., "DIR1/DIR2/FILE.TXT")
      * @param buffer Buffer to store read data
      * @param max_size Maximum bytes to read
      * @return Number of bytes read, or -1 on error
      */
-    int sd_spi_read_file(const fs_info_t *fs_info, const char *filename, uint8_t *buffer, uint32_t max_size);
+    int sd_spi_read_file(const fs_info_t *fs_info, const char *filepath, uint8_t *buffer, uint32_t max_size);
 
     /**
-     * @brief Delete a file from the filesystem
+     * @brief Read a chunk of a file from a specific offset
      * @param fs_info Filesystem info
-     * @param filename Filename to delete (8.3 format)
+     * @param filepath Full file path (e.g., "DIR1/DIR2/FILE.TXT")
+     * @param offset Byte offset into file
+     * @param buffer Buffer to store read data
+     * @param max_size Maximum bytes to read
+     * @return Number of bytes read, 0 if offset past EOF, or -1 on error
+     */
+    int sd_spi_read_file_chunk(const fs_info_t *fs_info, const char *filepath, uint32_t offset,
+                               uint8_t *buffer, uint32_t max_size);
+
+    /**
+     * @brief Get file size for a path
+     * @param fs_info Filesystem info
+     * @param filepath Full file path
+     * @param size_out Output file size in bytes
+     * @return true if file exists and size was obtained, false otherwise
+     */
+    bool sd_spi_get_file_size(const fs_info_t *fs_info, const char *filepath, uint32_t *size_out);
+
+    /**
+     * @brief Delete a file from the filesystem (with path support)
+     * @param fs_info Filesystem info
+     * @param filepath File path to delete (e.g., "DIR1/DIR2/FILE.TXT")
      * @return true if successful, false otherwise
      */
-    bool sd_spi_delete_file(const fs_info_t *fs_info, const char *filename);
+    bool sd_spi_delete_file(const fs_info_t *fs_info, const char *filepath);
+
+    /**
+     * @brief Check if a directory exists
+     * @param fs_info Filesystem info
+     * @param path Directory path to check
+     * @return true if directory exists, false otherwise
+     */
+    bool sd_spi_directory_exists(const fs_info_t *fs_info, const char *path);
+
+    /**
+     * @brief Check if a file exists
+     * @param fs_info Filesystem info
+     * @param filepath File path to check
+     * @return true if file exists, false otherwise
+     */
+    bool sd_spi_file_exists(const fs_info_t *fs_info, const char *filepath);
 
 #ifdef __cplusplus
 }

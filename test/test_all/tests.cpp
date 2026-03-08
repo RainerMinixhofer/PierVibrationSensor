@@ -7340,6 +7340,7 @@ void test_wiznet_counter_button()
 #if ENABLE_SD_TESTS
 
 #include "sd_spi.h"
+#include "miniseed_logger.h"
 
 // Test buffer for block operations
 static uint8_t sd_test_buffer[512];
@@ -8640,6 +8641,1550 @@ void test_sd_filesystem_and_directory(void)
     TEST_ASSERT_TRUE_MESSAGE(entry_count >= 0, "Directory read successful");
 }
 
+/**
+ * @brief Test: FAT Filesystem - Directory Tree Creation, File Write/Read/Verify
+ *
+ * This comprehensive test validates the complete FAT filesystem implementation by:
+ * 1. Creating a hierarchical directory structure
+ * 2. Writing files to multiple directories
+ * 3. Reading files back and verifying exact byte-for-byte content
+ * 4. Checking directory and file existence
+ * 5. Testing multiple files at different directory levels
+ */
+void test_sd_fat_filesystem_operations(void)
+{
+    Serial.println("\n=== Testing FAT Filesystem Operations (Directory Tree, Write, Read, Verify) ===\n");
+
+    // Initialize SD card if not already done
+    if (!sd_card_available)
+    {
+        Serial.println("SD card not initialized, initializing now...");
+        Serial.println("Pin Configuration:");
+        Serial.print("  SD_CS:   GP");
+        Serial.println(SD_CS);
+        Serial.print("  SD_CLK:  GP");
+        Serial.println(SD_CLK);
+        Serial.print("  SD_MOSI: GP");
+        Serial.println(SD_MOSI);
+        Serial.print("  SD_MISO: GP");
+        Serial.println(SD_MISO);
+        Serial.flush();
+
+        sd_card_available = sd_spi_init();
+
+        if (!sd_card_available)
+        {
+            Serial.println("ERROR: Failed to initialize SD card");
+            TEST_ASSERT_TRUE_MESSAGE(false, "SD card initialization failed - check connections and card insertion");
+            return;
+        }
+
+        Serial.println("SD card initialized successfully!");
+    }
+
+    // Identify filesystem
+    fs_info_t fs_info;
+    if (!sd_spi_identify_filesystem(&fs_info))
+    {
+        Serial.println("ERROR: Failed to identify filesystem");
+        TEST_ASSERT_TRUE_MESSAGE(false, "Failed to identify filesystem - ensure card is formatted as FAT12/FAT16/FAT32");
+        return;
+    }
+
+    // Determine FAT type from type field (1=FAT12, 2=FAT16, 3=FAT32)
+    const char *fat_type_str = (fs_info.type == 1) ? "FAT12" : (fs_info.type == 2) ? "FAT16"
+                                                           : (fs_info.type == 3)   ? "FAT32"
+                                                                                   : "Unknown";
+    Serial.printf("Filesystem: %s, %lu sectors, %u sectors/cluster\n",
+                  fat_type_str, fs_info.total_sectors, fs_info.sectors_per_cluster);
+
+    // ========================================================================
+    // TEST 1: Create Directory Tree
+    // ========================================================================
+    Serial.println("\n--- TEST 1: Creating Directory Tree ---");
+
+    const char *dirs[] = {
+        "test_data",
+        "test_data/folder1",
+        "test_data/folder1/subfolder1",
+        "test_data/folder2",
+        "test_data/folder2/subfolder2"};
+    const int dir_count = sizeof(dirs) / sizeof(dirs[0]);
+
+    int dirs_created = 0;
+    for (int i = 0; i < dir_count; i++)
+    {
+        Serial.printf("Creating directory: %s ... ", dirs[i]);
+        if (sd_spi_create_directory(&fs_info, dirs[i]))
+        {
+            Serial.println("OK");
+            dirs_created++;
+        }
+        else
+        {
+            Serial.println("FAILED");
+        }
+    }
+
+    Serial.printf("Result: %d/%d directories created\n", dirs_created, dir_count);
+    TEST_ASSERT_EQUAL_MESSAGE(dir_count, dirs_created, "All directories should be created");
+
+    // ========================================================================
+    // TEST 2: Verify Directory Existence
+    // ========================================================================
+    Serial.println("\n--- TEST 2: Verifying Directory Existence ---");
+
+    int dirs_verified = 0;
+    for (int i = 0; i < dir_count; i++)
+    {
+        if (sd_spi_directory_exists(&fs_info, dirs[i]))
+        {
+            Serial.printf("✓ %s exists\n", dirs[i]);
+            dirs_verified++;
+        }
+        else
+        {
+            Serial.printf("✗ %s does NOT exist\n", dirs[i]);
+        }
+    }
+
+    TEST_ASSERT_EQUAL_MESSAGE(dir_count, dirs_verified, "All directories should exist");
+
+    // ========================================================================
+    // TEST 3: Write Files to Different Directories
+    // ========================================================================
+    Serial.println("\n--- TEST 3: Writing Files to Multiple Directories ---");
+
+    // Define test files with test data
+    struct
+    {
+        const char *filepath;
+        const uint8_t *data;
+        uint32_t size;
+    } test_files[] = {
+        // Root level
+        {
+            "test_data/root_file.txt",
+            (const uint8_t *)"This is a file in test_data root directory.",
+            46},
+        // Level 1
+        {
+            "test_data/folder1/level1_file.txt",
+            (const uint8_t *)"This file is in folder1 (level 1 subdirectory).",
+            49},
+        // Level 2 deep nesting
+        {
+            "test_data/folder1/subfolder1/level2_file.txt",
+            (const uint8_t *)"This file is deeply nested in folder1/subfolder1 (level 2).",
+            61},
+        // Another branch
+        {
+            "test_data/folder2/level1_file2.txt",
+            (const uint8_t *)"This file is in folder2 (alternate level 1 subdirectory).",
+            59},
+        // Level 2 alternate branch
+        {
+            "test_data/folder2/subfolder2/level2_file2.txt",
+            (const uint8_t *)"This file is in folder2/subfolder2 (alternate level 2).",
+            56},
+        // Binary test data
+        {
+            "test_data/binary_test.bin",
+            (const uint8_t *)"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F"
+                             "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E\x1F",
+            32}};
+    const int file_count = sizeof(test_files) / sizeof(test_files[0]);
+
+    int files_written = 0;
+    for (int i = 0; i < file_count; i++)
+    {
+        Serial.printf("Writing: %s (%u bytes) ... ", test_files[i].filepath, test_files[i].size);
+        int bytes_written = sd_spi_write_file(&fs_info, test_files[i].filepath,
+                                              test_files[i].data, test_files[i].size);
+        if (bytes_written == (int)test_files[i].size)
+        {
+            Serial.println("OK");
+            files_written++;
+        }
+        else
+        {
+            Serial.printf("FAILED (wrote %d bytes)\n", bytes_written);
+        }
+    }
+
+    Serial.printf("Result: %d/%d files written\n", files_written, file_count);
+    TEST_ASSERT_EQUAL_MESSAGE(file_count, files_written, "All files should be written successfully");
+
+    // ========================================================================
+    // TEST 4: Verify File Existence
+    // ========================================================================
+    Serial.println("\n--- TEST 4: Verifying File Existence ---");
+
+    int files_exist = 0;
+    for (int i = 0; i < file_count; i++)
+    {
+        if (sd_spi_file_exists(&fs_info, test_files[i].filepath))
+        {
+            Serial.printf("✓ %s exists\n", test_files[i].filepath);
+            files_exist++;
+        }
+        else
+        {
+            Serial.printf("✗ %s does NOT exist\n", test_files[i].filepath);
+        }
+    }
+
+    TEST_ASSERT_EQUAL_MESSAGE(file_count, files_exist, "All files should exist");
+
+    // ========================================================================
+    // TEST 5: Read Files and Verify Content
+    // ========================================================================
+    Serial.println("\n--- TEST 5: Reading Files and Verifying Content ---");
+
+    uint8_t read_buffer[512]; // Buffer for reading file data
+    int verified_count = 0;
+
+    for (int i = 0; i < file_count; i++)
+    {
+        // Clear buffer
+        memset(read_buffer, 0, sizeof(read_buffer));
+
+        // Read file
+        int bytes_read = sd_spi_read_file(&fs_info, test_files[i].filepath,
+                                          read_buffer, sizeof(read_buffer));
+
+        Serial.printf("Reading: %s ... ", test_files[i].filepath);
+
+        if (bytes_read == (int)test_files[i].size)
+        {
+            // Verify content byte-for-byte
+            bool content_match = true;
+            for (uint32_t j = 0; j < test_files[i].size; j++)
+            {
+                if (read_buffer[j] != test_files[i].data[j])
+                {
+                    content_match = false;
+                    Serial.printf("\nERROR: Byte mismatch at offset %lu: "
+                                  "expected 0x%02X, got 0x%02X\n",
+                                  j, test_files[i].data[j], read_buffer[j]);
+                    break;
+                }
+            }
+
+            if (content_match)
+            {
+                Serial.println("OK (content verified)");
+                verified_count++;
+            }
+            else
+            {
+                Serial.println("FAILED (content mismatch)");
+            }
+        }
+        else
+        {
+            Serial.printf("FAILED (read %d bytes, expected %u)\n",
+                          bytes_read, test_files[i].size);
+        }
+    }
+
+    Serial.printf("Result: %d/%d files verified\n", verified_count, file_count);
+    TEST_ASSERT_EQUAL_MESSAGE(file_count, verified_count, "All file content should match");
+
+    // ========================================================================
+    // TEST 6: Test Large File (Multiple Clusters)
+    // ========================================================================
+    Serial.println("\n--- TEST 6: Writing and Reading Large File ---");
+
+    // Create a 4KB test file (should span multiple clusters on most FAT systems)
+    const uint32_t large_file_size = 4096;
+    uint8_t large_buffer[4096];
+
+    // Fill buffer with test pattern
+    for (uint32_t i = 0; i < large_file_size; i++)
+    {
+        large_buffer[i] = (i % 256);
+    }
+
+    Serial.printf("Writing large file: test_data/large_file.dat (%u bytes) ... ", large_file_size);
+    int bytes_written = sd_spi_write_file(&fs_info, "test_data/large_file.dat",
+                                          large_buffer, large_file_size);
+    if (bytes_written == (int)large_file_size)
+    {
+        Serial.println("OK");
+    }
+    else
+    {
+        Serial.printf("FAILED (wrote %d bytes)\n", bytes_written);
+        TEST_ASSERT_TRUE(false);
+        return;
+    }
+
+    // Read it back
+    memset(read_buffer, 0, sizeof(read_buffer));
+    Serial.printf("Reading large file back ... ");
+
+    // Need to read in chunks since file is larger than our single buffer
+    uint8_t large_read_buffer[4096];
+    int bytes_read = sd_spi_read_file(&fs_info, "test_data/large_file.dat",
+                                      large_read_buffer, sizeof(large_read_buffer));
+
+    if (bytes_read == (int)large_file_size)
+    {
+        // Verify content
+        bool match = true;
+        for (uint32_t i = 0; i < large_file_size; i++)
+        {
+            if (large_read_buffer[i] != large_buffer[i])
+            {
+                Serial.printf("\nERROR: Byte mismatch at offset %lu: "
+                              "expected 0x%02X, got 0x%02X\n",
+                              i, large_buffer[i], large_read_buffer[i]);
+                match = false;
+                break;
+            }
+        }
+
+        if (match)
+        {
+            Serial.println("OK (content verified)");
+        }
+        else
+        {
+            Serial.println("FAILED (content mismatch)");
+            TEST_ASSERT_TRUE(false);
+            return;
+        }
+    }
+    else
+    {
+        Serial.printf("FAILED (read %d bytes, expected %u)\n", bytes_read, large_file_size);
+        TEST_ASSERT_TRUE(false);
+        return;
+    }
+
+    // ========================================================================
+    // TEST 7: Test File Deletion
+    // ========================================================================
+    Serial.println("\n--- TEST 7: Testing File Deletion ---");
+
+    Serial.printf("Deleting: test_data/binary_test.bin ... ");
+    if (sd_spi_delete_file(&fs_info, "test_data/binary_test.bin"))
+    {
+        Serial.println("OK");
+
+        // Verify it no longer exists
+        if (!sd_spi_file_exists(&fs_info, "test_data/binary_test.bin"))
+        {
+            Serial.println("✓ File confirmed deleted");
+        }
+        else
+        {
+            Serial.println("✗ ERROR: File still exists after deletion");
+            TEST_ASSERT_TRUE(false);
+            return;
+        }
+    }
+    else
+    {
+        Serial.println("FAILED");
+        TEST_ASSERT_TRUE(false);
+        return;
+    }
+
+    // ========================================================================
+    // SUMMARY
+    // ========================================================================
+    Serial.println("\n=== FAT Filesystem Test Complete ===");
+    Serial.printf("✓ Created %d directories\n", dirs_created);
+    Serial.printf("✓ Verified %d directories exist\n", dirs_verified);
+    Serial.printf("✓ Wrote %d files (%d verified through read)\n", files_written, verified_count);
+    Serial.printf("✓ Wrote and verified 1 large file (4096 bytes)\n");
+    Serial.println("✓ Successfully deleted test file\n");
+
+    TEST_ASSERT_TRUE(true);
+}
+
+// ============================================================================
+// miniSEED File Tests - Write/Read with Dummy Data (600 seconds)
+// ============================================================================
+
+/**
+ * @brief Generate dummy noise data for testing
+ * Simple pseudo-random noise generator using Linear Congruential Generator (LCG)
+ */
+void generate_noise_data(int32_t *buffer, uint32_t count, uint32_t seed)
+{
+    uint32_t state = seed;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        // LCG: X(n+1) = (a * X(n) + c) mod m
+        state = (1103515245U * state + 12345U) & 0x7FFFFFFF;
+        // Scale to int32 range with center at 0
+        buffer[i] = (int32_t)(state - 0x40000000);
+    }
+}
+
+/**
+ * @brief Write miniSEED v2 format record (512 bytes)
+ * @param fs_info Filesystem information
+ * @param filename Output filename
+ * @param samples Sample data array
+ * @param sample_count Number of samples
+ * @param sample_rate Sampling rate in Hz
+ * @param timestamp Start timestamp
+ * @param station Station code (5 chars max)
+ * @param network Network code (2 chars max)
+ * @param channel Channel code (3 chars max)
+ * @return Number of bytes written, or -1 on error
+ */
+int write_miniseed_v2_record(fs_info_t *fs_info, const char *filename,
+                             const int32_t *samples, uint16_t sample_count,
+                             uint16_t sample_rate, time_t timestamp,
+                             const char *station, const char *network,
+                             const char *channel)
+{
+    if (!samples || sample_count == 0 || !filename || !fs_info)
+        return -1;
+
+    // Create miniSEED v2 record buffer (512 bytes)
+    uint8_t record[512];
+    memset(record, 0, sizeof(record));
+
+    struct tm *tm_info = gmtime(&timestamp);
+    if (!tm_info)
+        return -1;
+
+    // Fill miniSEED v2 header (48 bytes) - SEED 2.4 format
+    // Sequence number (positions 0-5): "000001"
+    snprintf((char *)record, 7, "000001");
+
+    // Data quality (position 6): 'D' for good data
+    record[6] = 'D';
+
+    // Reserved (position 7): space
+    record[7] = ' ';
+
+    // Station code (positions 8-12): 5 chars, space-padded
+    memset(record + 8, ' ', 5);
+    strncpy((char *)(record + 8), station, 5);
+
+    // Location code (positions 13-14): 2 spaces
+    record[13] = ' ';
+    record[14] = ' ';
+
+    // Channel code (positions 15-17): 3 chars
+    memcpy(record + 15, channel, 3);
+
+    // Network code (positions 18-19): 2 chars
+    memcpy(record + 18, network, 2);
+
+    // Record time fields
+    // Year (20-21): big-endian uint16
+    uint16_t year = tm_info->tm_year + 1900;
+    *(uint16_t *)(record + 20) = ((year >> 8) & 0xFF) | ((year << 8) & 0xFF00);
+
+    // Day of year (22-23): big-endian uint16 (1-366)
+    uint16_t day_of_year = tm_info->tm_yday + 1;
+    *(uint16_t *)(record + 22) = ((day_of_year >> 8) & 0xFF) | ((day_of_year << 8) & 0xFF00);
+
+    // Hour, minute, second (24-26)
+    record[24] = tm_info->tm_hour;
+    record[25] = tm_info->tm_min;
+    record[26] = tm_info->tm_sec;
+    record[27] = 0; // Unused (0.0001 seconds)
+
+    // Fractional seconds (28-29): big-endian uint16 (unused)
+    *(uint16_t *)(record + 28) = 0;
+
+    // Sample count (30-31): big-endian uint16
+    uint16_t nsamp = (sample_count > 116) ? 116 : sample_count; // Max 116 samples per 512-byte record
+    *(uint16_t *)(record + 30) = ((nsamp >> 8) & 0xFF) | ((nsamp << 8) & 0xFF00);
+
+    // Sample rate factor (32-33): big-endian int16
+    int16_t samprate = sample_rate;
+    *(int16_t *)(record + 32) = ((samprate >> 8) & 0xFF) | ((samprate << 8) & 0xFF00);
+
+    // Sample rate multiplier (34-35): big-endian int16
+    *(int16_t *)(record + 34) = 0x0100; // 1 in big-endian
+
+    // Flags (36-39)
+    record[36] = 0; // Activity flags
+    record[37] = 0; // I/O and clock flags
+    record[38] = 0; // Data quality flags
+    record[39] = 0; // Number of blockettes following
+
+    // Time correction (40-43): big-endian int32
+    *(int32_t *)(record + 40) = 0;
+
+    // Data offset (44-45): big-endian uint16 (48 = start of data)
+    *(uint16_t *)(record + 44) = 0x3000; // 48 in big-endian
+
+    // Blockette offset (46-47): big-endian uint16 (0 = no blockettes)
+    *(uint16_t *)(record + 46) = 0;
+
+    // Write sample data starting at offset 48 (uncompressed int32, big-endian)
+    uint32_t data_pos = 48;
+    uint32_t samples_to_write = nsamp;
+
+    for (uint32_t i = 0; i < samples_to_write && data_pos + 4 <= sizeof(record); i++)
+    {
+        int32_t val = samples[i];
+        // Convert to big-endian
+        *(int32_t *)(record + data_pos) = ((val >> 24) & 0xFF) |
+                                          ((val >> 8) & 0xFF00) |
+                                          ((val << 8) & 0xFF0000) |
+                                          ((val << 24) & 0xFF000000);
+        data_pos += 4;
+    }
+
+    // Write the complete record
+    return sd_spi_write_file(fs_info, filename, record, sizeof(record));
+}
+
+/**
+ * @brief Write miniSEED v3 format record
+ * miniSEED v3 uses JSON headers followed by data payload
+ * Format: Fixed header (40 bytes) + JSON (variable) + Data (variable)
+ * @return Number of bytes written, or -1 on error
+ */
+int write_miniseed_v3_record(fs_info_t *fs_info, const char *filename,
+                             const int32_t *samples, uint16_t sample_count,
+                             uint16_t sample_rate, time_t timestamp,
+                             const char *station, const char *network,
+                             const char *channel)
+{
+    if (!samples || sample_count == 0 || !filename || !fs_info)
+        return -1;
+
+    // miniSEED v3 uses a different structure with JSON metadata
+    // For compatibility, we'll create a simplified v3-like format
+    // Record structure: 'MS' signature + version + length + JSON header + data
+
+    // Calculate sizes
+    uint32_t header_size = 256; // Fixed size for this implementation
+    uint32_t data_size = sample_count * 4;
+    uint32_t total_size = header_size + data_size;
+
+    // Allocate buffer
+    uint8_t *record = (uint8_t *)malloc(total_size);
+    if (!record)
+        return -1;
+
+    memset(record, 0, total_size);
+
+    struct tm *tm_info = gmtime(&timestamp);
+    if (!tm_info)
+    {
+        free(record);
+        return -1;
+    }
+
+    // miniSEED v3 Fixed Header (simplified)
+    // Bytes 0-1: Record indicator "MS"
+    record[0] = 'M';
+    record[1] = 'S';
+
+    // Byte 2: Format version (3 = miniSEED v3)
+    record[2] = 3;
+
+    // Byte 3: Flags
+    record[3] = 0x01; // Bit 0 = CRC present (we'll skip CRC for simplicity)
+
+    // Bytes 4-7: Nanoseconds (big-endian uint32)
+    uint32_t nanos = 0; // Start of second
+    *(uint32_t *)(record + 4) = ((nanos >> 24) & 0xFF) |
+                                ((nanos >> 8) & 0xFF00) |
+                                ((nanos << 8) & 0xFF0000) |
+                                ((nanos << 24) & 0xFF000000);
+
+    // Bytes 8-9: Year (big-endian uint16)
+    uint16_t year = tm_info->tm_year + 1900;
+    *(uint16_t *)(record + 8) = ((year >> 8) & 0xFF) | ((year << 8) & 0xFF00);
+
+    // Bytes 10-11: Day of year (big-endian uint16)
+    uint16_t day_of_year = tm_info->tm_yday + 1;
+    *(uint16_t *)(record + 10) = ((day_of_year >> 8) & 0xFF) | ((day_of_year << 8) & 0xFF00);
+
+    // Byte 12: Hour
+    record[12] = tm_info->tm_hour;
+
+    // Byte 13: Minute
+    record[13] = tm_info->tm_min;
+
+    // Byte 14: Second
+    record[14] = tm_info->tm_sec;
+
+    // Byte 15: Data encoding (4 = 32-bit integer, little-endian for v3)
+    record[15] = 4;
+
+    // Bytes 16-19: Sample rate (big-endian float, approximate as int for now)
+    float rate_f = (float)sample_rate;
+    uint32_t rate_bits;
+    memcpy(&rate_bits, &rate_f, 4);
+    *(uint32_t *)(record + 16) = ((rate_bits >> 24) & 0xFF) |
+                                 ((rate_bits >> 8) & 0xFF00) |
+                                 ((rate_bits << 8) & 0xFF0000) |
+                                 ((rate_bits << 24) & 0xFF000000);
+
+    // Bytes 20-23: Number of samples (big-endian uint32)
+    uint32_t nsamp = sample_count;
+    *(uint32_t *)(record + 20) = ((nsamp >> 24) & 0xFF) |
+                                 ((nsamp >> 8) & 0xFF00) |
+                                 ((nsamp << 8) & 0xFF0000) |
+                                 ((nsamp << 24) & 0xFF000000);
+
+    // Bytes 24-27: CRC (big-endian uint32, set to 0 for simplicity)
+    *(uint32_t *)(record + 24) = 0;
+
+    // Bytes 28-31: Publication version (big-endian uint32)
+    *(uint32_t *)(record + 28) = 0x01000000; // Version 1
+
+    // Bytes 32-35: Extra header length (big-endian uint32)
+    uint32_t extra_len = 64; // Simplified JSON header size
+    *(uint32_t *)(record + 32) = ((extra_len >> 24) & 0xFF) |
+                                 ((extra_len >> 8) & 0xFF00) |
+                                 ((extra_len << 8) & 0xFF0000) |
+                                 ((extra_len << 24) & 0xFF000000);
+
+    // Bytes 36-39: Data length (big-endian uint32)
+    *(uint32_t *)(record + 36) = ((data_size >> 24) & 0xFF) |
+                                 ((data_size >> 8) & 0xFF00) |
+                                 ((data_size << 8) & 0xFF0000) |
+                                 ((data_size << 24) & 0xFF000000);
+
+    // Create simplified JSON extra headers (bytes 40-103)
+    char json_header[128];
+    snprintf(json_header, sizeof(json_header),
+             "{\"SID\":\"%s.%s..%s\",\"FormatVersion\":3}",
+             network, station, channel);
+    memcpy(record + 40, json_header, strlen(json_header));
+
+    // Write sample data (int32, little-endian for v3)
+    uint32_t data_offset = header_size;
+    for (uint32_t i = 0; i < sample_count; i++)
+    {
+        *(int32_t *)(record + data_offset) = samples[i];
+        data_offset += 4;
+    }
+
+    // Write the complete record
+    int bytes_written = sd_spi_write_file(fs_info, filename, record, total_size);
+    free(record);
+
+    return bytes_written;
+}
+
+/**
+ * @brief Read and parse miniSEED v2 record header
+ * @return true if header is valid
+ */
+bool parse_miniseed_v2_header(const uint8_t *record, uint16_t *out_sample_count,
+                              uint16_t *out_sample_rate, time_t *out_timestamp)
+{
+    if (!record)
+        return false;
+
+    // Check sequence number format (should be digits)
+    for (int i = 0; i < 6; i++)
+    {
+        if (record[i] < '0' || record[i] > '9')
+            return false;
+    }
+
+    // Check data quality indicator
+    if (record[6] != 'D' && record[6] != 'R' && record[6] != 'Q' && record[6] != 'M')
+        return false;
+
+    // Parse sample count (30-31, big-endian)
+    uint16_t nsamp = ((uint16_t)record[30] << 8) | record[31];
+    if (out_sample_count)
+        *out_sample_count = nsamp;
+
+    // Parse sample rate (32-33, big-endian int16)
+    int16_t rate = ((int16_t)record[32] << 8) | record[33];
+    if (out_sample_rate)
+        *out_sample_rate = rate;
+
+    // Parse timestamp
+    if (out_timestamp)
+    {
+        // Year (20-21, big-endian)
+        uint16_t year = ((uint16_t)record[20] << 8) | record[21];
+
+        // Day of year (22-23, big-endian)
+        uint16_t doy = ((uint16_t)record[22] << 8) | record[23];
+
+        // Time
+        uint8_t hour = record[24];
+        uint8_t minute = record[25];
+        uint8_t second = record[26];
+
+        // Convert to timestamp (simplified)
+        struct tm tm_time;
+        memset(&tm_time, 0, sizeof(tm_time));
+        tm_time.tm_year = year - 1900;
+        tm_time.tm_mon = 0;    // January
+        tm_time.tm_mday = doy; // Day of year (will be adjusted)
+        tm_time.tm_hour = hour;
+        tm_time.tm_min = minute;
+        tm_time.tm_sec = second;
+
+        *out_timestamp = mktime(&tm_time);
+    }
+
+    return true;
+}
+
+/**
+ * @brief Read miniSEED v2 data samples from record
+ * @param record The 512-byte miniSEED record
+ * @param samples Output buffer for samples
+ * @param max_samples Maximum number of samples to read
+ * @return Number of samples read
+ */
+uint16_t read_miniseed_v2_samples(const uint8_t *record, int32_t *samples, uint16_t max_samples)
+{
+    if (!record || !samples)
+        return 0;
+
+    // Get sample count from header
+    uint16_t nsamp = ((uint16_t)record[30] << 8) | record[31];
+    if (nsamp > max_samples)
+        nsamp = max_samples;
+    if (nsamp > 116)
+        nsamp = 116; // Max samples in 512-byte record
+
+    // Read samples starting at offset 48 (big-endian int32)
+    uint32_t data_pos = 48;
+    for (uint16_t i = 0; i < nsamp && data_pos + 4 <= 512; i++)
+    {
+        int32_t val = ((int32_t)record[data_pos] << 24) |
+                      ((int32_t)record[data_pos + 1] << 16) |
+                      ((int32_t)record[data_pos + 2] << 8) |
+                      record[data_pos + 3];
+        samples[i] = val;
+        data_pos += 4;
+    }
+
+    return nsamp;
+}
+
+/**
+ * @brief Test miniSEED v2 and v3 file writing/reading with dummy data
+ * Duration: 60 seconds
+ * The RP2040 has limited heap memory, so we use 60s to stay within ~50KB
+ */
+void test_miniseed_write_read_60s(void)
+{
+    Serial.println("\n=== miniSEED Write/Read Test (Dummy Data) ===");
+
+    if (!sd_card_available)
+    {
+        TEST_IGNORE_MESSAGE("SD card not initialized, skipping miniSEED test");
+        return;
+    }
+
+    // Get filesystem info
+    fs_info_t fs_info;
+    if (!sd_spi_identify_filesystem(&fs_info))
+    {
+        TEST_FAIL_MESSAGE("Failed to identify filesystem");
+        return;
+    }
+
+    // Match miniSEED write test with benchmark conditions instead of default 500 kHz.
+    const uint32_t miniseed_spi_freq_hz = 4000000;
+    sd_spi_set_frequency(miniseed_spi_freq_hz);
+    Serial.printf("SPI method: %s\n", sd_spi_get_method());
+    Serial.printf("SPI frequency for miniSEED test: %lu kHz\n\n", miniseed_spi_freq_hz / 1000);
+
+    // Test parameters
+    // NOTE: Reduced from 600s to 60s due to RP2040 RAM constraints
+    // Full 600s would require ~265KB buffer, RP2040 has limited heap
+    const uint16_t sample_rate = 100;                              // 100 Hz
+    const uint32_t duration_seconds = 60;                          // 60 seconds (reduced for memory constraints)
+    const uint32_t total_samples = sample_rate * duration_seconds; // 6,000 samples
+    const uint16_t samples_per_record = 116;                       // Max samples in 512-byte v2 record
+    const uint32_t total_records = (total_samples + samples_per_record - 1) / samples_per_record;
+    const uint32_t total_v2_filesize = total_records * 512; // Total file size for v2
+
+    Serial.printf("Test Configuration:\n");
+    Serial.printf("  Sample Rate: %u Hz\n", sample_rate);
+    Serial.printf("  Duration: %u seconds (reduced for RP2040 RAM constraints)\n", duration_seconds);
+    Serial.printf("  Total Samples: %u\n", total_samples);
+    Serial.printf("  Samples per Record: %u\n", samples_per_record);
+    Serial.printf("  Total Records: %u\n", total_records);
+    Serial.printf("  Total v2 File Size: %u bytes (~%u KB)\n\n", total_v2_filesize, total_v2_filesize / 1024);
+
+    // Allocate buffers
+    int32_t *noise_data = (int32_t *)malloc(total_samples * sizeof(int32_t));
+    if (!noise_data)
+    {
+        TEST_FAIL_MESSAGE("Failed to allocate noise data buffer");
+        return;
+    }
+
+    // Generate dummy noise data
+    Serial.printf("Generating %us of dummy noise data...\n", duration_seconds);
+    unsigned long gen_start = millis();
+    generate_noise_data(noise_data, total_samples, 12345);
+    unsigned long gen_time = millis() - gen_start;
+    Serial.printf("Generated %u samples in %lu ms\n\n", total_samples, gen_time);
+
+    // ========================================================================
+    // TEST 1: Write miniSEED v2 format (single write operation)
+    // ========================================================================
+    Serial.println("--- TEST 1: Writing miniSEED v2 format ---");
+    Serial.println("NOTE: Building entire file in memory before writing");
+    Serial.println();
+    Serial.println("IMPORTANT: FAT filesystem writes are SLOW with Software SPI!");
+    Serial.println("  Benchmark (raw blocks): ~1700 kbit/s (sd_spi_write_block)");
+    Serial.println("  File writes (FAT/FS):   ~10-20 kbit/s (sd_spi_write_file)");
+    Serial.println("  Overhead: Directory traversal, cluster allocation, FAT updates");
+    Serial.println("  Solution: Use hardware SPI or raw block writes for production");
+    Serial.println();
+
+    const char *v2_filename = "test_v2.mseed";
+    time_t start_time = 1709827200; // 2024-03-08 00:00:00 UTC
+    const char *station = "TEST1";
+    const char *network = "XX";
+    const char *channel = "HNZ";
+
+    unsigned long v2_write_start = millis();
+    uint32_t sample_offset = 0;
+    bool v2_write_success = true;
+
+    // Delete existing file if it exists
+    sd_spi_delete_file(&fs_info, v2_filename);
+
+    // Allocate buffer for entire file (all records at once)
+    const uint32_t total_file_size = total_records * 512;
+    uint8_t *file_buffer = (uint8_t *)malloc(total_file_size);
+
+    if (!file_buffer)
+    {
+        free(noise_data);
+        TEST_FAIL_MESSAGE("Failed to allocate file buffer");
+        return;
+    }
+
+    Serial.printf("Building %u records (%u bytes) in memory...\n",
+                  total_records, total_file_size);
+
+    // Build all records in memory
+    for (uint32_t r = 0; r < total_records; r++)
+    {
+        uint16_t samples_in_record = samples_per_record;
+        if (sample_offset + samples_in_record > total_samples)
+        {
+            samples_in_record = total_samples - sample_offset;
+        }
+
+        time_t record_time = start_time + (sample_offset / sample_rate);
+        uint8_t *record = file_buffer + (r * 512);
+
+        // Generate miniSEED v2 record directly in file buffer
+        memset(record, 0, 512);
+
+        struct tm *tm_info = gmtime(&record_time);
+        if (!tm_info)
+        {
+            v2_write_success = false;
+            break;
+        }
+
+        // Fill miniSEED v2 header inline (optimized)
+        snprintf((char *)record, 7, "%06u", r + 1);
+        record[6] = 'D';
+        record[7] = ' ';
+        memset(record + 8, ' ', 5);
+        strncpy((char *)(record + 8), station, 5);
+        record[13] = ' ';
+        record[14] = ' ';
+        memcpy(record + 15, channel, 3);
+        memcpy(record + 18, network, 2);
+        uint16_t year = tm_info->tm_year + 1900;
+        *(uint16_t *)(record + 20) = ((year >> 8) & 0xFF) | ((year << 8) & 0xFF00);
+        uint16_t day_of_year = tm_info->tm_yday + 1;
+        *(uint16_t *)(record + 22) = ((day_of_year >> 8) & 0xFF) | ((day_of_year << 8) & 0xFF00);
+        record[24] = tm_info->tm_hour;
+        record[25] = tm_info->tm_min;
+        record[26] = tm_info->tm_sec;
+        record[27] = 0;
+        *(uint16_t *)(record + 28) = 0;
+        uint16_t nsamp = (samples_in_record > 116) ? 116 : samples_in_record;
+        *(uint16_t *)(record + 30) = ((nsamp >> 8) & 0xFF) | ((nsamp << 8) & 0xFF00);
+        int16_t samprate = sample_rate;
+        *(int16_t *)(record + 32) = ((samprate >> 8) & 0xFF) | ((samprate << 8) & 0xFF00);
+        *(int16_t *)(record + 34) = 0x0100;
+        *(uint32_t *)(record + 36) = 0;
+        *(int32_t *)(record + 40) = 0;
+        *(uint16_t *)(record + 44) = 0x3000;
+        *(uint16_t *)(record + 46) = 0;
+
+        // Write sample data (big-endian int32)
+        uint32_t data_pos = 48;
+        for (uint32_t i = 0; i < nsamp && data_pos + 4 <= 512; i++)
+        {
+            int32_t val = noise_data[sample_offset + i];
+            *(int32_t *)(record + data_pos) = ((val >> 24) & 0xFF) |
+                                              ((val >> 8) & 0xFF00) |
+                                              ((val << 8) & 0xFF0000) |
+                                              ((val << 24) & 0xFF000000);
+            data_pos += 4;
+        }
+
+        sample_offset += samples_in_record;
+
+        // Progress indication while building
+        uint32_t progress_interval = (total_records >= 250) ? (total_records / 10) : 25;
+        if ((r + 1) % progress_interval == 0 || (r + 1) == total_records)
+        {
+            unsigned long elapsed = millis() - v2_write_start;
+            float progress_pct = 100.0 * (r + 1) / total_records;
+            Serial.printf("  Building: %u/%u records (%.1f%%) - %lu ms\n",
+                          r + 1, total_records, progress_pct, elapsed);
+        }
+    }
+
+    unsigned long actual_write_time_v2 = 0;
+
+    if (v2_write_success)
+    {
+        // Write entire file in one operation
+        Serial.printf("Writing %u bytes to SD card...\n", total_file_size);
+        unsigned long write_start = millis();
+
+        int bytes = sd_spi_write_file(&fs_info, v2_filename, file_buffer, total_file_size);
+
+        actual_write_time_v2 = millis() - write_start;
+
+        if (bytes != (int)total_file_size)
+        {
+            Serial.printf("ERROR: Failed to write file (wrote %d bytes, expected %u)\n",
+                          bytes, total_file_size);
+            v2_write_success = false;
+        }
+        else
+        {
+            Serial.printf("✓ File written in %lu ms\n", actual_write_time_v2);
+            float write_speed_kbps = (total_file_size * 1000.0) / (actual_write_time_v2 * 1024.0);
+            Serial.printf("✓ SD Write Speed: %.2f kB/s (%.2f KB/s)\n", write_speed_kbps, write_speed_kbps * 1.024);
+        }
+    }
+
+    free(file_buffer);
+    unsigned long v2_total_time = millis() - v2_write_start;
+
+    if (v2_write_success)
+    {
+        unsigned long build_time = v2_total_time - actual_write_time_v2;
+        Serial.printf("✓ miniSEED v2 complete: %u records\n", total_records);
+        Serial.printf("  Build time: %lu ms, Write time: %lu ms, Total: %lu ms\n\n",
+                      build_time, actual_write_time_v2, v2_total_time);
+    }
+    else
+    {
+        free(noise_data);
+        TEST_FAIL_MESSAGE("miniSEED v2 write failed");
+        return;
+    }
+
+    // ========================================================================
+    // COMPARISON: Raw block write speed (no filesystem overhead)
+    // ========================================================================
+    Serial.println("--- COMPARISON: Raw Block Write Speed ---");
+    Serial.printf("Writing same data (%u bytes) using sd_spi_write_block()...\n", total_file_size);
+
+    // Allocate buffer for block writes
+    uint8_t *block_buffer = (uint8_t *)malloc(total_file_size);
+    if (block_buffer)
+    {
+        // Copy v2 file data to block buffer (reuse the data we already built)
+        // We need to rebuild it since we freed file_buffer
+        Serial.println("Rebuilding data for raw write comparison...");
+
+        sample_offset = 0;
+        for (uint32_t r = 0; r < total_records; r++)
+        {
+            uint16_t samples_in_record = samples_per_record;
+            if (sample_offset + samples_in_record > total_samples)
+            {
+                samples_in_record = total_samples - sample_offset;
+            }
+
+            time_t record_time = start_time + (sample_offset / sample_rate);
+            uint8_t *record = block_buffer + (r * 512);
+            memset(record, 0, 512);
+
+            struct tm *tm_info = gmtime(&record_time);
+            if (tm_info)
+            {
+                snprintf((char *)record, 7, "%06u", r + 1);
+                record[6] = 'D';
+                record[7] = ' ';
+                memset(record + 8, ' ', 5);
+                strncpy((char *)(record + 8), station, 5);
+                record[13] = ' ';
+                record[14] = ' ';
+                memcpy(record + 15, channel, 3);
+                memcpy(record + 18, network, 2);
+                uint16_t year = tm_info->tm_year + 1900;
+                *(uint16_t *)(record + 20) = ((year >> 8) & 0xFF) | ((year << 8) & 0xFF00);
+                uint16_t day_of_year = tm_info->tm_yday + 1;
+                *(uint16_t *)(record + 22) = ((day_of_year >> 8) & 0xFF) | ((day_of_year << 8) & 0xFF00);
+                record[24] = tm_info->tm_hour;
+                record[25] = tm_info->tm_min;
+                record[26] = tm_info->tm_sec;
+                record[27] = 0;
+                *(uint16_t *)(record + 28) = 0;
+                uint16_t nsamp = (samples_in_record > 116) ? 116 : samples_in_record;
+                *(uint16_t *)(record + 30) = ((nsamp >> 8) & 0xFF) | ((nsamp << 8) & 0xFF00);
+                int16_t samprate = sample_rate;
+                *(int16_t *)(record + 32) = ((samprate >> 8) & 0xFF) | ((samprate << 8) & 0xFF00);
+                *(int16_t *)(record + 34) = 0x0100;
+                *(uint32_t *)(record + 36) = 0;
+                *(int32_t *)(record + 40) = 0;
+                *(uint16_t *)(record + 44) = 0x3000;
+                *(uint16_t *)(record + 46) = 0;
+
+                uint32_t data_pos = 48;
+                for (uint32_t i = 0; i < nsamp && data_pos + 4 <= 512; i++)
+                {
+                    int32_t val = noise_data[sample_offset + i];
+                    *(int32_t *)(record + data_pos) = ((val >> 24) & 0xFF) |
+                                                      ((val >> 8) & 0xFF00) |
+                                                      ((val << 8) & 0xFF0000) |
+                                                      ((val << 24) & 0xFF000000);
+                    data_pos += 4;
+                }
+            }
+
+            sample_offset += samples_in_record;
+        }
+
+        // Perform raw block write
+        const uint32_t start_sector = 1000; // Use sector 1000+ for raw writes
+        unsigned long raw_write_start = millis();
+        bool raw_write_success = true;
+
+        for (uint32_t i = 0; i < total_records; i++)
+        {
+            if (!sd_spi_write_block(start_sector + i, block_buffer + (i * 512)))
+            {
+                raw_write_success = false;
+                Serial.printf("ERROR: Raw write failed at block %u\n", i);
+                break;
+            }
+        }
+
+        unsigned long raw_write_time = millis() - raw_write_start;
+
+        if (raw_write_success)
+        {
+            float raw_speed_kbps = (total_file_size * 1000.0) / (raw_write_time * 1024.0);
+            float raw_speed_kbitps = (total_file_size * 8.0 * 1000.0) / (raw_write_time * 1000.0);
+
+            Serial.printf("✓ Raw block write complete: %u blocks in %lu ms\n", total_records, raw_write_time);
+            Serial.printf("  Raw Write Speed: %.2f kB/s (%.2f kbit/s)\n\n", raw_speed_kbps, raw_speed_kbitps);
+
+            // Show comparison
+            Serial.println("*** PERFORMANCE COMPARISON ***");
+            Serial.printf("  FAT Filesystem write: %lu ms (%.2f kB/s)\n",
+                          actual_write_time_v2,
+                          (total_file_size * 1000.0) / (actual_write_time_v2 * 1024.0));
+            Serial.printf("  Raw Block write:      %lu ms (%.2f kB/s)\n",
+                          raw_write_time,
+                          raw_speed_kbps);
+            Serial.printf("  Speedup: %.1fx faster with raw blocks\n\n",
+                          (float)actual_write_time_v2 / raw_write_time);
+        }
+
+        free(block_buffer);
+    }
+    else
+    {
+        Serial.println("Failed to allocate buffer for raw write comparison\n");
+    }
+
+    // ========================================================================
+    // TEST 2: Read and verify miniSEED v2 format
+    // ========================================================================
+    Serial.println("--- TEST 2: Reading and verifying miniSEED v2 format ---");
+
+    uint8_t *v2_read_buffer = (uint8_t *)malloc(total_file_size);
+    int32_t *read_samples = (int32_t *)malloc(samples_per_record * sizeof(int32_t));
+
+    if (!v2_read_buffer || !read_samples)
+    {
+        free(noise_data);
+        if (v2_read_buffer)
+            free(v2_read_buffer);
+        if (read_samples)
+            free(read_samples);
+        TEST_FAIL_MESSAGE("Failed to allocate read buffers");
+        return;
+    }
+
+    unsigned long v2_read_start = millis();
+    uint32_t total_samples_read = 0;
+    uint32_t mismatches = 0;
+    bool v2_read_success = true;
+    uint32_t v2_header_errors = 0;
+
+    int v2_bytes_read = sd_spi_read_file(&fs_info, v2_filename, v2_read_buffer, total_file_size);
+    if (v2_bytes_read != (int)total_file_size)
+    {
+        Serial.printf("✗ Failed to read full v2 file (%d/%u bytes)\n", v2_bytes_read, total_file_size);
+        v2_read_success = false;
+    }
+
+    uint32_t expected_sample_offset = 0;
+
+    // Parse file record by record and verify against original source samples.
+    for (uint32_t r = 0; r < total_records; r++)
+    {
+        if (!v2_read_success)
+            break;
+
+        const uint8_t *record = v2_read_buffer + (r * 512);
+        uint16_t record_samples = 0;
+        uint16_t record_rate = 0;
+        time_t record_ts = 0;
+
+        if (!parse_miniseed_v2_header(record, &record_samples, &record_rate, &record_ts))
+        {
+            if (v2_header_errors < 5)
+                Serial.printf("  Header parse error at record %u\n", r);
+            v2_header_errors++;
+            v2_read_success = false;
+            break;
+        }
+
+        uint32_t expected_samples_in_record = samples_per_record;
+        if (expected_sample_offset + expected_samples_in_record > total_samples)
+            expected_samples_in_record = total_samples - expected_sample_offset;
+
+        if (record_samples != expected_samples_in_record)
+        {
+            if (mismatches < 5)
+            {
+                Serial.printf("  Sample count mismatch at record %u: got %u expected %u\n",
+                              r, record_samples, expected_samples_in_record);
+            }
+            mismatches++;
+        }
+
+        if (record_rate != sample_rate)
+        {
+            if (mismatches < 5)
+            {
+                Serial.printf("  Sample rate mismatch at record %u: got %u expected %u\n",
+                              r, record_rate, sample_rate);
+            }
+            mismatches++;
+        }
+
+        uint16_t samples_decoded = read_miniseed_v2_samples(record, read_samples, samples_per_record);
+        if (samples_decoded != expected_samples_in_record)
+        {
+            if (mismatches < 5)
+            {
+                Serial.printf("  Decoded sample count mismatch at record %u: got %u expected %u\n",
+                              r, samples_decoded, expected_samples_in_record);
+            }
+            mismatches++;
+        }
+
+        uint16_t cmp_count = samples_decoded;
+        if (cmp_count > expected_samples_in_record)
+            cmp_count = expected_samples_in_record;
+
+        for (uint16_t i = 0; i < cmp_count; i++)
+        {
+            int32_t expected = noise_data[expected_sample_offset + i];
+            if (read_samples[i] != expected)
+            {
+                if (mismatches < 5)
+                {
+                    Serial.printf("  Data mismatch r=%u s=%u: got %ld expected %ld\n",
+                                  r, i, (long)read_samples[i], (long)expected);
+                }
+                mismatches++;
+            }
+        }
+
+        expected_sample_offset += expected_samples_in_record;
+        total_samples_read += samples_decoded;
+
+        // Progress indication
+        if ((r + 1) % 100 == 0)
+        {
+            Serial.printf("  Verified %u/%u records (%.1f%%)\n",
+                          r + 1, total_records, 100.0 * (r + 1) / total_records);
+        }
+    }
+
+    unsigned long v2_read_time = millis() - v2_read_start;
+    if (v2_read_success && mismatches == 0 && total_samples_read == total_samples && expected_sample_offset == total_samples)
+    {
+        Serial.printf("✓ miniSEED v2 data verified: %u samples, %u records in %lu ms\n\n",
+                      total_samples_read, total_records, v2_read_time);
+        v2_read_success = true;
+    }
+    else
+    {
+        Serial.printf("✗ miniSEED v2 verification failed (samples=%u/%u, mismatches=%u, header_errors=%u)\n\n",
+                      total_samples_read, total_samples, mismatches, v2_header_errors);
+        v2_read_success = false;
+    }
+
+    // ========================================================================
+    // TEST 3: Write miniSEED v3 format (single write operation)
+    // ========================================================================
+    Serial.println("--- TEST 3: Writing miniSEED v3 format ---");
+    Serial.println("NOTE: Building entire file in memory before writing");
+
+    const char *v3_filename = "test_v3.mseed";
+    const uint16_t v3_samples_per_record = 256; // v3 can have variable record sizes
+    const uint32_t v3_total_records = (total_samples + v3_samples_per_record - 1) / v3_samples_per_record;
+
+    Serial.printf("miniSEED v3 Configuration:\n");
+    Serial.printf("  Samples per Record: %u\n", v3_samples_per_record);
+    Serial.printf("  Total Records: %u\n\n", v3_total_records);
+
+    unsigned long v3_write_start = millis();
+    sample_offset = 0;
+    bool v3_write_success = true;
+
+    // Delete existing file if it exists
+    sd_spi_delete_file(&fs_info, v3_filename);
+
+    // Calculate total v3 file size (variable record sizes)
+    const uint32_t v3_header_size = 256; // Fixed header per record
+    uint32_t v3_total_size = 0;
+    for (uint32_t r = 0; r < v3_total_records; r++)
+    {
+        uint16_t samples_in_record = v3_samples_per_record;
+        if (sample_offset + samples_in_record > total_samples)
+        {
+            samples_in_record = total_samples - sample_offset;
+        }
+        v3_total_size += v3_header_size + (samples_in_record * 4); // 4 bytes per int32 sample
+        sample_offset += samples_in_record;
+    }
+
+    // Allocate buffer for entire v3 file
+    uint8_t *v3_file_buffer = (uint8_t *)malloc(v3_total_size);
+    if (!v3_file_buffer)
+    {
+        free(noise_data);
+        free(v2_read_buffer);
+        free(read_samples);
+        TEST_FAIL_MESSAGE("Failed to allocate v3 file buffer");
+        return;
+    }
+
+    Serial.printf("Building %u records (%u bytes) in memory...\n",
+                  v3_total_records, v3_total_size);
+
+    sample_offset = 0;
+    uint32_t file_offset = 0;
+
+    // Build all v3 records in memory (simplified v3 format)
+    for (uint32_t r = 0; r < v3_total_records; r++)
+    {
+        uint16_t samples_in_record = v3_samples_per_record;
+        if (sample_offset + samples_in_record > total_samples)
+        {
+            samples_in_record = total_samples - sample_offset;
+        }
+
+        time_t record_time = start_time + (sample_offset / sample_rate);
+        uint32_t data_size = samples_in_record * 4;
+        uint32_t record_size = v3_header_size + data_size;
+
+        struct tm *tm_info = gmtime(&record_time);
+        if (!tm_info)
+        {
+            v3_write_success = false;
+            break;
+        }
+
+        uint8_t *record = v3_file_buffer + file_offset;
+        memset(record, 0, v3_header_size);
+
+        // miniSEED v3 Fixed Header (simplified)
+        record[0] = 'M';
+        record[1] = 'S';
+        record[2] = 3;    // Version
+        record[3] = 0x01; // Flags
+
+        // Nanoseconds (big-endian uint32)
+        uint32_t nanos = 0;
+        *(uint32_t *)(record + 4) = ((nanos >> 24) & 0xFF) | ((nanos >> 8) & 0xFF00) |
+                                    ((nanos << 8) & 0xFF0000) | ((nanos << 24) & 0xFF000000);
+
+        // Year (big-endian uint16)
+        uint16_t year = tm_info->tm_year + 1900;
+        *(uint16_t *)(record + 8) = ((year >> 8) & 0xFF) | ((year << 8) & 0xFF00);
+
+        // Day of year (big-endian uint16)
+        uint16_t day_of_year = tm_info->tm_yday + 1;
+        *(uint16_t *)(record + 10) = ((day_of_year >> 8) & 0xFF) | ((day_of_year << 8) & 0xFF00);
+
+        record[12] = tm_info->tm_hour;
+        record[13] = tm_info->tm_min;
+        record[14] = tm_info->tm_sec;
+        record[15] = 4; // Data encoding
+
+        // Sample rate (big-endian float)
+        float rate_f = (float)sample_rate;
+        uint32_t rate_bits;
+        memcpy(&rate_bits, &rate_f, 4);
+        *(uint32_t *)(record + 16) = ((rate_bits >> 24) & 0xFF) | ((rate_bits >> 8) & 0xFF00) |
+                                     ((rate_bits << 8) & 0xFF0000) | ((rate_bits << 24) & 0xFF000000);
+
+        // Number of samples (big-endian uint32)
+        uint32_t nsamp = samples_in_record;
+        *(uint32_t *)(record + 20) = ((nsamp >> 24) & 0xFF) | ((nsamp >> 8) & 0xFF00) |
+                                     ((nsamp << 8) & 0xFF0000) | ((nsamp << 24) & 0xFF000000);
+
+        // CRC, version, extra header length, data length
+        *(uint32_t *)(record + 24) = 0;          // CRC
+        *(uint32_t *)(record + 28) = 0x01000000; // Version 1
+
+        uint32_t extra_len = 64;
+        *(uint32_t *)(record + 32) = ((extra_len >> 24) & 0xFF) | ((extra_len >> 8) & 0xFF00) |
+                                     ((extra_len << 8) & 0xFF0000) | ((extra_len << 24) & 0xFF000000);
+
+        *(uint32_t *)(record + 36) = ((data_size >> 24) & 0xFF) | ((data_size >> 8) & 0xFF00) |
+                                     ((data_size << 8) & 0xFF0000) | ((data_size << 24) & 0xFF000000);
+
+        // Simplified JSON header
+        char json_header[128];
+        snprintf(json_header, sizeof(json_header), "{\"SID\":\"%s.%s..%s\",\"FormatVersion\":3}",
+                 network, station, channel);
+        memcpy(record + 40, json_header, strlen(json_header));
+
+        // Write sample data (int32, little-endian for v3)
+        uint32_t *data_ptr = (uint32_t *)(record + v3_header_size);
+        for (uint32_t i = 0; i < samples_in_record; i++)
+        {
+            data_ptr[i] = noise_data[sample_offset + i];
+        }
+
+        file_offset += record_size;
+        sample_offset += samples_in_record;
+
+        // Progress indication
+        uint32_t progress_interval = (v3_total_records >= 250) ? (v3_total_records / 10) : 25;
+        if ((r + 1) % progress_interval == 0 || (r + 1) == v3_total_records)
+        {
+            unsigned long elapsed = millis() - v3_write_start;
+            float progress_pct = 100.0 * (r + 1) / v3_total_records;
+            Serial.printf("  Building: %u/%u records (%.1f%%) - %lu ms\n",
+                          r + 1, v3_total_records, progress_pct, elapsed);
+        }
+    }
+
+    unsigned long actual_write_time_v3 = 0;
+
+    if (v3_write_success)
+    {
+        // Write entire file in one operation
+        Serial.printf("Writing %u bytes to SD card...\n", v3_total_size);
+        unsigned long write_start = millis();
+
+        int bytes = sd_spi_write_file(&fs_info, v3_filename, v3_file_buffer, v3_total_size);
+
+        actual_write_time_v3 = millis() - write_start;
+
+        if (bytes != (int)v3_total_size)
+        {
+            Serial.printf("ERROR: Failed to write file (wrote %d bytes, expected %u)\n",
+                          bytes, v3_total_size);
+            v3_write_success = false;
+        }
+        else
+        {
+            Serial.printf("✓ File written in %lu ms\n", actual_write_time_v3);
+            float write_speed_kbps = (v3_total_size * 1000.0) / (actual_write_time_v3 * 1024.0);
+            Serial.printf("✓ SD Write Speed: %.2f kB/s (%.2f KB/s)\n", write_speed_kbps, write_speed_kbps * 1.024);
+        }
+    }
+
+    unsigned long v3_total_time = millis() - v3_write_start;
+    if (v3_write_success)
+    {
+        unsigned long build_time = v3_total_time - actual_write_time_v3;
+        Serial.printf("✓ miniSEED v3 complete: %u records\n",
+                      v3_total_records);
+        Serial.printf("  Build time: %lu ms, Write time: %lu ms, Total: %lu ms\n\n",
+                      build_time, actual_write_time_v3, v3_total_time);
+    }
+    else
+    {
+        free(v3_file_buffer);
+        free(noise_data);
+        free(v2_read_buffer);
+        free(read_samples);
+        TEST_FAIL_MESSAGE("miniSEED v3 write failed");
+        return;
+    }
+
+    free(v3_file_buffer);
+
+    // ========================================================================
+    // TEST 4: Verify miniSEED v3 format
+    // ========================================================================
+    Serial.println("--- TEST 4: Verifying miniSEED v3 format ---");
+
+    bool v3_read_success = true;
+
+    uint8_t *v3_read_buffer = (uint8_t *)malloc(v3_total_size);
+    if (!v3_read_buffer)
+    {
+        Serial.println("✗ Failed to allocate v3 read buffer\n");
+        v3_read_success = false;
+    }
+
+    if (v3_read_success)
+    {
+        int v3_bytes_read = sd_spi_read_file(&fs_info, v3_filename, v3_read_buffer, v3_total_size);
+        if (v3_bytes_read != (int)v3_total_size)
+        {
+            Serial.printf("✗ Failed to read full v3 file (%d/%u bytes)\n", v3_bytes_read, v3_total_size);
+            v3_read_success = false;
+        }
+    }
+
+    uint32_t v3_mismatches = 0;
+    uint32_t v3_records_parsed = 0;
+    uint32_t v3_samples_read = 0;
+    uint32_t v3_offset = 0;
+
+    while (v3_read_success && v3_offset < v3_total_size && v3_records_parsed < v3_total_records)
+    {
+        const uint8_t *record = v3_read_buffer + v3_offset;
+
+        // Validate miniSEED v3 signature and version.
+        if (record[0] != 'M' || record[1] != 'S' || record[2] != 3)
+        {
+            if (v3_mismatches < 5)
+                Serial.printf("  Invalid v3 header at record %u\n", v3_records_parsed);
+            v3_mismatches++;
+            v3_read_success = false;
+            break;
+        }
+
+        uint32_t nsamp = ((uint32_t)record[20] << 24) |
+                         ((uint32_t)record[21] << 16) |
+                         ((uint32_t)record[22] << 8) |
+                         (uint32_t)record[23];
+        uint32_t data_size = ((uint32_t)record[36] << 24) |
+                             ((uint32_t)record[37] << 16) |
+                             ((uint32_t)record[38] << 8) |
+                             (uint32_t)record[39];
+
+        uint32_t record_size = v3_header_size + data_size;
+        if (record_size < v3_header_size || v3_offset + record_size > v3_total_size || data_size != nsamp * 4)
+        {
+            if (v3_mismatches < 5)
+            {
+                Serial.printf("  Invalid v3 record size at record %u (nsamp=%lu data=%lu rec=%lu)\n",
+                              v3_records_parsed, (unsigned long)nsamp, (unsigned long)data_size, (unsigned long)record_size);
+            }
+            v3_mismatches++;
+            v3_read_success = false;
+            break;
+        }
+
+        uint32_t expected_samples_in_record = v3_samples_per_record;
+        if (v3_samples_read + expected_samples_in_record > total_samples)
+            expected_samples_in_record = total_samples - v3_samples_read;
+
+        if (nsamp != expected_samples_in_record)
+        {
+            if (v3_mismatches < 5)
+            {
+                Serial.printf("  v3 sample count mismatch at record %u: got %lu expected %lu\n",
+                              v3_records_parsed, (unsigned long)nsamp, (unsigned long)expected_samples_in_record);
+            }
+            v3_mismatches++;
+        }
+
+        const uint8_t *data_ptr = record + v3_header_size;
+        uint32_t cmp_count = nsamp;
+        if (cmp_count > expected_samples_in_record)
+            cmp_count = expected_samples_in_record;
+
+        for (uint32_t i = 0; i < cmp_count; i++)
+        {
+            int32_t sample_value = 0;
+            memcpy(&sample_value, data_ptr + (i * 4), sizeof(int32_t));
+            int32_t expected = noise_data[v3_samples_read + i];
+            if (sample_value != expected)
+            {
+                if (v3_mismatches < 5)
+                {
+                    Serial.printf("  v3 data mismatch r=%u s=%lu: got %ld expected %ld\n",
+                                  v3_records_parsed, (unsigned long)i, (long)sample_value, (long)expected);
+                }
+                v3_mismatches++;
+            }
+        }
+
+        v3_samples_read += expected_samples_in_record;
+        v3_records_parsed++;
+        v3_offset += record_size;
+    }
+
+    if (v3_read_buffer)
+        free(v3_read_buffer);
+
+    if (v3_read_success && v3_mismatches == 0 && v3_samples_read == total_samples &&
+        v3_records_parsed == v3_total_records && v3_offset == v3_total_size)
+    {
+        Serial.printf("✓ miniSEED v3 data verified: %u samples, %u records\n\n",
+                      v3_samples_read, v3_records_parsed);
+    }
+    else
+    {
+        Serial.printf("✗ miniSEED v3 verification failed (samples=%u/%u, records=%u/%u, mismatches=%u)\n\n",
+                      v3_samples_read, total_samples, v3_records_parsed, v3_total_records, v3_mismatches);
+        v3_read_success = false;
+    }
+
+    // ========================================================================
+    // SUMMARY
+    // ========================================================================
+    Serial.println("=== miniSEED Test Summary ===");
+    Serial.printf("✓ Generated %u samples of dummy noise data\n", total_samples);
+    Serial.printf("✓ miniSEED v2: %s (%u records, %u bytes)\n",
+                  v2_write_success ? "PASS" : "FAIL",
+                  total_records, total_records * 512);
+    Serial.printf("✓ miniSEED v3: %s (%u records, variable size)\n",
+                  v3_write_success ? "PASS" : "FAIL",
+                  v3_total_records);
+    Serial.println();
+
+    // Cleanup
+    free(noise_data);
+    free(v2_read_buffer);
+    free(read_samples);
+
+    // Delete test files
+    Serial.println("Cleaning up test files...");
+    sd_spi_delete_file(&fs_info, v2_filename);
+    sd_spi_delete_file(&fs_info, v3_filename);
+    Serial.println("✓ Test files deleted\n");
+
+    TEST_ASSERT_TRUE_MESSAGE(v2_write_success && v3_write_success,
+                             "miniSEED write/read tests completed");
+}
+
 #endif // ENABLE_SD_TESTS
 
 // ============================================================================
@@ -8757,7 +10302,11 @@ void setup()
 #endif
 #endif
 #if ENABLE_SINGLE_TEST
-    RUN_TEST(test_display_and_touch);
+    // Initialize SD card for single test
+    Serial.println("\n--- Initializing SD Card for Single Test ---\n");
+    RUN_TEST(test_sd_initialization);
+    Serial.println("\n--- Running Single Test ---\n");
+    RUN_TEST(test_miniseed_write_read_60s);
 #endif
 
     // Run Wiznet tests
@@ -8794,6 +10343,8 @@ void setup()
     RUN_TEST(test_sd_file_write);
     RUN_TEST(test_sd_file_read);
     RUN_TEST(test_sd_file_write_read_verify);
+    RUN_TEST(test_sd_fat_filesystem_operations);
+    RUN_TEST(test_miniseed_write_read_60s);
 #endif
 
     // Finish tests

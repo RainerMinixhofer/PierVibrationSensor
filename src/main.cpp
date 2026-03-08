@@ -65,15 +65,14 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 #include <FS.h>       // Already present
 #include <LittleFS.h> // Use LittleFS for file system operations
 #include "arm_math.h"
-#include <TFT_eSPI.h>    // TFT_eSPI supports both display and touch
-#include "SdFatConfig.h" // Include SdFatConfig.h for SD card support
-#include <SdFat.h>
-#include "sd_spi.h" // Low-level SD card SPI interface
+#include <TFT_eSPI.h> // TFT_eSPI supports both display and touch
+#include "sd_spi.h"   // Low-level SD card SPI interface
 // #include <Adafruit_ICM20X.h>
 #include <Adafruit_ICM20948.h>
 #include <Adafruit_Sensor.h>
 #include "version.h"
-#include "pin_config.h" // GPIO pin assignments
+#include "pin_config.h"      // GPIO pin assignments
+#include "miniseed_logger.h" // miniSEED data logging for seismic data compatibility
 
 #define PERFORM_CALIBRATION // Comment to disable startup calibration
 
@@ -100,7 +99,7 @@ Adafruit_ICM20948 icm;
 
 // Constants for TFT display with TFT_eSPI
 #define TFT_TEXT_SIZE 1             // Set the default text size for the display
-#define TFT_DISPLAY_REFRESH_RATE 20 // Set a refresh rate of 20 FPS for the display modes 1,2 and 3
+#define TFT_DISPLAY_REFRESH_RATE 10 // Set a refresh rate of 20 FPS for the display modes 1,2 and 3
 #define TEXT_DISPLAY_REFRESH_RATE 1 // Set a refresh rate of 1 FPS for the text display in mode 0
 
 // Create TFT_eSPI object (handles both display and touch via eSPI_Setup.h)
@@ -125,38 +124,6 @@ static uint16_t scroll_x_start = SCROLL_TOP_FIXED_AREA;
 
 // Touch calibration threshold for TFT_eSPI getTouch()
 #define TOUCH_THRESHOLD 600 // Pressure threshold for valid touch
-
-// SD_FAT_TYPE = 0 for SdFat/File as defined in SdFatConfig.h,
-// 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
-#define SD_FAT_TYPE 3
-
-#if SD_SPI_PORT == -1
-SoftSpiDriver<SD_MISO, SD_MOSI, SD_CLK> sdSoftSpi;
-#define SD_CONFIG_INIT SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SPI_BPS_INIT, &sdSoftSpi)
-#define SD_CONFIG_FAST SdSpiConfig(SD_CS, DEDICATED_SPI, SD_SPI_BPS, &sdSoftSpi)
-#elif SD_SPI_PORT == 1
-#define SD_CONFIG_INIT SdSpiConfig(SD_CS, SHARED_SPI, SD_SPI_BPS_INIT, &SPI1)
-#define SD_CONFIG_FAST SdSpiConfig(SD_CS, SHARED_SPI, SD_SPI_BPS, &SPI1)
-#else
-#define SD_CONFIG_INIT SdSpiConfig(SD_CS, SHARED_SPI, SD_SPI_BPS_INIT)
-#define SD_CONFIG_FAST SdSpiConfig(SD_CS, SHARED_SPI, SD_SPI_BPS)
-#endif
-
-#if SD_FAT_TYPE == 0
-SdFat sd;
-File file;
-#elif SD_FAT_TYPE == 1
-SdFat32 sd;
-File32 file;
-#elif SD_FAT_TYPE == 2
-SdExFat sd;
-ExFile file;
-#elif SD_FAT_TYPE == 3
-SdFs sd;
-FsFile file;
-#else // SD_FAT_TYPE
-#error Invalid SD_FAT_TYPE
-#endif // SD_FAT_TYPE
 
 // MMSE-based calibration coefficients
 // Transformation: Xd = A*Xt + B*Yt + C, Yd = D*Xt + E*Yt + F
@@ -251,12 +218,36 @@ sensors_event_t tempData;                  // temp structure to hold latest temp
 // --- UDP Streaming Control ---
 volatile bool udpStreamEnable[5] = {false, false, false, false, false};
 
+// --- miniSEED Recording Control (Raspberry Shake compatible data format) ---
+MinISeedLogger miniSeedLogger;                  ///< miniSEED logger for Raspberry Shake compatible data storage
+fs_info_t sd_fs_info;                           ///< Global filesystem info for miniSEED file I/O
+volatile bool miniSeedRecordingEnabled = false; ///< Global flag to control miniSEED recording
+volatile bool sd_card_ready = false;            ///< Global flag indicating SD card is mounted and ready
+
+static void stopMiniSeedRecording(const char *reason)
+{
+  if (reason)
+  {
+    Serial.print("miniSEED stop requested: ");
+    Serial.println(reason);
+  }
+
+  // Disable first to prevent new writes, then close buffered data immediately.
+  miniSeedRecordingEnabled = false;
+  miniSeedLogger.setRecordingEnabled(false);
+  miniSeedLogger.closeFile();
+}
+
 // --- Display Mode and State ---
 volatile int mode = 3;         // -1 = off 0 = text 1 = waveform, 2 = fft, 3 = sgram
 volatile int display_axis = 0; // 0 = X axis, 1 = Y axis, 2 = radial velocity
 // --- Radial velocity calculation ---
 float velocR = 0.0; // Latest radial velocity value in m/s
 bool mode_initialized = false;
+
+// --- Highcharts Status Tracking ---
+volatile bool highchartsWorking = false; // Track if Highcharts loaded successfully
+unsigned long highchartsLastReport = 0;  // Timestamp of last Highcharts status report
 
 // --- Menu State ---
 const int NUM_MENU_BUTTONS = 5;
@@ -347,6 +338,8 @@ const unsigned long MENU_TIMEOUT_MS = 15000; // Menu auto-hides after 15 seconds
 // ============================================================================
 
 void drawModeMenu();
+bool fsCreateDirectory(const char *path);
+bool fsDirectoryExists(const char *path);
 
 // ============================================================================
 // INTERRUPT HANDLERS
@@ -566,6 +559,94 @@ void initAllGPIOs()
 }
 
 // ============================================================================
+// SPI HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Release SPI bus
+ * Sets all SPI device CS pins high to release the bus and prevent conflicts
+ * Call this before switching operation between shared SPI devices
+ */
+void releaseSPIBus()
+{
+  // Release TFT from SPI bus
+#if defined(TFT_CS) && TFT_CS != -1
+  digitalWrite(TFT_CS, HIGH);
+#endif
+
+  // Release touch controller from SPI bus
+#if defined(TOUCH_CS) && TOUCH_CS != -1
+  digitalWrite(TOUCH_CS, HIGH);
+#endif
+
+  // Wiznet CS is managed by Ethernet library, but we can ensure it's available
+#if defined(WIZNET_SPI_CS) && WIZNET_SPI_CS != -1
+  digitalWrite(WIZNET_SPI_CS, HIGH);
+#endif
+}
+
+/**
+ * @brief Get SPI baudrate for TFT display (SPI0)
+ * @param spi SPI instance (spi0 for TFT)
+ * @return Actual baudrate in Hz
+ */
+static uint32_t get_tft_spi_baudrate(spi_inst_t *spi)
+{
+  spi_hw_t *hw = spi_get_hw(spi);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu; // CR0 bits 15:8 contain SCR
+  uint32_t clk = clock_get_hz(clk_peri);
+  if (cpsr == 0)
+    return 0;
+  return clk / (cpsr * (scr + 1u));
+}
+
+/**
+ * @brief Log TFT SPI speed with tag for debugging
+ * @param tag Description tag for the log message
+ */
+static void log_tft_spi_speed(const char *tag)
+{
+  spi_inst_t *spi = TFT_SPI_PORT;
+  spi_hw_t *hw = spi_get_hw(spi);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
+  uint32_t baud = get_tft_spi_baudrate(spi);
+
+  debugSerialPrintf("%s SPI baud: %.2f MHz (cpsr=%lu, scr=%lu)\n", tag, baud / 1000000.0, cpsr, scr);
+}
+
+/**
+ * @brief Get SPI baudrate for Wiznet adapter
+ * @param spi SPI instance
+ * @return Actual baudrate in Hz
+ */
+static uint32_t get_wiznet_spi_baudrate(spi_inst_t *spi)
+{
+  spi_hw_t *hw = spi_get_hw(spi);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
+  uint32_t clk = clock_get_hz(clk_peri);
+  if (cpsr == 0)
+    return 0;
+  return clk / (cpsr * (scr + 1u));
+}
+
+/**
+ * @brief Log Wiznet SPI speed with tag for debugging
+ * @param tag Description tag for the log message
+ */
+static void log_wiznet_spi_speed(const char *tag)
+{
+  spi_hw_t *hw = spi_get_hw(WIZNET_SPI_PORT);
+  uint32_t cpsr = hw->cpsr & 0xFFu;
+  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
+  uint32_t baud = get_wiznet_spi_baudrate(WIZNET_SPI_PORT);
+
+  debugSerialPrintf("%s SPI baud: %lu Hz (cpsr=%lu, scr=%lu)\n", tag, baud, cpsr, scr);
+}
+
+// ============================================================================
 // SD CARD FUNCTIONS
 // ============================================================================
 
@@ -582,7 +663,7 @@ void initSDCard()
   }
   debugSerialPrintln("LittleFS mounted successfully.");
 
-  // Initialize SD card via SPI
+  // Initialize SD card via low-level SPI driver (proven working method from test suite)
   Serial.println("Attempting SD card initialization...");
   Serial.println("NOTE: This may take 10-30 seconds if no SD card is inserted.");
   Serial.println("Please wait - system will continue automatically after timeout.");
@@ -742,6 +823,53 @@ void initSDCard()
   }
 
   debugSerialPrintln("SD card initialized successfully.");
+
+  // Save filesystem info to global for miniSEED logger to use
+  sd_fs_info = fs_info;
+  sd_card_ready = true;
+
+  // Create directory structure for miniSEED data logging
+  Serial.println("\nCreating directory structure for miniSEED logging...");
+
+  // Create /data directory
+  if (sd_spi_directory_exists(&fs_info, "/data"))
+  {
+    Serial.println("  /data directory already exists");
+  }
+  else
+  {
+    if (sd_spi_create_directory(&fs_info, "/data"))
+    {
+      Serial.println("  Created /data directory");
+    }
+    else
+    {
+      Serial.println("  WARNING: Failed to create /data directory");
+    }
+  }
+
+  // Create /data/miniseed directory
+  if (sd_spi_directory_exists(&fs_info, "/data/miniseed"))
+  {
+    Serial.println("  /data/miniseed directory already exists");
+  }
+  else
+  {
+    if (sd_spi_create_directory(&fs_info, "/data/miniseed"))
+    {
+      Serial.println("  Created /data/miniseed directory");
+    }
+    else
+    {
+      Serial.println("  WARNING: Failed to create /data/miniseed directory");
+    }
+  }
+
+  // Initialize miniSEED logger with hierarchical directory support
+  miniSeedLogger.init(&sd_fs_info, "PIER1", "XX", "/data/miniseed");
+
+  Serial.println("miniSEED recording will write files to /data/miniseed directory");
+  Serial.println("=== SD Card and Filesystem Ready ===");
 }
 
 void disableSDCard()
@@ -760,94 +888,6 @@ void disableTouch()
   {
     digitalWrite(TOUCH_CS, HIGH); // Deselect touch
   }
-}
-
-// ============================================================================
-// SPI HELPER FUNCTIONS
-// ============================================================================
-
-/**
- * @brief Release SPI bus
- * Sets all SPI device CS pins high to release the bus and prevent conflicts
- * Call this before switching operation between shared SPI devices
- */
-void releaseSPIBus()
-{
-  // Release TFT from SPI bus
-#if defined(TFT_CS) && TFT_CS != -1
-  digitalWrite(TFT_CS, HIGH);
-#endif
-
-  // Release touch controller from SPI bus
-#if defined(TOUCH_CS) && TOUCH_CS != -1
-  digitalWrite(TOUCH_CS, HIGH);
-#endif
-
-  // Wiznet CS is managed by Ethernet library, but we can ensure it's available
-#if defined(WIZNET_SPI_CS) && WIZNET_SPI_CS != -1
-  digitalWrite(WIZNET_SPI_CS, HIGH);
-#endif
-}
-
-/**
- * @brief Get SPI baudrate for TFT display (SPI0)
- * @param spi SPI instance (spi0 for TFT)
- * @return Actual baudrate in Hz
- */
-static uint32_t get_tft_spi_baudrate(spi_inst_t *spi)
-{
-  spi_hw_t *hw = spi_get_hw(spi);
-  uint32_t cpsr = hw->cpsr & 0xFFu;
-  uint32_t scr = (hw->cr0 >> 8) & 0xFFu; // CR0 bits 15:8 contain SCR
-  uint32_t clk = clock_get_hz(clk_peri);
-  if (cpsr == 0)
-    return 0;
-  return clk / (cpsr * (scr + 1u));
-}
-
-/**
- * @brief Log TFT SPI speed with tag for debugging
- * @param tag Description tag for the log message
- */
-static void log_tft_spi_speed(const char *tag)
-{
-  spi_inst_t *spi = TFT_SPI_PORT;
-  spi_hw_t *hw = spi_get_hw(spi);
-  uint32_t cpsr = hw->cpsr & 0xFFu;
-  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
-  uint32_t baud = get_tft_spi_baudrate(spi);
-
-  debugSerialPrintf("%s SPI baud: %.2f MHz (cpsr=%lu, scr=%lu)\n", tag, baud / 1000000.0, cpsr, scr);
-}
-
-/**
- * @brief Get SPI baudrate for Wiznet adapter
- * @param spi SPI instance
- * @return Actual baudrate in Hz
- */
-static uint32_t get_wiznet_spi_baudrate(spi_inst_t *spi)
-{
-  spi_hw_t *hw = spi_get_hw(spi);
-  uint32_t cpsr = hw->cpsr & 0xFFu;
-  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
-  uint32_t clk = clock_get_hz(clk_peri);
-  if (cpsr == 0)
-    return 0;
-  return clk / (cpsr * (scr + 1u));
-}
-
-/**
- * @brief Log Wiznet SPI speed with tag for debugging
- * @param tag Description tag for the log message
- */
-static void log_wiznet_spi_speed(const char *tag)
-{
-  spi_hw_t *hw = spi_get_hw(WIZNET_SPI_PORT);
-  uint32_t cpsr = hw->cpsr & 0xFFu;
-  uint32_t scr = (hw->cr0 >> 8) & 0xFFu;
-  uint32_t baud = get_wiznet_spi_baudrate(WIZNET_SPI_PORT);
-
-  debugSerialPrintf("%s SPI baud: %lu Hz (cpsr=%lu, scr=%lu)\n", tag, baud, cpsr, scr);
 }
 
 // ============================================================================
@@ -1172,6 +1212,355 @@ void serveSetLogLevel(Stream &client, const String &req)
   client.println("Connection: close");
   client.println();
   client.printf("OK logVerbosity=%d\n", logVerbosity);
+}
+
+/**
+ * @brief Handler for enabling/disabling miniSEED recording via HTTP
+ * @param client Output stream for HTTP response
+ * @param req Request string containing the query parameters
+ */
+void serveMinISeedControl(Stream &client, const String &req)
+{
+  int enableIdx = req.indexOf("enable=");
+  int formatIdx = req.indexOf("format=");
+  bool newState = miniSeedRecordingEnabled;
+
+  if (formatIdx != -1)
+  {
+    String formatStr = req.substring(formatIdx + 7);
+    int endIdx = 0;
+    while (endIdx < formatStr.length() && isalnum(formatStr.charAt(endIdx)))
+      endIdx++;
+    formatStr = formatStr.substring(0, endIdx);
+    formatStr.toLowerCase();
+
+    if (formatStr == "v3" || formatStr == "3")
+    {
+      miniSeedLogger.setFormat(MinISeedLogger::FORMAT_V3);
+      debugSerialPrintln("miniSEED format set to v3");
+    }
+    else if (formatStr == "v2" || formatStr == "2")
+    {
+      miniSeedLogger.setFormat(MinISeedLogger::FORMAT_V2);
+      debugSerialPrintln("miniSEED format set to v2");
+    }
+  }
+
+  if (enableIdx != -1)
+  {
+    String enableStr = req.substring(enableIdx + 7);
+    int endIdx = 0;
+    while (endIdx < enableStr.length() && (isdigit(enableStr.charAt(endIdx)) || enableStr.charAt(endIdx) == '-'))
+      endIdx++;
+    enableStr = enableStr.substring(0, endIdx);
+    int value = enableStr.toInt();
+    newState = (value != 0);
+
+    if (newState && !sd_card_ready)
+    {
+      debugSerialPrintln("miniSEED Recording: request denied, SD card not ready");
+      newState = false;
+    }
+
+    if (newState)
+    {
+      miniSeedRecordingEnabled = true;
+      miniSeedLogger.setRecordingEnabled(true);
+      debugSerialPrintln("miniSEED Recording: ENABLED");
+    }
+    else
+    {
+      debugSerialPrintln("miniSEED Recording: DISABLED");
+      stopMiniSeedRecording("HTTP disable request");
+    }
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.printf("{\"miniSeedRecording\":%s,\"miniSeedFormat\":\"%s\",\"sdCardReady\":%s}\n",
+                miniSeedRecordingEnabled ? "true" : "false",
+                miniSeedLogger.getFormatString(),
+                sd_card_ready ? "true" : "false");
+}
+
+/**
+ * @brief Handler for safely unmounting SD card via HTTP
+ * @param client Output stream for HTTP response
+ * @param req Request string (unused)
+ */
+void serveSDUnmount(Stream &client, const String &req)
+{
+  debugSerialPrintln("HTTP: SD Card unmount requested");
+
+  bool success = true;
+  String message = "";
+
+  // Always stop recording and close immediately before unmount.
+  stopMiniSeedRecording("SD unmount request");
+
+  // Stop SD-backed operations. SD_SPI is stateless, so no explicit unmount call is needed.
+  debugSerialPrintln("  Releasing SD card for safe removal...");
+
+  // Small delay to ensure all operations complete
+  delay(100);
+
+  sd_card_ready = false;
+
+  debugSerialPrintln("  SD card safely unmounted");
+  message = "SD card safely unmounted. You can now remove it.";
+
+  // Send JSON response
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.print("{\"success\":");
+  client.print(success ? "true" : "false");
+  client.print(",\"message\":\"");
+  client.print(message);
+  client.print("\",\"miniSeedRecording\":false,\"sdCardReady\":false,\"miniSeedFormat\":\"");
+  client.print(miniSeedLogger.getFormatString());
+  client.println("\"}");
+}
+
+/**
+ * @brief Handler for listing mseed files via HTTP
+ * @param client Output stream for HTTP response
+ * @param req Request string (unused)
+ */
+void serveMseedFileList(Stream &client, const String &req)
+{
+  debugSerialPrintln("HTTP: Listing mseed files");
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+
+  if (!sd_card_ready)
+  {
+    client.println("{\"error\":\"SD card not ready\",\"files\":[]}");
+    return;
+  }
+
+  // Check and create directory if it doesn't exist
+  if (!fsDirectoryExists("/data/miniseed"))
+  {
+    debugSerialPrintln("  /data/miniseed doesn't exist, creating...");
+
+    // Create /data directory if needed
+    if (!fsDirectoryExists("/data"))
+    {
+      debugSerialPrintln("  Creating /data directory...");
+      if (!fsCreateDirectory("/data"))
+      {
+        debugSerialPrintln("  Failed to create /data directory");
+        client.println("{\"error\":\"Could not create /data directory\",\"files\":[]}");
+        return;
+      }
+      debugSerialPrintln("  Created /data directory");
+    }
+
+    // Create /data/miniseed directory
+    debugSerialPrintln("  Creating /data/miniseed directory...");
+    if (!fsCreateDirectory("/data/miniseed"))
+    {
+      debugSerialPrintln("  Failed to create /data/miniseed directory");
+      client.println("{\"error\":\"Could not create /data/miniseed directory\",\"files\":[]}");
+      return;
+    }
+    debugSerialPrintln("  Created /data/miniseed directory");
+  }
+
+  client.print("{\"files\":[");
+
+  dirent_t entries[128];
+  int count = sd_spi_read_directory_path(&sd_fs_info, "/data/miniseed", entries, 128);
+  if (count < 0)
+  {
+    debugSerialPrintln("  Failed to open /data/miniseed directory");
+    client.println("],\"error\":\"Could not open /data/miniseed directory\"}");
+    return;
+  }
+
+  bool first = true;
+  for (int i = 0; i < count; i++)
+  {
+    // Skip directories
+    if (entries[i].attributes & 0x10)
+      continue;
+
+    const char *filename = entries[i].filename;
+    int len = strlen(filename);
+    bool isMiniSeedFile = false;
+    if (len > 6 && (strcmp(filename + len - 6, ".mseed") == 0 ||
+                    strcmp(filename + len - 6, ".MSEED") == 0))
+    {
+      isMiniSeedFile = true;
+    }
+    else if (len > 4 && (strcmp(filename + len - 4, ".mse") == 0 ||
+                         strcmp(filename + len - 4, ".MSE") == 0))
+    {
+      isMiniSeedFile = true;
+    }
+
+    if (isMiniSeedFile)
+    {
+      if (!first)
+        client.print(",");
+      first = false;
+
+      client.print("{\"name\":\"");
+      client.print(filename);
+      client.print("\",\"size\":");
+      client.print((unsigned long)entries[i].file_size);
+      client.print("}");
+    }
+  }
+
+  client.println("]}");
+}
+
+/**
+ * @brief Handler for serving a specific mseed file via HTTP
+ * @param client Output stream for HTTP response
+ * @param req Request string containing filename parameter
+ */
+void serveMseedFile(Stream &client, const String &req)
+{
+  debugSerialPrintln("HTTP: Serving mseed file");
+
+  // Extract filename parameter
+  int fileIdx = req.indexOf("file=");
+  if (fileIdx == -1)
+  {
+    client.println("HTTP/1.1 400 Bad Request");
+    client.println("Content-Type: text/html");
+    client.println("Connection: close");
+    client.println();
+    client.println("<html><body><h2>Error: Missing file parameter</h2></body></html>");
+    return;
+  }
+
+  String filename = req.substring(fileIdx + 5);
+  int endIdx = filename.indexOf('&');
+  if (endIdx != -1)
+    filename = filename.substring(0, endIdx);
+  int spaceIdx = filename.indexOf(' ');
+  if (spaceIdx != -1)
+    filename = filename.substring(0, spaceIdx);
+
+  // URL decode filename (basic implementation)
+  filename.replace("%20", " ");
+  filename.replace("%2F", "/");
+
+  debugSerialPrintf("  Requested file: %s\n", filename.c_str());
+
+  if (!sd_card_ready)
+  {
+    client.println("HTTP/1.1 503 Service Unavailable");
+    client.println("Content-Type: text/html");
+    client.println("Connection: close");
+    client.println();
+    client.println("<html><body><h2>Error: SD card not ready</h2></body></html>");
+    return;
+  }
+
+  // Build full path
+  String fullPath = "/data/miniseed/" + filename;
+
+  uint32_t fileSize = 0;
+  if (!sd_spi_get_file_size(&sd_fs_info, fullPath.c_str(), &fileSize))
+  {
+    client.println("HTTP/1.1 404 Not Found");
+    client.println("Content-Type: text/html");
+    client.println("Connection: close");
+    client.println();
+    client.println("<html><body><h2>Error: File not found</h2></body></html>");
+    return;
+  }
+
+  // Send file with appropriate headers
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/octet-stream");
+  client.print("Content-Disposition: attachment; filename=\"");
+  client.print(filename);
+  client.println("\"");
+  client.print("Content-Length: ");
+  client.println((unsigned long)fileSize);
+  client.println("Connection: close");
+  client.println();
+
+  // Stream file content in chunks via SD_SPI
+  const uint32_t bufSize = 512;
+  uint8_t buf[bufSize];
+  uint32_t offset = 0;
+
+  while (offset < fileSize)
+  {
+    int n = sd_spi_read_file_chunk(&sd_fs_info, fullPath.c_str(), offset, buf, bufSize);
+    if (n <= 0)
+      break;
+    client.write(buf, n);
+    offset += (uint32_t)n;
+  }
+
+  if (offset != fileSize)
+  {
+    debugSerialPrintf("  WARNING: Sent %lu/%lu bytes for %s\n", (unsigned long)offset,
+                      (unsigned long)fileSize, fullPath.c_str());
+  }
+
+  debugSerialPrintln("  File sent successfully");
+}
+
+/**
+ * @brief Handler for serving the mseed viewer HTML page
+ * @param client Output stream for HTTP response
+ */
+void serveMseedViewer(Stream &client)
+{
+  debugSerialPrintln("HTTP: Serving mseed viewer page");
+
+  // Open the HTML file from the LittleFS filesystem
+  File htmlFile = LittleFS.open("/mseedviewer.html", "r");
+
+  if (!htmlFile)
+  {
+    client.println("HTTP/1.1 404 Not Found");
+    client.println("Content-Type: text/html");
+    client.println("Connection: close");
+    client.println();
+    client.println("<html><body><h2>Error: mseedviewer.html not found on filesystem.</h2></body></html>");
+    return;
+  }
+
+  // Send HTTP headers
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html; charset=utf-8");
+  client.println("Connection: close");
+  client.println();
+
+  // Read and send file content in chunks
+  const size_t bufSize = 512;
+  char buf[bufSize];
+
+  while (htmlFile.available())
+  {
+    size_t n = htmlFile.readBytes(buf, bufSize - 1);
+    if (n == 0)
+    {
+      break;
+    }
+    buf[n] = '\0'; // Null terminate
+
+    client.print(buf);
+  }
+
+  client.flush();
+  htmlFile.close();
 }
 
 void debugPrint(const char *msg, uint16_t color = TFT_GREEN, int level = LOG_INFO)
@@ -1877,15 +2266,19 @@ void initADS1256()
   tftPrint("Initializing ADC... \n");
 
   // Initialize SPI1 with ADS1256 pin definitions
+  debugSerialPrintln("DEBUG: Setting ADS1256 SPI pins...");
   ADS1256_SPI_PORT.setSCK(ADS1256_SCLK);
   ADS1256_SPI_PORT.setTX(ADS1256_MOSI);
   ADS1256_SPI_PORT.setRX(ADS1256_MISO);
+  debugSerialPrintln("DEBUG: SPI pins configured");
 
   // Setting up CS, RESET, SYNC and SPI
   // Assigning default values to: STATUS, MUX, ADCON, DRATE
   // Performing a SYSCAL
 
+  debugSerialPrintln("DEBUG: Calling ads.InitializeADC()...");
   ads.InitializeADC();
+  debugSerialPrintln("DEBUG: ads.InitializeADC() completed");
 
   // Set a PGA value
   debugSerialPrintln("Setting PGA to 1... ");
@@ -2422,20 +2815,21 @@ NetworkMode initNetworking()
 
 // TODO: Review NTP connection when using WiFi. Due to metal case the WiFi connection is bad could be the reason for the problems
 
-bool setTimeFromNTP()
+bool setTimeFromNTP(NetworkMode currentNetMode)
 {
-  uint8_t ntp_packet[48] = {0};
-  ntp_packet[0] = 0b11100011;
-  int packetSize = 0;
-  uint8_t recv_buf[48];
-  uint32_t start = millis();
-  EthernetUDP ethUdp;
-  WiFiUDP udp;
+  // Pass netMode as parameter to avoid volatile variable stack corruption
+  // Variables declared on stack for minimal memory footprint
   IPAddress ntpServerIP;
+  uint8_t ntp_packet[48] = {0};
+  uint8_t recv_buf[48];
   char resultStr[64];
+  uint32_t start = millis();
+  const uint32_t timeout_ms = 10000; // 10 second overall timeout
+  int packetSize = 0;
   uint32_t secs_since_1900;
   uint32_t unix_time;
-  time_t t; // <-- This is fine; no need for 'struct tm;' here
+
+  debugSerialPrintf("setTimeFromNTP: netMode=%d (WIFI=%d, WIZNET=%d)\n", currentNetMode, NET_WIFI, NET_WIZNET);
 
   if (!ntpServerIP.fromString(NTP_SERVER))
   {
@@ -2443,8 +2837,21 @@ bool setTimeFromNTP()
     return false;
   }
 
-  if (netMode == NET_WIFI)
+  // Check timeout before network operations
+  if (millis() - start > timeout_ms)
   {
+    tftPrint("NTP timeout before network init.\n");
+    return false;
+  }
+
+  // Initialize NTP packet
+  ntp_packet[0] = 0b11100011;
+
+  if (currentNetMode == NET_WIFI)
+  {
+    // Only create WiFi UDP object when needed
+    WiFiUDP udp;
+
     if (udp.begin(0) == 0)
     {
       tftPrint("Failed to open UDP socket for NTP.\n");
@@ -2456,21 +2863,33 @@ bool setTimeFromNTP()
     debugSerialPrint("NTP packet sent, waiting for response...\n");
 
     int attempts = 0;
-    while (attempts < 200) // 200 * 10ms = 2 seconds
+    while (attempts < 1000) // Check more frequently with 10ms intervals
     {
+      // Check overall timeout
+      if (millis() - start > timeout_ms)
+      {
+        udp.stop();
+        tftPrint("NTP overall timeout (10s) exceeded.\n");
+        return false;
+      }
+
       packetSize = udp.parsePacket();
       if (packetSize == 48)
       {
         debugSerialPrintf("NTP response received: %d bytes\n", packetSize);
         udp.read(recv_buf, 48);
+        udp.stop();
         break;
       }
       delay(10);
       attempts++;
     }
   }
-  else if (netMode == NET_WIZNET)
+  else if (currentNetMode == NET_WIZNET)
   {
+    // Only create Ethernet UDP object when needed
+    EthernetUDP ethUdp;
+
     if (ethUdp.begin(0) == 0)
     {
       tftPrint("Failed to open UDP socket for NTP.\n");
@@ -2482,13 +2901,22 @@ bool setTimeFromNTP()
     debugSerialPrint("NTP packet sent, waiting for response...\n");
 
     int attempts = 0;
-    while (attempts < 200) // 200 * 10ms = 2 seconds
+    while (attempts < 1000) // Check more frequently with 10ms intervals
     {
+      // Check overall timeout
+      if (millis() - start > timeout_ms)
+      {
+        ethUdp.stop();
+        tftPrint("NTP overall timeout (10s) exceeded.\n");
+        return false;
+      }
+
       packetSize = ethUdp.parsePacket();
       if (packetSize == 48)
       {
         debugSerialPrintf("NTP response received: %d bytes\n", packetSize);
         ethUdp.read(recv_buf, 48);
+        ethUdp.stop();
         break;
       }
       delay(10);
@@ -2515,7 +2943,7 @@ bool setTimeFromNTP()
   tv.tv_usec = 0;
   settimeofday(&tv, nullptr);
 
-  t = unix_time;
+  time_t t = unix_time;
   tm *tm_info = localtime(&t); // <-- Now 'tm' is fully defined from <time.h>
 
   sprintf(resultStr, "System time set from NTP: %04d-%02d-%02d %02d:%02d:%02d\n",
@@ -2744,6 +3172,17 @@ void serveSensorData(Stream &client)
   client.print(spectrogram_min);
   client.print(",\"spectrogramMax\":");
   client.print(spectrogram_max);
+  client.print(",\"highchartsOk\":");
+  client.print(highchartsWorking ? "true" : "false");
+  client.print(",\"highchartsLastReport\":");
+  client.print((unsigned long)highchartsLastReport);
+  client.print(",\"miniSeedRecording\":");
+  client.print(miniSeedRecordingEnabled ? "true" : "false");
+  client.print(",\"miniSeedFormat\":\"");
+  client.print(miniSeedLogger.getFormatString());
+  client.print("\"");
+  client.print(",\"sdCardReady\":");
+  client.print(sd_card_ready ? "true" : "false");
   client.println("}");
   client.flush();
 }
@@ -2991,6 +3430,38 @@ void serveTouchCalibData(Stream &client, const String &req)
     client.println("touch_calib.txt not found!");
     debugPrintln("touch_calib.txt not found!");
   }
+}
+
+void serveHighchartsStatus(Stream &client, const String &req)
+{
+  // Parse status parameter from request: /highcharts?status=ok or status=error
+  int statusIdx = req.indexOf("status=");
+  if (statusIdx != -1)
+  {
+    String statusStr = req.substring(statusIdx + 7);
+    // Extract until space or end of line
+    int endIdx = statusStr.indexOf(' ');
+    if (endIdx != -1)
+      statusStr = statusStr.substring(0, endIdx);
+
+    highchartsWorking = (statusStr == "ok");
+    highchartsLastReport = millis();
+
+    if (highchartsWorking)
+    {
+      debugPrintln("Highcharts: Loaded successfully");
+    }
+    else
+    {
+      debugPrintf("Highcharts: Error reported - %s\n", statusStr.c_str());
+    }
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/plain");
+  client.println("Connection: close");
+  client.println();
+  client.println("OK");
 }
 
 // ============================================================================
@@ -3598,6 +4069,143 @@ bool handleTouchInput(volatile int &current_mode)
 }
 
 // ============================================================================
+// FILESYSTEM UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * @brief Creates a directory path on the SD card (supports nested directory creation)
+ * @param path Directory path to create (e.g., "/data/miniseed")
+ * @return true if directory was created or already exists, false on error
+ */
+bool fsCreateDirectory(const char *path)
+{
+  if (!sd_card_ready || !path)
+    return false;
+
+  return sd_spi_create_directory(&sd_fs_info, path);
+}
+
+/**
+ * @brief Checks if a directory exists on the SD card
+ * @param path Directory path to check
+ * @return true if directory exists, false otherwise
+ */
+bool fsDirectoryExists(const char *path)
+{
+  if (!sd_card_ready || !path)
+    return false;
+
+  return sd_spi_directory_exists(&sd_fs_info, path);
+}
+
+/**
+ * @brief Checks if a file exists on the SD card
+ * @param path File path to check
+ * @return true if file exists, false otherwise
+ */
+bool fsFileExists(const char *path)
+{
+  if (!sd_card_ready || !path)
+    return false;
+
+  return sd_spi_file_exists(&sd_fs_info, path);
+}
+
+/**
+ * @brief Writes data to a file on the SD card
+ * @param path File path (including parent directories which will be created if needed)
+ * @param data Pointer to data buffer to write
+ * @param size Number of bytes to write
+ * @return Number of bytes written, or -1 on error
+ */
+int fsWriteFile(const char *path, const uint8_t *data, uint32_t size)
+{
+  if (!sd_card_ready || !path || !data || size == 0)
+    return -1;
+
+  return sd_spi_write_file(&sd_fs_info, path, data, size);
+}
+
+/**
+ * @brief Reads data from a file on the SD card
+ * @param path File path to read
+ * @param buffer Pointer to buffer where data will be stored
+ * @param max_size Maximum bytes to read
+ * @return Number of bytes read, or -1 on error
+ */
+int fsReadFile(const char *path, uint8_t *buffer, uint32_t max_size)
+{
+  if (!sd_card_ready || !path || !buffer || max_size == 0)
+    return -1;
+
+  return sd_spi_read_file(&sd_fs_info, path, buffer, max_size);
+}
+
+/**
+ * @brief Deletes a file from the SD card
+ * @param path File path to delete
+ * @return true if file was deleted successfully, false on error
+ */
+bool fsDeleteFile(const char *path)
+{
+  if (!sd_card_ready || !path)
+    return false;
+
+  return sd_spi_delete_file(&sd_fs_info, path);
+}
+
+/**
+ * @brief Lists files and directories in a directory
+ * @param path Directory path to list (default is root "/" if NULL)
+ * @param entries Pointer to array of dirent_t structures to populate
+ * @param max_entries Maximum number of entries to return
+ * @return Number of entries found, or -1 on error
+ */
+int fsListDirectory(const char *path, dirent_t *entries, int max_entries)
+{
+  if (!sd_card_ready || !entries || max_entries <= 0)
+    return -1;
+
+  // For now, only root directory is supported by sd_spi_read_directory
+  // This can be extended in the future if needed
+  return sd_spi_read_directory(&sd_fs_info, entries, max_entries);
+}
+
+/**
+ * @brief Gets the total size and free space on the SD card
+ * @param total_size Pointer to store total size in bytes
+ * @param free_size Pointer to store free space in bytes
+ * @return true if successful, false on error
+ */
+bool fsGetSpaceInfo(uint64_t *total_size, uint64_t *free_size)
+{
+  if (!sd_card_ready || !total_size || !free_size)
+    return false;
+
+  // Calculate total filesystem size
+  *total_size = (uint64_t)sd_fs_info.total_sectors * sd_fs_info.bytes_per_sector;
+
+  // Estimate free space based on free clusters
+  // (This is approximate as FAT table needs to be scanned for accurate count)
+  uint32_t estimated_free_clusters = sd_fs_info.cluster_count / 2; // Rough estimate
+  *free_size = (uint64_t)estimated_free_clusters * sd_fs_info.bytes_per_sector * sd_fs_info.sectors_per_cluster;
+
+  return true;
+}
+
+/**
+ * @brief Gets filesystem type string
+ * @return Pointer to static string describing filesystem type
+ */
+const char *fsGetTypeString()
+{
+  if (!sd_card_ready)
+    return "Unknown";
+
+  return sd_spi_get_fs_type_string(sd_fs_info.type);
+}
+
+// ============================================================================
 // SETUP AT START
 // ============================================================================
 
@@ -3626,6 +4234,8 @@ void setup()
   // Initialize networking after TFT
   netMode = initNetworking();
 
+  debugSerialPrintf("setup(): netMode set to %d (NONE=%d, WIZNET=%d, WIFI=%d)\n", netMode, NET_NONE, NET_WIZNET, NET_WIFI);
+
 #ifdef DEBUG_BUILD
   debugSerialPrintln("Git Version: " GIT_COMMIT_SHORT);
   debugSerialPrintln("Full Commit: " GIT_COMMIT_FULL);
@@ -3636,7 +4246,8 @@ void setup()
   tftPrint("Filesystem initialized...\n");
 
 #if ENABLE_SD_CARD
-  initSDCard(); // Initialize SD card
+  initSDCard(); // Initialize SD card - also initializes miniSEED logger
+  tftPrint("miniSEED logger initialized (sd_spi backend)...\n");
 #else
   debugSerialPrintln("SD card support disabled (ENABLE_SD_CARD=0)");
 #endif
@@ -3708,11 +4319,34 @@ void setup()
     formatMACString(mac, macString);
   }
 
-  // NTP time sync disabled to prevent hanging
-  // if (!setTimeFromNTP())
-  // {
-  //   tftPrint("Failed to set system time from NTP server.\n");
-  // }
+  // Auto-correct netMode if it was reset but we have a valid network connection
+  // (Same protection as in loop() - needed because of known netMode reset issue)
+  debugSerialPrintf("Before NTP: netMode=%d, assignedIP=%d.%d.%d.%d\n", netMode, assignedIP[0], assignedIP[1], assignedIP[2], assignedIP[3]);
+
+  // Check both assignedIP and Ethernet.localIP() as double protection
+  IPAddress currentIP = Ethernet.localIP();
+  debugSerialPrintf("Ethernet.localIP() = %d.%d.%d.%d\n", currentIP[0], currentIP[1], currentIP[2], currentIP[3]);
+
+  if (netMode == NET_NONE && ((assignedIP[0] != 0) || (currentIP[0] != 0)))
+  {
+    debugSerialPrintln("WARNING: netMode was reset to NET_NONE, restoring to NET_WIZNET");
+    netMode = NET_WIZNET;
+    // Update assignedIP if it was cleared
+    if (assignedIP[0] == 0 && currentIP[0] != 0)
+    {
+      assignedIP = currentIP;
+    }
+  }
+
+  debugSerialPrintf("After auto-correct: netMode=%d\n", netMode);
+
+  // NTP time sync enabled with 10-second timeout
+  // Capture netMode here to avoid stack corruption inside function
+  NetworkMode netModeForNTP = netMode;
+  if (!setTimeFromNTP(netModeForNTP))
+  {
+    tftPrint("Failed to set system time from NTP server.\n");
+  }
 
   // Server is already started in initNetworking()
   if (!serverInfoPrinted)
@@ -3863,6 +4497,76 @@ void loop()
   gyroX_block[block_idx] = gyroData.gyro.x;
   gyroY_block[block_idx] = gyroData.gyro.y;
   gyroZ_block[block_idx] = gyroData.gyro.z;
+
+  // Record to miniSEED logger if recording is enabled (Raspberry Shake compatible format)
+  // Data format: int32_t with standardized units for seismic compatibility
+  if (miniSeedRecordingEnabled && sd_card_ready)
+  {
+    time_t now = time(nullptr);
+
+    static uint32_t write_error_count = 0;
+    static unsigned long last_error_log = 0;
+    bool write_ok = true;
+
+    // VEL channels: Store raw ADC counts (int32_t) at 500 Hz
+    // Scaling: 1 count ≈ 0.596 nV per LSB (from ADS1256 datasheet with Vref=2.5V, PGA=1)
+    // Raw counts preserve full ADC resolution for post-processing calibration
+    if (!miniSeedLogger.recordSample("VEL_X", (int32_t)adcValue0, 500, now))
+      write_ok = false;
+    if (!miniSeedLogger.recordSample("VEL_Y", (int32_t)adcValue7, 500, now))
+      write_ok = false;
+
+    if (icm_read_counter == 0) // Record IMU data every 5th sample (40 Hz)
+    {
+      // ACC channels: Convert from m/s² to micro-g (µg) for seismic compatibility
+      // Standard conversion: 1 g = 9.80665 m/s²
+      // Store in units of micro-g (µg) for int32_t precision
+      int32_t acc_x_ug = (int32_t)(accelData.acceleration.x * 1000000.0f / 9.80665f);
+      int32_t acc_y_ug = (int32_t)(accelData.acceleration.y * 1000000.0f / 9.80665f);
+      int32_t acc_z_ug = (int32_t)(accelData.acceleration.z * 1000000.0f / 9.80665f);
+
+      if (!miniSeedLogger.recordSample("ACC_X", acc_x_ug, 100, now))
+        write_ok = false;
+      if (!miniSeedLogger.recordSample("ACC_Y", acc_y_ug, 100, now))
+        write_ok = false;
+      if (!miniSeedLogger.recordSample("ACC_Z", acc_z_ug, 100, now))
+        write_ok = false;
+
+      // GYRO channels: Convert from rad/s to milli-degrees/s (mdps)
+      // Standard conversion: 1 rad/s = 57.2958 deg/s = 57295.8 mdps
+      int32_t gyro_x_mdps = (int32_t)(gyroData.gyro.x * 57295.8f);
+      int32_t gyro_y_mdps = (int32_t)(gyroData.gyro.y * 57295.8f);
+      int32_t gyro_z_mdps = (int32_t)(gyroData.gyro.z * 57295.8f);
+
+      if (!miniSeedLogger.recordSample("GYRO_X", gyro_x_mdps, 100, now))
+        write_ok = false;
+      if (!miniSeedLogger.recordSample("GYRO_Y", gyro_y_mdps, 100, now))
+        write_ok = false;
+      if (!miniSeedLogger.recordSample("GYRO_Z", gyro_z_mdps, 100, now))
+        write_ok = false;
+    }
+
+    // Track and log write errors
+    if (!write_ok)
+    {
+      write_error_count++;
+      // Log errors every 5 seconds to avoid spam
+      if (millis() - last_error_log > 5000)
+      {
+        debugSerialPrintf("WARNING: miniSEED write errors detected (total: %lu). Check SD card/directory.\n",
+                          (unsigned long)write_error_count);
+        last_error_log = millis();
+      }
+    }
+
+    // Intentionally avoid periodic forced flush here.
+    // High-rate channels flush on buffer-full, and recording stop triggers close/flush.
+    // Avoiding synchronous 5-second flush reduces acquisition stalls and trace splitting.
+  }
+  else if (miniSeedRecordingEnabled && !sd_card_ready)
+  {
+    stopMiniSeedRecording("SD card not ready during data loop");
+  }
 
   // Feed selected sensor data into ring buffer for display/analysis modes
   if (mode >= 0)
@@ -4145,6 +4849,11 @@ void loop()
           debugSerialPrintln("HTTP: /setaxis");
           serveAxisControl(client, req);
         }
+        else if (req.indexOf("GET /setloglevel") == 0)
+        {
+          debugSerialPrintln("HTTP: /setloglevel");
+          serveSetLogLevel(client, req);
+        }
         else if (req.indexOf("GET /touchcalibrate") == 0)
         {
           debugSerialPrintln("HTTP: /touchcalibrate");
@@ -4154,6 +4863,39 @@ void loop()
         {
           debugSerialPrintln("HTTP: /touchcalibdata");
           serveTouchCalibData(client, req);
+        }
+        else if (req.indexOf("GET /miniseed") == 0)
+        {
+          debugSerialPrintln("HTTP: /miniseed");
+          serveMinISeedControl(client, req);
+        }
+        else if (req.indexOf("GET /listmseed") == 0)
+        {
+          debugSerialPrintln("HTTP: /listmseed");
+          serveMseedFileList(client, req);
+        }
+        else if (req.indexOf("GET /mseedfile") == 0)
+        {
+          debugSerialPrintln("HTTP: /mseedfile");
+          serveMseedFile(client, req);
+        }
+        else if (req.indexOf("GET /mseedviewer") == 0)
+        {
+          debugSerialPrintln("HTTP: /mseedviewer");
+          serveMseedViewer(client);
+        }
+        else if (req.indexOf("GET /sdunmount") == 0)
+        {
+          debugSerialPrintln("HTTP: /sdunmount");
+          serveSDUnmount(client, req);
+        }
+        else if (req.indexOf("GET /highcharts") == 0)
+        {
+          if (logVerbosity >= LOG_DEBUG)
+          {
+            debugSerialPrintln("HTTP: /highcharts");
+          }
+          serveHighchartsStatus(client, req);
         }
         else
         {
@@ -4272,6 +5014,11 @@ void loop()
           debugSerialPrintln("HTTP: /setaxis");
           serveAxisControl(client, req);
         }
+        else if (req.indexOf("GET /setloglevel") == 0)
+        {
+          debugSerialPrintln("HTTP: /setloglevel");
+          serveSetLogLevel(client, req);
+        }
         else if (req.indexOf("GET /touchcalibrate") == 0)
         {
           debugSerialPrintln("HTTP: /touchcalibrate");
@@ -4281,6 +5028,39 @@ void loop()
         {
           debugSerialPrintln("HTTP: /touchcalibdata");
           serveTouchCalibData(client, req);
+        }
+        else if (req.indexOf("GET /miniseed") == 0)
+        {
+          debugSerialPrintln("HTTP: /miniseed");
+          serveMinISeedControl(client, req);
+        }
+        else if (req.indexOf("GET /listmseed") == 0)
+        {
+          debugSerialPrintln("HTTP: /listmseed");
+          serveMseedFileList(client, req);
+        }
+        else if (req.indexOf("GET /mseedfile") == 0)
+        {
+          debugSerialPrintln("HTTP: /mseedfile");
+          serveMseedFile(client, req);
+        }
+        else if (req.indexOf("GET /mseedviewer") == 0)
+        {
+          debugSerialPrintln("HTTP: /mseedviewer");
+          serveMseedViewer(client);
+        }
+        else if (req.indexOf("GET /sdunmount") == 0)
+        {
+          debugSerialPrintln("HTTP: /sdunmount");
+          serveSDUnmount(client, req);
+        }
+        else if (req.indexOf("GET /highcharts") == 0)
+        {
+          if (logVerbosity >= LOG_DEBUG)
+          {
+            debugSerialPrintln("HTTP: /highcharts");
+          }
+          serveHighchartsStatus(client, req);
         }
         else
         {

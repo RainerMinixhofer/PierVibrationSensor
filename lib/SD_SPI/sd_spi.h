@@ -279,6 +279,52 @@ extern "C"
     bool sd_spi_delete_file(const fs_info_t *fs_info, const char *filepath);
 
     /**
+     * @brief File handle for efficient sequential reading
+     */
+    typedef struct
+    {
+        const fs_info_t *fs_info;
+        uint32_t file_size;
+        uint32_t current_cluster;
+        uint32_t bytes_per_cluster;
+        uint32_t position; // Current read position in file
+        bool is_open;
+    } file_handle_t;
+
+    /**
+     * @brief Open a file for efficient streaming reads
+     * @param fs_info Filesystem info
+     * @param filepath Full file path
+     * @param handle Output file handle
+     * @return true if successful, false otherwise
+     */
+    bool sd_spi_open_file(const fs_info_t *fs_info, const char *filepath, file_handle_t *handle);
+
+    /**
+     * @brief Read data from an opened file (sequential, efficient)
+     * @param handle File handle from sd_spi_open_file
+     * @param buffer Buffer to store read data
+     * @param size Number of bytes to read
+     * @return Number of bytes actually read, 0 at EOF, -1 on error
+     */
+    int sd_spi_read_from_handle(file_handle_t *handle, uint8_t *buffer, uint32_t size);
+
+    /**
+     * @brief Close a file handle
+     * @param handle File handle to close
+     */
+    void sd_spi_close_file(file_handle_t *handle);
+
+    /**
+     * @brief Read multiple blocks efficiently (for large file transfers)
+     * @param start_block Starting block number
+     * @param block_count Number of blocks to read
+     * @param buffer Buffer to store data (must be block_count * 512 bytes)
+     * @return true if successful, false otherwise
+     */
+    bool sd_spi_read_multiple_blocks(uint32_t start_block, uint32_t block_count, uint8_t *buffer);
+
+    /**
      * @brief Check if a directory exists
      * @param fs_info Filesystem info
      * @param path Directory path to check

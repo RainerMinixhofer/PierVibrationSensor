@@ -47,6 +47,137 @@
       font-weight: bold;
       color: #333;
     }
+
+    .pot-card {
+      margin-top: 20px;
+      padding: 10px;
+      background: #ffffff;
+      border-radius: 6px;
+      border: 1px solid #ddd;
+      max-width: 400px;
+    }
+
+    .pot-row {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed #e0e0e0;
+    }
+
+    .pot-grid {
+      display: flex;
+      gap: 18px;
+      align-items: stretch;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
+    .pot-panel {
+      flex: 1 1 320px;
+      min-width: 280px;
+      padding: 10px 12px;
+      border: 1px dashed #e0e0e0;
+      border-radius: 6px;
+      background: #fafafa;
+    }
+
+    .pot-row:first-of-type {
+      border-top: none;
+      padding-top: 0;
+      margin-top: 4px;
+    }
+
+    .pot-input {
+      width: 90px;
+      margin-right: 4px;
+    }
+
+    .pot-status {
+      margin-top: 8px;
+      font-size: 0.9em;
+      color: #333;
+      min-height: 1.2em;
+    }
+
+    .magcal-status {
+      margin-top: 6px;
+      font-size: 0.9em;
+      color: #333;
+      min-height: 2.4em;
+      max-width: 340px;
+      white-space: normal;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    .udp-grid {
+      display: grid;
+      grid-template-columns: repeat(2, max-content);
+      gap: 4px 8px;
+      justify-content: start;
+      margin-top: 6px;
+    }
+
+    .udp-col {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .udp-col .stream-btn {
+      margin: 3px 0;
+    }
+
+    .accel-chart-wrap {
+      display: flex;
+      align-items: stretch;
+      gap: 12px;
+      width: 100%;
+    }
+
+    .accel-chart-main {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    .orientation-inset {
+      flex: 0 0 168px;
+      width: 168px;
+      height: 168px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid #d2d2d2;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+      overflow: hidden;
+    }
+
+    .orientation-inset canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    @media (max-width: 900px) {
+      .accel-chart-wrap {
+        flex-direction: column;
+      }
+
+      .orientation-inset {
+        width: 150px;
+        height: 150px;
+        flex-basis: 150px;
+        align-self: flex-end;
+      }
+
+      .pot-grid {
+        flex-direction: column;
+      }
+
+      .udp-grid {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 
@@ -88,6 +219,20 @@
         <button id="axisX" class="stream-btn enabled" onclick="setAxis('X')">vx</button><br>
         <button id="axisY" class="stream-btn disabled" onclick="setAxis('Y')">vy</button><br>
         <button id="axisR" class="stream-btn disabled" onclick="setAxis('R')">vr</button>
+        <div style="margin-top: 14px;">
+          <h3 style="margin: 5px 0;">UDP Streams</h3>
+          <div class="udp-grid">
+            <div class="udp-col">
+              <button id="velocXBtn" class="stream-btn disabled" onclick="toggleStream('velocX')">vx</button>
+              <button id="velocYBtn" class="stream-btn disabled" onclick="toggleStream('velocY')">vy</button>
+            </div>
+            <div class="udp-col">
+              <button id="accelXBtn" class="stream-btn disabled" onclick="toggleStream('accelX')">ax</button>
+              <button id="accelYBtn" class="stream-btn disabled" onclick="toggleStream('accelY')">ay</button>
+              <button id="accelZBtn" class="stream-btn disabled" onclick="toggleStream('accelZ')">az</button>
+            </div>
+          </div>
+        </div>
       </div>
       <div style="margin-top: 20px;">
         <h3 style="margin: 5px 0;">Touch Calibration</h3>
@@ -99,6 +244,19 @@
         </select><br>
         <button class="stream-btn" onclick="startCalibration()">Calibrate Touch</button><br>
         <button id="calibDataBtn" class="stream-btn" onclick="toggleCalibrationData()">Show Calibration Data</button>
+      </div>
+      <div style="margin-top: 16px;">
+        <h3 style="margin: 5px 0;">Magnetometer Calibration</h3>
+        <button id="magCalStartBtn" class="stream-btn" onclick="magCalAction('start')">Start Guided
+          Calibration</button><br>
+        <button id="magCalCaptureBtn" class="stream-btn hidden" onclick="magCalAction('capture')">Capture Current
+          Pose</button><br>
+        <button id="magCalStatusBtn" class="stream-btn" onclick="magCalAction('status')">Refresh Status</button><br>
+        <button id="magCalCancelBtn" class="stream-btn hidden" onclick="magCalAction('cancel')">Cancel</button><br>
+        <button id="magCalResetBtn" class="stream-btn" onclick="magCalAction('reset')">Reset Stored Calibration</button>
+        <button id="magCalDataBtn" class="stream-btn" onclick="toggleMagCalibrationData()">Show Mag Calibration
+          Data</button>
+        <div id="magCalStatus" class="magcal-status">MagCal: idle</div>
       </div>
       <div style="margin-top: 20px;">
         <h3 style="margin: 5px 0;">Data Recording</h3>
@@ -115,7 +273,8 @@
         <h3 style="margin: 5px 0;">SD Card Management</h3>
         <button id="unmountBtn" class="stream-btn" onclick="unmountSDCard()" style="background: #ff9800;">Unmount SD
           Card</button><br>
-        <button id="viewMseedBtn" class="stream-btn" onclick="openMseedViewer()" style="background: #2196F3; margin-top: 8px;">View MiniSEED Files</button><br>
+        <button id="viewMseedBtn" class="stream-btn" onclick="openMseedViewer()"
+          style="background: #2196F3; margin-top: 8px;">View MiniSEED Files</button><br>
         <small style="color: #666; display: block; margin-top: 5px;">Safely unmount SD card before removal<br>(flushes
           buffers, closes files)</small>
       </div>
@@ -124,26 +283,74 @@
         <pre id="calibDataContent"
           style="background: #f0f0f0; padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto; font-size: 11px;"></pre>
       </div>
+      <div id="magCalibDataDisplay" style="margin-top: 10px; display: none; max-width: 400px;">
+        <h4 style="margin: 5px 0;">Mag Calibration Data:</h4>
+        <pre id="magCalibDataContent"
+          style="background: #f0f0f0; padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto; font-size: 11px;"></pre>
+      </div>
     </div>
     <div style="flex: 1;">
-      <div>
-        <button id="velocXBtn" class="stream-btn disabled" onclick="toggleStream('velocX')">UDP velocX: OFF</button>
-        <button id="velocYBtn" class="stream-btn disabled" onclick="toggleStream('velocY')">UDP velocY: OFF</button>
-        <button id="accelXBtn" class="stream-btn disabled" onclick="toggleStream('accelX')">UDP accelX: OFF</button>
-        <button id="accelYBtn" class="stream-btn disabled" onclick="toggleStream('accelY')">UDP accelY: OFF</button>
-        <button id="accelZBtn" class="stream-btn disabled" onclick="toggleStream('accelZ')">UDP accelZ: OFF</button>
-      </div>
       <div id="chart-container">
         <!-- VELOCITY_CHART_START -->
         <div class="chart-box">
           <div id="velocChart" style="width:100%;height:300px;"></div>
         </div>
         <!-- VELOCITY_CHART_END -->
+        <div class="pot-card" style="max-width: 900px; margin-top: 10px;">
+          <h3 style="margin: 5px 0;">AD620 Gain/Offset Tuning</h3>
+          <small style="color: #666; display: block; margin-bottom: 4px;">
+            ADS ch0 uses pot ch0, ADS ch7 uses pot ch1.
+          </small>
+
+          <div class="pot-grid">
+            <div class="pot-row pot-panel">
+              <strong>ADS ch0</strong><br>
+              <label>Gain wiper (0..255):</label><br>
+              <input id="gainWiper0" class="pot-input" type="number" min="0" max="255" step="1" value="0">
+              <button class="stream-btn" onclick="applyGainWiper(0)">Apply Gain</button><br>
+              <small>Current: <span id="gainCurrent0">---</span></small><br>
+
+              <label>Offset voltage [V]:</label><br>
+              <input id="offsetVolt0" class="pot-input" type="number" min="0" max="5" step="0.001" value="0.000">
+              <button class="stream-btn" onclick="applyOffsetVoltage(0)">Apply Offset</button><br>
+              <small>Current: <span id="offsetCurrent0">---</span> V (wiper <span
+                  id="offsetWiperCurrent0">---</span>)</small>
+            </div>
+
+            <div class="pot-row pot-panel">
+              <strong>ADS ch7</strong><br>
+              <label>Gain wiper (0..255):</label><br>
+              <input id="gainWiper1" class="pot-input" type="number" min="0" max="255" step="1" value="0">
+              <button class="stream-btn" onclick="applyGainWiper(1)">Apply Gain</button><br>
+              <small>Current: <span id="gainCurrent1">---</span></small><br>
+
+              <label>Offset voltage [V]:</label><br>
+              <input id="offsetVolt1" class="pot-input" type="number" min="0" max="5" step="0.001" value="0.000">
+              <button class="stream-btn" onclick="applyOffsetVoltage(1)">Apply Offset</button><br>
+              <small>Current: <span id="offsetCurrent1">---</span> V (wiper <span
+                  id="offsetWiperCurrent1">---</span>)</small>
+            </div>
+          </div>
+
+          <div id="potControlStatus" class="pot-status">Waiting for DigPot status...</div>
+        </div>
         <!-- ACCELERATION_CHART_START -->
         <div class="chart-box">
-          <div id="accelChart" style="width:100%;height:300px;"></div>
+          <div class="accel-chart-wrap">
+            <div class="accel-chart-main">
+              <div id="accelChart" style="width:100%;height:300px;"></div>
+            </div>
+            <div class="orientation-inset" id="orientationInset">
+              <canvas id="orientationCanvas" width="168" height="168"></canvas>
+            </div>
+          </div>
         </div>
         <!-- ACCELERATION_CHART_END -->
+        <!-- MAGNETOMETER_CHART_START -->
+        <div class="chart-box">
+          <div id="magChart" style="width:100%;height:300px;"></div>
+        </div>
+        <!-- MAGNETOMETER_CHART_END -->
       </div>
     </div>
   </div>
@@ -180,10 +387,400 @@
       accelZ: false
     };
 
+    const udpStreamLabels = {
+      velocX: 'vx',
+      velocY: 'vy',
+      accelX: 'ax',
+      accelY: 'ay',
+      accelZ: 'az'
+    };
+
     let miniSeedRecording = false;
     let miniSeedFormat = 'v2';
+    let activeVelocLogStart = null;
+    let velocLogIntervals = [];
+    let lastVelocSampleTime = null;
+    let velocBgRecordingState = null;
 
     let showSIUnits = true;
+    const orientationCanvas = document.getElementById('orientationCanvas');
+    const orientationCtx = orientationCanvas ? orientationCanvas.getContext('2d') : null;
+    let dataPollIntervalMs = 200;
+    let dataPollTimer = null;
+    let orientationState = {
+      southInBody: null,
+      eastInBody: null,
+      upInBody: null,
+      valid: false
+    };
+    let filteredMag = null;
+    const magLpfAlpha = 0.18;
+
+    function scheduleNextFetch() {
+      if (dataPollTimer) {
+        clearTimeout(dataPollTimer);
+      }
+      dataPollTimer = setTimeout(fetchData, dataPollIntervalMs);
+    }
+
+    function vecLength(v) {
+      return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    }
+
+    function vecNormalize(v) {
+      const len = vecLength(v);
+      if (len < 1e-8) {
+        return null;
+      }
+      return { x: v.x / len, y: v.y / len, z: v.z / len };
+    }
+
+    function vecCross(a, b) {
+      return {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x
+      };
+    }
+
+    function vecDot(a, b) {
+      return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    function worldFromBody(bodyVec, state) {
+      return {
+        x: vecDot(bodyVec, state.southInBody),
+        y: vecDot(bodyVec, state.eastInBody),
+        z: vecDot(bodyVec, state.upInBody)
+      };
+    }
+
+    function projectPoint(p, width, height) {
+      // Camera south of scene looking North.
+      // World coords: x = South, y = East, z = Up (gravity = -z).
+      // Screen mapping: East (y) -> right, Up (z) -> screen-up, South (x) = depth toward viewer.
+      // Use weak perspective to avoid a strongly distorted box while preserving
+      // a small depth cue from South-axis movement.
+      const camDist = 8.0;
+      const focal = 130;
+      const perspectiveStrength = 0.35; // 0 = orthographic, 1 = full perspective
+      const depth = Math.max(0.6, camDist - p.x * perspectiveStrength);
+      const s = focal / depth;
+      return {
+        x: width * 0.5 + p.y * s,  // East  -> screen right
+        y: height * 0.58 - p.z * s,  // Up    -> screen up  (gravity=-z is screen-down)
+        depth: depth
+      };
+    }
+
+    function drawArrow2D(ctx, from, to, color, label) {
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      const length = Math.max(1e-6, Math.sqrt(dx * dx + dy * dy));
+      const ux = dx / length;
+      const uy = dy / length;
+      const head = 8;
+
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(from.x, from.y);
+      ctx.lineTo(to.x, to.y);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(to.x, to.y);
+      ctx.lineTo(to.x - ux * head - uy * head * 0.55, to.y - uy * head + ux * head * 0.55);
+      ctx.lineTo(to.x - ux * head + uy * head * 0.55, to.y - uy * head - ux * head * 0.55);
+      ctx.closePath();
+      ctx.fill();
+
+      if (label) {
+        ctx.font = '12px Arial';
+        ctx.fillText(label, to.x + 4, to.y - 4);
+      }
+    }
+
+    function drawOrientationInset(state) {
+      if (!orientationCtx || !orientationCanvas) {
+        return;
+      }
+
+      const width = orientationCanvas.width;
+      const height = orientationCanvas.height;
+      orientationCtx.clearRect(0, 0, width, height);
+
+      orientationCtx.fillStyle = '#f8f8f8';
+      orientationCtx.fillRect(0, 0, width, height);
+
+      if (!state.valid) {
+        orientationCtx.fillStyle = '#666';
+        orientationCtx.font = '11px Arial';
+        orientationCtx.fillText('Waiting for accel + mag data', 10, 18);
+        return;
+      }
+
+      const boxScale = 2.0;
+      const verticesBody = [
+        { x: -0.72 * boxScale, y: -0.60 * boxScale, z: -0.27 * boxScale },
+        { x: 0.72 * boxScale, y: -0.60 * boxScale, z: -0.27 * boxScale },
+        { x: 0.72 * boxScale, y: 0.60 * boxScale, z: -0.27 * boxScale },
+        { x: -0.72 * boxScale, y: 0.60 * boxScale, z: -0.27 * boxScale },
+        { x: -0.72 * boxScale, y: -0.60 * boxScale, z: 0.27 * boxScale },
+        { x: 0.72 * boxScale, y: -0.60 * boxScale, z: 0.27 * boxScale },
+        { x: 0.72 * boxScale, y: 0.60 * boxScale, z: 0.27 * boxScale },
+        { x: -0.72 * boxScale, y: 0.60 * boxScale, z: 0.27 * boxScale }
+      ];
+
+      const projected = verticesBody.map(v => projectPoint(worldFromBody(v, state), width, height));
+      const edges = [
+        [0, 1], [1, 2], [2, 3], [3, 0],
+        [4, 5], [5, 6], [6, 7], [7, 4],
+        [0, 4], [1, 5], [2, 6], [3, 7]
+      ];
+
+      orientationCtx.strokeStyle = '#2c3e50';
+      orientationCtx.lineWidth = 1.4;
+      edges.forEach(edge => {
+        const a = projected[edge[0]];
+        const b = projected[edge[1]];
+        orientationCtx.beginPath();
+        orientationCtx.moveTo(a.x, a.y);
+        orientationCtx.lineTo(b.x, b.y);
+        orientationCtx.stroke();
+      });
+
+      const boxCenter = projectPoint(worldFromBody({ x: 0, y: 0, z: 0 }, state), width, height);
+      const localXTip = projectPoint(worldFromBody({ x: 0, y: -1.20 * boxScale, z: 0 }, state), width, height);
+      const localYTip = projectPoint(worldFromBody({ x: 1.20 * boxScale, y: 0, z: 0 }, state), width, height);
+
+      drawArrow2D(orientationCtx, boxCenter, localXTip, '#d81b60', 'x');
+      drawArrow2D(orientationCtx, boxCenter, localYTip, '#1e88e5', 'y');
+
+      const origin = { x: 22, y: height - 20 };
+      // E (East)  -> right on screen
+      drawArrow2D(orientationCtx, origin, { x: origin.x + 26, y: origin.y }, '#00897b', 'E');
+      // Z (Up / anti-gravity) -> screen up; -Z = gravity is naturally screen-down
+      drawArrow2D(orientationCtx, origin, { x: origin.x, y: origin.y - 26 }, '#f4511e', 'Z');
+      // S (South = depth toward viewer) -> foreshortened arrow out of screen
+      drawArrow2D(orientationCtx, origin, { x: origin.x - 17, y: origin.y + 12 }, '#6a1b9a', 'S');
+    }
+
+    function updateOrientationFromSensors(d) {
+      if (d.accelX === undefined || d.accelY === undefined || d.accelZ === undefined ||
+        d.magX === undefined || d.magY === undefined || d.magZ === undefined) {
+        orientationState.valid = false;
+        drawOrientationInset(orientationState);
+        return;
+      }
+
+      const accel = { x: Number(d.accelX), y: Number(d.accelY), z: Number(d.accelZ) };
+      const magRaw = { x: Number(d.magX), y: Number(d.magY), z: Number(d.magZ) };
+
+      if (!Number.isFinite(magRaw.x) || !Number.isFinite(magRaw.y) || !Number.isFinite(magRaw.z)) {
+        orientationState.valid = false;
+        drawOrientationInset(orientationState);
+        return;
+      }
+
+      // Exponential low-pass filter for magnetometer vector to stabilize yaw.
+      if (!filteredMag) {
+        filteredMag = { ...magRaw };
+      } else {
+        filteredMag = {
+          x: filteredMag.x + (magRaw.x - filteredMag.x) * magLpfAlpha,
+          y: filteredMag.y + (magRaw.y - filteredMag.y) * magLpfAlpha,
+          z: filteredMag.z + (magRaw.z - filteredMag.z) * magLpfAlpha
+        };
+      }
+      const mag = filteredMag;
+
+      const upInBody = vecNormalize(accel);
+      if (!upInBody) {
+        orientationState.valid = false;
+        drawOrientationInset(orientationState);
+        return;
+      }
+
+      const eastInBody = vecNormalize(vecCross(upInBody, mag));
+      if (!eastInBody) {
+        orientationState.valid = false;
+        drawOrientationInset(orientationState);
+        return;
+      }
+
+      const northInBody = vecNormalize(vecCross(eastInBody, upInBody));
+      if (!northInBody) {
+        orientationState.valid = false;
+        drawOrientationInset(orientationState);
+        return;
+      }
+
+      orientationState = {
+        southInBody: { x: -northInBody.x, y: -northInBody.y, z: -northInBody.z },
+        eastInBody,
+        upInBody,
+        valid: true
+      };
+
+      drawOrientationInset(orientationState);
+    }
+
+    function setPotStatus(message, isError = false) {
+      const el = document.getElementById('potControlStatus');
+      el.textContent = message;
+      el.style.color = isError ? '#c62828' : '#333';
+    }
+
+    function updateMagCalStatus(d) {
+      const statusEl = document.getElementById('magCalStatus');
+      if (!statusEl) {
+        return;
+      }
+
+      const setBtnVisible = (id, visible) => {
+        const el = document.getElementById(id);
+        if (!el) {
+          return;
+        }
+        if (visible) {
+          el.classList.remove('hidden');
+        } else {
+          el.classList.add('hidden');
+        }
+      };
+
+      if (!d) {
+        statusEl.textContent = 'MagCal: no status available';
+        statusEl.style.color = '#333';
+        setBtnVisible('magCalStartBtn', true);
+        setBtnVisible('magCalCaptureBtn', false);
+        setBtnVisible('magCalCancelBtn', false);
+        setBtnVisible('magCalResetBtn', true);
+        setBtnVisible('magCalDataBtn', true);
+        setBtnVisible('magCalStatusBtn', true);
+        return;
+      }
+
+      const msg = d.message || d.magCalMessage || 'No message';
+      const step = (d.step !== undefined) ? d.step : d.magCalStep;
+      const total = (d.totalSteps !== undefined) ? d.totalSteps : d.magCalTotalSteps;
+      const nextPose = d.nextPose || '';
+      const active = (d.active !== undefined) ? !!d.active : !!d.magCalActive;
+      const valid = (d.calValid !== undefined) ? !!d.calValid : !!d.magCalValid;
+
+      // Only show command buttons that are relevant to current workflow state.
+      setBtnVisible('magCalStartBtn', !active);
+      setBtnVisible('magCalCaptureBtn', active);
+      setBtnVisible('magCalCancelBtn', active);
+      setBtnVisible('magCalResetBtn', !active);
+      setBtnVisible('magCalDataBtn', !active || valid);
+      setBtnVisible('magCalStatusBtn', true);
+
+      let text = `MagCal ${active ? 'active' : 'idle'} | step ${step}/${total} | ${msg}`;
+      if (nextPose) {
+        text += ` | next: ${nextPose}`;
+      }
+      text += ` | stored: ${valid ? 'yes' : 'no'}`;
+
+      statusEl.textContent = text;
+      statusEl.style.color = active ? '#1565c0' : (valid ? '#2e7d32' : '#333');
+    }
+
+    function magCalAction(action) {
+      fetch('/magcalibrate?action=' + encodeURIComponent(action))
+        .then(response => response.json())
+        .then(result => {
+          console.log('Mag calibration:', result);
+          updateMagCalStatus(result);
+        })
+        .catch(error => {
+          console.error('Error in mag calibration action:', error);
+          updateMagCalStatus({ message: `Error: ${error.message}`, active: false, calValid: false, step: 0, totalSteps: 6 });
+        });
+    }
+
+    function updatePotUiFromData(d) {
+      if (d.gainPotCh0Wiper !== undefined) {
+        document.getElementById('gainCurrent0').textContent = d.gainPotCh0Wiper;
+      }
+      if (d.gainPotCh1Wiper !== undefined) {
+        document.getElementById('gainCurrent1').textContent = d.gainPotCh1Wiper;
+      }
+      if (d.offsetPotCh0Voltage !== undefined) {
+        document.getElementById('offsetCurrent0').textContent = Number(d.offsetPotCh0Voltage).toFixed(4);
+      }
+      if (d.offsetPotCh1Voltage !== undefined) {
+        document.getElementById('offsetCurrent1').textContent = Number(d.offsetPotCh1Voltage).toFixed(4);
+      }
+      if (d.offsetPotCh0Wiper !== undefined) {
+        document.getElementById('offsetWiperCurrent0').textContent = d.offsetPotCh0Wiper;
+      }
+      if (d.offsetPotCh1Wiper !== undefined) {
+        document.getElementById('offsetWiperCurrent1').textContent = d.offsetPotCh1Wiper;
+      }
+
+      if (d.gainPotDetected === false || d.offsetPotDetected === false) {
+        const missingPots = [];
+        if (d.gainPotDetected === false) {
+          missingPots.push('GainPot (TPL0102 @ 0x50)');
+        }
+        if (d.offsetPotDetected === false) {
+          missingPots.push('OffsetPot (AD5142A @ 0x23)');
+        }
+        setPotStatus(`DigPot I2C probe failed: ${missingPots.join(', ')} not detected.`, true);
+      } else if (d.gainPotDetected === true && d.offsetPotDetected === true) {
+        setPotStatus('DigPots detected. Tune ADS ch0/ch7 with pot ch0/ch1.');
+      }
+    }
+
+    function applyGainWiper(channel) {
+      const input = document.getElementById(`gainWiper${channel}`);
+      const wiper = Number(input.value);
+      if (!Number.isInteger(wiper) || wiper < 0 || wiper > 255) {
+        setPotStatus(`Invalid gain wiper for channel ${channel}. Use 0..255.`, true);
+        return;
+      }
+
+      fetch(`/setgainpot?channel=${channel}&wiper=${wiper}`)
+        .then(response => response.json())
+        .then(result => {
+          if (!result.ok) {
+            throw new Error(result.error || 'Gain write failed');
+          }
+          setPotStatus(`GainPot ch${channel} set to wiper ${result.wiper}.`);
+          document.getElementById(`gainCurrent${channel}`).textContent = result.wiper;
+        })
+        .catch(error => {
+          console.error('Error setting gain wiper:', error);
+          setPotStatus(`Failed to set GainPot ch${channel}: ${error.message}`, true);
+        });
+    }
+
+    function applyOffsetVoltage(channel) {
+      const input = document.getElementById(`offsetVolt${channel}`);
+      const voltage = Number(input.value);
+      if (!Number.isFinite(voltage)) {
+        setPotStatus(`Invalid offset voltage for channel ${channel}.`, true);
+        return;
+      }
+
+      fetch(`/setoffsetpot?channel=${channel}&voltage=${encodeURIComponent(voltage)}`)
+        .then(response => response.json())
+        .then(result => {
+          if (!result.ok) {
+            throw new Error(result.error || 'Offset write failed');
+          }
+          setPotStatus(`OffsetPot ch${channel} -> ${Number(result.appliedVoltage).toFixed(4)} V (wiper ${result.wiper}).`);
+          document.getElementById(`offsetCurrent${channel}`).textContent = Number(result.appliedVoltage).toFixed(4);
+          document.getElementById(`offsetWiperCurrent${channel}`).textContent = result.wiper;
+        })
+        .catch(error => {
+          console.error('Error setting offset voltage:', error);
+          setPotStatus(`Failed to set OffsetPot ch${channel}: ${error.message}`, true);
+        });
+    }
 
     function toggleUnit() {
       showSIUnits = !showSIUnits;
@@ -201,36 +798,119 @@
       accelChart.series[0].setData([]);
       accelChart.series[1].setData([]);
       accelChart.series[2].setData([]);
+      magChart.series[0].setData([]);
+      magChart.series[1].setData([]);
+      magChart.series[2].setData([]);
+      activeVelocLogStart = null;
+      velocLogIntervals = [];
+      lastVelocSampleTime = null;
+      velocBgRecordingState = null;
+      redrawVelocLogBands();
+    }
+
+    function setMiniSeedButtonState(recording) {
+      const btn = document.getElementById('miniseedBtn');
+      if (!btn) {
+        return;
+      }
+
+      if (recording) {
+        btn.classList.remove('disabled');
+        btn.classList.add('enabled');
+        btn.textContent = 'miniSEED: ON';
+      } else {
+        btn.classList.remove('enabled');
+        btn.classList.add('disabled');
+        btn.textContent = 'miniSEED: OFF';
+      }
+    }
+
+    function redrawVelocLogBands() {
+      const axis = velocChart.xAxis[0];
+      if (!axis) {
+        return;
+      }
+
+      const intervalsToDraw = velocLogIntervals.map(interval => ({
+        from: interval.start,
+        to: interval.end
+      }));
+
+      if (activeVelocLogStart !== null) {
+        intervalsToDraw.push({
+          from: activeVelocLogStart,
+          to: Number.MAX_SAFE_INTEGER
+        });
+      }
+
+      const plotBands = intervalsToDraw
+        .filter(interval => interval.to > interval.from)
+        .map(interval => ({
+          from: interval.from,
+          to: interval.to,
+          color: 'rgba(180, 180, 180, 0.35)',
+          zIndex: 0
+        }));
+
+      axis.update({ plotBands }, false);
+
+      const chartEl = document.getElementById('velocChart');
+      if (chartEl) {
+        chartEl.style.backgroundColor = '#ffffff';
+      }
+      velocChart.redraw(false);
+    }
+
+    function setUdpStreamButtonState(channel, enabled) {
+      udpStreams[channel] = !!enabled;
+      const btn = document.getElementById(channel + 'Btn');
+      if (!btn) {
+        return;
+      }
+
+      if (udpStreams[channel]) {
+        btn.classList.remove('disabled');
+        btn.classList.add('enabled');
+        btn.textContent = udpStreamLabels[channel];
+      } else {
+        btn.classList.remove('enabled');
+        btn.classList.add('disabled');
+        btn.textContent = udpStreamLabels[channel];
+      }
+    }
+
+    function updateUdpStreamsFromData(d) {
+      if (d.udpVelocX !== undefined) {
+        setUdpStreamButtonState('velocX', d.udpVelocX);
+      }
+      if (d.udpVelocY !== undefined) {
+        setUdpStreamButtonState('velocY', d.udpVelocY);
+      }
+      if (d.udpAccelX !== undefined) {
+        setUdpStreamButtonState('accelX', d.udpAccelX);
+      }
+      if (d.udpAccelY !== undefined) {
+        setUdpStreamButtonState('accelY', d.udpAccelY);
+      }
+      if (d.udpAccelZ !== undefined) {
+        setUdpStreamButtonState('accelZ', d.udpAccelZ);
+      }
     }
 
     function toggleStream(channel) {
-      udpStreams[channel] = !udpStreams[channel];
-      const btn = document.getElementById(channel + "Btn");
-      if (udpStreams[channel]) {
-        btn.classList.remove("disabled");
-        btn.classList.add("enabled");
-        btn.textContent = "UDP " + channel + ": ON";
-      } else {
-        btn.classList.remove("enabled");
-        btn.classList.add("disabled");
-        btn.textContent = "UDP " + channel + ": OFF";
-      }
-      fetch('/udpstream?channel=' + channel + '&enable=' + (udpStreams[channel] ? 1 : 0));
+      const nextState = !udpStreams[channel];
+      setUdpStreamButtonState(channel, nextState);
+      fetch('/udpstream?channel=' + channel + '&enable=' + (nextState ? 1 : 0))
+        .catch(error => {
+          console.error('Error toggling UDP stream:', error);
+          setUdpStreamButtonState(channel, !nextState);
+        });
     }
 
     function toggleMiniSEED() {
       miniSeedRecording = !miniSeedRecording;
-      const btn = document.getElementById('miniseedBtn');
       const selectedFormat = document.getElementById('miniseedFormat').value;
-      if (miniSeedRecording) {
-        btn.classList.remove("disabled");
-        btn.classList.add("enabled");
-        btn.textContent = "miniSEED: ON";
-      } else {
-        btn.classList.remove("enabled");
-        btn.classList.add("disabled");
-        btn.textContent = "miniSEED: OFF";
-      }
+      setMiniSeedButtonState(miniSeedRecording);
       fetch('/miniseed?enable=' + (miniSeedRecording ? 1 : 0) + '&format=' + selectedFormat)
         .then(response => response.json())
         .then(result => {
@@ -241,18 +921,13 @@
             document.getElementById('miniseedFormat').value = miniSeedFormat;
           }
 
-          if (miniSeedRecording) {
-            btn.classList.remove("disabled");
-            btn.classList.add("enabled");
-            btn.textContent = "miniSEED: ON";
-          } else {
-            btn.classList.remove("enabled");
-            btn.classList.add("disabled");
-            btn.textContent = "miniSEED: OFF";
-          }
+          setMiniSeedButtonState(miniSeedRecording);
+          updateVelocBg(miniSeedRecording);
         })
         .catch(error => {
           console.error('Error toggling miniSEED:', error);
+          miniSeedRecording = !miniSeedRecording;
+          setMiniSeedButtonState(miniSeedRecording);
         });
     }
 
@@ -289,10 +964,8 @@
             btn.textContent = "✓ SD Card Unmounted";
             btn.style.background = "#4caf50";
             miniSeedRecording = false;
-            const miniBtn = document.getElementById('miniseedBtn');
-            miniBtn.classList.remove("enabled");
-            miniBtn.classList.add("disabled");
-            miniBtn.textContent = "miniSEED: OFF";
+            setMiniSeedButtonState(false);
+            updateVelocBg(false);
             alert('SD card safely unmounted. You can now remove it.');
           } else {
             btn.textContent = "✗ Unmount Failed";
@@ -361,12 +1034,10 @@
       fetch(`/touchcalibrate?points=${points}`)
         .then(response => response.text())
         .then(data => {
-          alert('Touch calibration started with ' + points + ' points. Please follow the on-screen instructions on the TFT display.');
           console.log('Calibration response:', data);
         })
         .catch(error => {
           console.error('Error starting calibration:', error);
-          alert('Failed to start calibration: ' + error);
         });
     }
 
@@ -397,17 +1068,44 @@
       }
     }
 
+    function toggleMagCalibrationData() {
+      const displayDiv = document.getElementById('magCalibDataDisplay');
+      const btn = document.getElementById('magCalDataBtn');
+
+      if (displayDiv.style.display === 'none' || displayDiv.style.display === '') {
+        fetch('/magcalibdata')
+          .then(response => response.text())
+          .then(data => {
+            document.getElementById('magCalibDataContent').textContent = data;
+            displayDiv.style.display = 'block';
+            btn.textContent = 'Hide Mag Calibration Data';
+            console.log('Mag calibration data:', data);
+          })
+          .catch(error => {
+            console.error('Error fetching mag calibration data:', error);
+            document.getElementById('magCalibDataContent').textContent = 'Error: ' + error;
+            displayDiv.style.display = 'block';
+            btn.textContent = 'Hide Mag Calibration Data';
+          });
+      } else {
+        displayDiv.style.display = 'none';
+        btn.textContent = 'Show Mag Calibration Data';
+      }
+    }
+
     // Highcharts setup for velocity
     const velocChart = Highcharts.chart('velocChart', {
       chart: {
-        type: 'line'
+        type: 'line',
+        plotBackgroundColor: '#ffffff'
       },
       title: {
         text: 'Velocity Data'
       },
       xAxis: {
         type: 'datetime',
-        tickPixelInterval: 150
+        tickPixelInterval: 150,
+        plotBands: []
       },
       yAxis: {
         title: {
@@ -429,6 +1127,29 @@
         { name: 'Veloc Y', data: [], color: 'purple' }
       ]
     });
+
+    function updateVelocBg(recording) {
+      const referenceTime = lastVelocSampleTime || Date.now();
+
+      if (recording === velocBgRecordingState) {
+        return;
+      }
+
+      velocBgRecordingState = recording;
+
+      if (recording) {
+        if (activeVelocLogStart === null) {
+          activeVelocLogStart = referenceTime;
+        }
+      } else if (activeVelocLogStart !== null) {
+        velocLogIntervals.push({
+          start: activeVelocLogStart,
+          end: Math.max(referenceTime, activeVelocLogStart)
+        });
+        activeVelocLogStart = null;
+      }
+      redrawVelocLogBands();
+    }
 
     // Highcharts setup for acceleration
     const accelChart = Highcharts.chart('accelChart', {
@@ -464,18 +1185,55 @@
       ]
     });
 
+    const magChart = Highcharts.chart('magChart', {
+      chart: {
+        type: 'line'
+      },
+      title: {
+        text: 'Magnetometer Data'
+      },
+      xAxis: {
+        type: 'datetime',
+        tickPixelInterval: 150
+      },
+      yAxis: {
+        title: {
+          text: 'Magnetic Field [uT]'
+        }
+      },
+      legend: {
+        enabled: true
+      },
+      plotOptions: {
+        line: {
+          marker: {
+            enabled: false
+          }
+        }
+      },
+      series: [
+        { name: 'Mag X', data: [], color: '#8e24aa' },
+        { name: 'Mag Y', data: [], color: '#00897b' },
+        { name: 'Mag Z', data: [], color: '#6d4c41' }
+      ]
+    });
+
     function fetchData() {
       fetch('/data')
         .then(response => response.json())
         .then(d => {
           // Use client-side timestamp for better resolution (200ms updates, server only has 1s resolution)
           const now = (new Date()).getTime();
+          lastVelocSampleTime = now;
           // Use SI or raw values based on toggle
           const vX = showSIUnits ? d.velocX : d.velocXraw;
           const vY = showSIUnits ? d.velocY : d.velocYraw;
           const aX = showSIUnits ? d.accelX : d.accelXraw;
           const aY = showSIUnits ? d.accelY : d.accelYraw;
           const aZ = showSIUnits ? d.accelZ : d.accelZraw;
+          const mX = Number(d.magX);
+          const mY = Number(d.magY);
+          const mZ = Number(d.magZ);
 
           velocChart.series[0].addPoint([now, vX], false, velocChart.series[0].data.length >= 60);
           velocChart.series[1].addPoint([now, vY], false, velocChart.series[1].data.length >= 60);
@@ -485,6 +1243,13 @@
           accelChart.series[1].addPoint([now, aY], false, accelChart.series[1].data.length >= 60);
           accelChart.series[2].addPoint([now, aZ], false, accelChart.series[2].data.length >= 60);
           accelChart.redraw();
+
+          if (Number.isFinite(mX) && Number.isFinite(mY) && Number.isFinite(mZ)) {
+            magChart.series[0].addPoint([now, mX], false, magChart.series[0].data.length >= 60);
+            magChart.series[1].addPoint([now, mY], false, magChart.series[1].data.length >= 60);
+            magChart.series[2].addPoint([now, mZ], false, magChart.series[2].data.length >= 60);
+            magChart.redraw();
+          }
 
           // Update MAC field if present in JSON
           if (d.mac) {
@@ -514,29 +1279,39 @@
               document.getElementById('spectrogram-scale').textContent = '---';
             }
           }
+
+          if (d.touchCalActive !== undefined) {
+            dataPollIntervalMs = d.touchCalActive ? 1000 : 200;
+          }
+
           // Update axis field if present in JSON
           if (d.axis) {
             updateAxisButtons(d.axis);
           }
 
+          updateUdpStreamsFromData(d);
+
           if (d.miniSeedRecording !== undefined) {
             miniSeedRecording = !!d.miniSeedRecording;
-            const miniBtn = document.getElementById('miniseedBtn');
-            if (miniSeedRecording) {
-              miniBtn.classList.remove('disabled');
-              miniBtn.classList.add('enabled');
-              miniBtn.textContent = 'miniSEED: ON';
-            } else {
-              miniBtn.classList.remove('enabled');
-              miniBtn.classList.add('disabled');
-              miniBtn.textContent = 'miniSEED: OFF';
-            }
+            setMiniSeedButtonState(miniSeedRecording);
+            updateVelocBg(miniSeedRecording);
           }
 
           if (d.miniSeedFormat) {
             miniSeedFormat = d.miniSeedFormat;
             document.getElementById('miniseedFormat').value = miniSeedFormat;
           }
+
+          updateMagCalStatus(d);
+
+          updatePotUiFromData(d);
+          updateOrientationFromSensors(d);
+        })
+        .catch(error => {
+          console.error('Error fetching sensor data:', error);
+        })
+        .finally(() => {
+          scheduleNextFetch();
         });
     }
 
@@ -568,8 +1343,9 @@
       }
     }
 
-    setInterval(fetchData, 200);
-    fetchData();
+    drawOrientationInset(orientationState);
+    magCalAction('status');
+    scheduleNextFetch();
   </script>
 </body>
 

@@ -31,7 +31,9 @@ enum LogLevel
 int logVerbosity = LOG_INFO; // Set global log verbosity here
 
 #include <Arduino.h>
-#include "pico/stdlib.h" // <-- Add this include for Pico SDK functions
+#include "pico/stdlib.h"     // <-- Add this include for Pico SDK functions
+#include "pico/cyw43_arch.h" // <-- Add CYW43 driver for WiFi power management control
+
 // #include "hardware/spi.h"
 // #include "hardware/i2c.h"
 #include <stdio.h>
@@ -70,6 +72,7 @@ int logVerbosity = LOG_INFO; // Set global log verbosity here
 // #include <Adafruit_ICM20X.h>
 #include <Adafruit_ICM20948.h>
 #include <Adafruit_Sensor.h>
+#include <DigPot.h>
 #include "version.h"
 #include "pin_config.h"      // GPIO pin assignments
 #include "miniseed_logger.h" // miniSEED data logging for seismic data compatibility
@@ -88,6 +91,17 @@ ADS1256 ads(ADS1256_DRDY, ADS1256_RST, ADS1256_SYNC, ADS1256_CS, 2.500, &ADS1256
 
 // Create ICM20948 object using I2C0
 Adafruit_ICM20948 icm;
+
+// Create DigPot objects using I2C bus/address definitions from pin_config.h
+digpot::AD5142A offsetPot(AD5142A_I2C_PORT, AD5142A_ADDR);
+digpot::TPL0102 gainPot(TPL0102_I2C_PORT, TPL0102_ADDR);
+bool offsetPotDetected = false;
+bool gainPotDetected = false;
+bool icmDetected = false;
+digpot::AD5142A::VoltageDividerConfig offsetPotVoltageDividerCfg;
+uint8_t offsetPotWiperCache[2] = {0, 0};
+float offsetPotVoltageCache[2] = {0.0f, 0.0f};
+uint8_t gainPotWiperCache[2] = {0, 0};
 
 // Ring buffer sensor selection constants
 #define RINGBUFFER_VELOCX_RAW 0
@@ -157,6 +171,9 @@ EthernetServer ethServer(HTTP_SERVER_PORT);
 WiFiServer wifiServer(HTTP_SERVER_PORT);
 EthernetUDP ethUdpStream;
 WiFiUDP wifiUdpStream;
+static bool ethUdpStreamReady = false;
+static bool wifiUdpStreamReady = false;
+static const IPAddress udpBroadcastIp(255, 255, 255, 255);
 
 /**
  * @enum NetworkMode
@@ -195,6 +212,248 @@ char wifi_password[64] = {0};
 CalibrationMatrix mmseCalibMatrix = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f}; // Identity by default
 int NUM_CALIB_POINTS = 5;                                                 // Change to 5 for faster calibration, 9 for better accuracy
 volatile bool trigger_touch_calibration = false;                          // Trigger for remote calibration
+volatile bool touch_calibration_active = false;                           // True while touch calibration routine is running
+volatile bool touch_calibration_unsaved = false;                          // True when new touch calibration is in RAM only
+
+// --- Magnetometer Calibration (Hard/Soft-Iron) ---
+struct MagCalibrationParams
+{
+  float offset[3] = {0.0f, 0.0f, 0.0f};
+  float scale[3] = {1.0f, 1.0f, 1.0f};
+  bool valid = false;
+};
+
+struct MagCalibrationSession
+{
+  bool active = false;
+  uint8_t step = 0;
+  static const uint8_t totalSteps = 6;
+  float minV[3] = {1e9f, 1e9f, 1e9f};
+  float maxV[3] = {-1e9f, -1e9f, -1e9f};
+  float poseMean[totalSteps][3] = {{0.0f}};
+  char message[160] = "Idle";
+};
+
+MagCalibrationParams magCalParams;
+MagCalibrationSession magCalSession;
+const char *MAG_CAL_FILE = "/mag_calib.txt";
+
+// Forward declarations for globals defined later but needed by flash-write guards.
+extern volatile bool miniSeedRecordingEnabled;
+extern MinISeedLogger miniSeedLogger;
+
+static const char *magCalPoseName(uint8_t step)
+{
+  switch (step)
+  {
+  case 0:
+    return "Top face UP";
+  case 1:
+    return "Top face DOWN";
+  case 2:
+    return "Top face NORTH";
+  case 3:
+    return "Top face SOUTH";
+  case 4:
+    return "Top face EAST";
+  case 5:
+    return "Top face WEST";
+  default:
+    return "Done";
+  }
+}
+
+static void applyMagCalibration(float rawX, float rawY, float rawZ, float &outX, float &outY, float &outZ)
+{
+  if (!magCalParams.valid)
+  {
+    outX = rawX;
+    outY = rawY;
+    outZ = rawZ;
+    return;
+  }
+
+  outX = (rawX - magCalParams.offset[0]) * magCalParams.scale[0];
+  outY = (rawY - magCalParams.offset[1]) * magCalParams.scale[1];
+  outZ = (rawZ - magCalParams.offset[2]) * magCalParams.scale[2];
+}
+
+static bool saveMagCalibration()
+{
+  bool recordingWasEnabled = miniSeedRecordingEnabled;
+
+  if (recordingWasEnabled)
+  {
+    miniSeedRecordingEnabled = false;
+    miniSeedLogger.setRecordingEnabled(false);
+  }
+
+  File f = LittleFS.open(MAG_CAL_FILE, "w");
+  if (!f)
+  {
+    if (recordingWasEnabled)
+    {
+      miniSeedRecordingEnabled = true;
+      miniSeedLogger.setRecordingEnabled(true);
+    }
+    return false;
+  }
+
+  f.println("MAGCAL1");
+  f.printf("%.8f,%.8f,%.8f\n", magCalParams.offset[0], magCalParams.offset[1], magCalParams.offset[2]);
+  f.printf("%.8f,%.8f,%.8f\n", magCalParams.scale[0], magCalParams.scale[1], magCalParams.scale[2]);
+  f.close();
+
+  if (recordingWasEnabled)
+  {
+    miniSeedRecordingEnabled = true;
+    miniSeedLogger.setRecordingEnabled(true);
+  }
+  return true;
+}
+
+static bool loadMagCalibration()
+{
+  File f = LittleFS.open(MAG_CAL_FILE, "r");
+  if (!f)
+  {
+    return false;
+  }
+
+  String header = f.readStringUntil('\n');
+  header.trim();
+  if (header != "MAGCAL1")
+  {
+    f.close();
+    return false;
+  }
+
+  String offLine = f.readStringUntil('\n');
+  String sclLine = f.readStringUntil('\n');
+  f.close();
+
+  if (sscanf(offLine.c_str(), "%f,%f,%f", &magCalParams.offset[0], &magCalParams.offset[1], &magCalParams.offset[2]) != 3)
+  {
+    return false;
+  }
+  if (sscanf(sclLine.c_str(), "%f,%f,%f", &magCalParams.scale[0], &magCalParams.scale[1], &magCalParams.scale[2]) != 3)
+  {
+    return false;
+  }
+
+  magCalParams.valid = true;
+  return true;
+}
+
+static bool collectMagStats(uint32_t durationMs,
+                            uint32_t intervalMs,
+                            float &meanX,
+                            float &meanY,
+                            float &meanZ,
+                            float &minX,
+                            float &minY,
+                            float &minZ,
+                            float &maxX,
+                            float &maxY,
+                            float &maxZ)
+{
+  if (!icmDetected)
+  {
+    return false;
+  }
+
+  sensors_event_t accelEvt;
+  sensors_event_t gyroEvt;
+  sensors_event_t tempEvt;
+  sensors_event_t magEvt;
+
+  float sumX = 0.0f, sumY = 0.0f, sumZ = 0.0f;
+  uint32_t count = 0;
+  minX = minY = minZ = 1e9f;
+  maxX = maxY = maxZ = -1e9f;
+
+  unsigned long startMs = millis();
+  while ((millis() - startMs) < durationMs)
+  {
+    icm.getEvent(&accelEvt, &gyroEvt, &tempEvt, &magEvt);
+    float x = magEvt.magnetic.x;
+    float y = magEvt.magnetic.y;
+    float z = magEvt.magnetic.z;
+
+    sumX += x;
+    sumY += y;
+    sumZ += z;
+
+    if (x < minX)
+      minX = x;
+    if (y < minY)
+      minY = y;
+    if (z < minZ)
+      minZ = z;
+    if (x > maxX)
+      maxX = x;
+    if (y > maxY)
+      maxY = y;
+    if (z > maxZ)
+      maxZ = z;
+
+    count++;
+    delay(intervalMs);
+  }
+
+  if (count == 0)
+  {
+    return false;
+  }
+
+  meanX = sumX / (float)count;
+  meanY = sumY / (float)count;
+  meanZ = sumZ / (float)count;
+  return true;
+}
+
+static bool finalizeMagCalibration()
+{
+  float halfRange[3];
+  for (int i = 0; i < 3; ++i)
+  {
+    magCalParams.offset[i] = 0.5f * (magCalSession.maxV[i] + magCalSession.minV[i]);
+    halfRange[i] = 0.5f * (magCalSession.maxV[i] - magCalSession.minV[i]);
+    if (halfRange[i] < 1.0f)
+    {
+      snprintf(magCalSession.message, sizeof(magCalSession.message), "Calibration failed: axis %d range too small", i);
+      magCalParams.valid = false;
+      return false;
+    }
+  }
+
+  float avgRange = (halfRange[0] + halfRange[1] + halfRange[2]) / 3.0f;
+  for (int i = 0; i < 3; ++i)
+  {
+    magCalParams.scale[i] = avgRange / halfRange[i];
+  }
+
+  magCalParams.valid = true;
+  bool saved = saveMagCalibration();
+  snprintf(magCalSession.message,
+           sizeof(magCalSession.message),
+           "Mag calibration complete (%s)",
+           saved ? "saved" : "not saved");
+  return true;
+}
+
+static void startMagCalibrationSession()
+{
+  magCalSession.active = true;
+  magCalSession.step = 0;
+  magCalSession.minV[0] = magCalSession.minV[1] = magCalSession.minV[2] = 1e9f;
+  magCalSession.maxV[0] = magCalSession.maxV[1] = magCalSession.maxV[2] = -1e9f;
+  snprintf(magCalSession.message,
+           sizeof(magCalSession.message),
+           "Step 1/%d: Place sensor %s and capture",
+           MagCalibrationSession::totalSteps,
+           magCalPoseName(0));
+}
 
 // --- Touch Event Handling ---
 static volatile bool forceTouchCalibration = FORCETOUCHCALIBRATION; // Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
@@ -217,6 +476,8 @@ sensors_event_t tempData;                  // temp structure to hold latest temp
 
 // --- UDP Streaming Control ---
 volatile bool udpStreamEnable[5] = {false, false, false, false, false};
+volatile uint32_t udpPacketsSent[5] = {0, 0, 0, 0, 0};
+volatile uint32_t udpPacketsDropped[5] = {0, 0, 0, 0, 0};
 
 // --- miniSEED Recording Control (Raspberry Shake compatible data format) ---
 MinISeedLogger miniSeedLogger;                  ///< miniSEED logger for Raspberry Shake compatible data storage
@@ -870,6 +1131,8 @@ void initSDCard()
 
   Serial.println("miniSEED recording will write files to /data/miniseed directory");
   Serial.println("=== SD Card and Filesystem Ready ===");
+
+  debugSerialPrintln("miniSEED logger ready");
 }
 
 void disableSDCard()
@@ -899,6 +1162,10 @@ void disableTouch()
  */
 static void enableBacklight()
 {
+  float magXCal = 0.0f;
+  float magYCal = 0.0f;
+  float magZCal = 0.0f;
+  applyMagCalibration(magData.magnetic.x, magData.magnetic.y, magData.magnetic.z, magXCal, magYCal, magZCal);
   if (TFT_BL != -1)
   {
     digitalWrite(TFT_BL, HIGH);
@@ -930,13 +1197,11 @@ void setBacklight(float brightness)
       static bool initialized = false;
       if (!initialized)
       {
-        gpio_set_function(TFT_BL, GPIO_FUNC_PWM);
         uint slice_num = pwm_gpio_to_slice_num(TFT_BL);
-        pwm_set_wrap(slice_num, 255); // 8-bit resolution
         pwm_set_enabled(slice_num, true);
         initialized = true;
       }
-      uint slice_num = pwm_gpio_to_slice_num(TFT_BL);
+
       uint level = (uint)(brightness * 255.0f);
       if (level > 255)
         level = 255;
@@ -1493,33 +1758,119 @@ void serveMseedFile(Stream &client, const String &req)
   client.println("Connection: close");
   client.println();
 
-  // Stream file content in chunks via SD_SPI
-  const uint32_t bufSize = 512;
-  uint8_t buf[bufSize];
-  uint32_t offset = 0;
-
-  while (offset < fileSize)
+  // Open file with optimized handle for sequential reading
+  file_handle_t file_handle;
+  if (!sd_spi_open_file(&sd_fs_info, fullPath.c_str(), &file_handle))
   {
-    int n = sd_spi_read_file_chunk(&sd_fs_info, fullPath.c_str(), offset, buf, bufSize);
+    debugSerialPrintln("  ERROR: Failed to open file handle");
+    return;
+  }
+
+  // Stream file content in larger chunks for much better performance
+  // Use 4KB buffer (8x larger than before) for 8x fewer SD operations
+  const uint32_t bufSize = 4096;
+  static uint8_t buf[4096]; // Static to avoid stack overflow
+  uint32_t totalSent = 0;
+  unsigned long startTime = millis();
+
+  while (totalSent < fileSize)
+  {
+    int n = sd_spi_read_from_handle(&file_handle, buf, bufSize);
     if (n <= 0)
       break;
+
     client.write(buf, n);
-    offset += (uint32_t)n;
+    totalSent += (uint32_t)n;
   }
 
-  if (offset != fileSize)
+  sd_spi_close_file(&file_handle);
+
+  unsigned long duration = millis() - startTime;
+  if (totalSent != fileSize)
   {
-    debugSerialPrintf("  WARNING: Sent %lu/%lu bytes for %s\n", (unsigned long)offset,
+    debugSerialPrintf("  WARNING: Sent %lu/%lu bytes for %s\n", (unsigned long)totalSent,
                       (unsigned long)fileSize, fullPath.c_str());
   }
-
-  debugSerialPrintln("  File sent successfully");
+  else
+  {
+    float throughput = (totalSent / 1024.0f) / (duration / 1000.0f);
+    debugSerialPrintf("  File sent successfully: %lu bytes in %lu ms (%.1f KB/s)\n",
+                      (unsigned long)totalSent, duration, throughput);
+  }
 }
 
 /**
  * @brief Handler for serving the mseed viewer HTML page
  * @param client Output stream for HTTP response
  */
+void serveDeleteMseedFile(Stream &client, const String &req)
+{
+  debugSerialPrintln("HTTP: Delete mseed file request");
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+
+  int fileIdx = req.indexOf("file=");
+  if (fileIdx == -1)
+  {
+    client.println("{\"success\":false,\"error\":\"Missing file parameter\"}");
+    return;
+  }
+
+  String filename = req.substring(fileIdx + 5);
+  int endIdx = filename.indexOf('&');
+  if (endIdx != -1)
+    filename = filename.substring(0, endIdx);
+  int spaceIdx = filename.indexOf(' ');
+  if (spaceIdx != -1)
+    filename = filename.substring(0, spaceIdx);
+
+  filename.replace("%20", " ");
+  filename.replace("%2F", "/");
+
+  if (!sd_card_ready)
+  {
+    client.println("{\"success\":false,\"error\":\"SD card not ready\"}");
+    return;
+  }
+
+  if (miniSeedRecordingEnabled)
+  {
+    client.println("{\"success\":false,\"error\":\"Stop miniSEED recording before deleting files\"}");
+    return;
+  }
+
+  if (filename.length() == 0 || filename.indexOf("..") != -1 ||
+      filename.indexOf('/') != -1 || filename.indexOf('\\') != -1 ||
+      filename.indexOf(':') != -1)
+  {
+    client.println("{\"success\":false,\"error\":\"Invalid filename\"}");
+    return;
+  }
+
+  String fullPath = "/data/miniseed/" + filename;
+
+  if (!sd_spi_file_exists(&sd_fs_info, fullPath.c_str()))
+  {
+    client.println("{\"success\":false,\"error\":\"File not found\"}");
+    return;
+  }
+
+  if (!sd_spi_delete_file(&sd_fs_info, fullPath.c_str()))
+  {
+    debugSerialPrintf("  Failed to delete file: %s\n", fullPath.c_str());
+    client.println("{\"success\":false,\"error\":\"Delete failed\"}");
+    return;
+  }
+
+  debugSerialPrintf("  Deleted file: %s\n", fullPath.c_str());
+  client.print("{\"success\":true,\"message\":\"Deleted\",\"file\":\"");
+  client.print(filename);
+  client.println("\"}");
+}
+
 void serveMseedViewer(Stream &client)
 {
   debugSerialPrintln("HTTP: Serving mseed viewer page");
@@ -1690,6 +2041,95 @@ void drawCalibrationCross(int x, int y, uint16_t color = TFT_RED)
   // Draw a cross at the specified position
   tft.drawLine(x - 10, y, x + 10, y, color);
   tft.drawLine(x, y - 10, x, y + 10, color);
+}
+
+// Forward declarations for lightweight HTTP servicing during blocking calibration.
+void serveChartPage(Stream &client);
+void serveSensorData(Stream &client);
+
+static void serviceCalibrationHttpOnce()
+{
+  if (netMode == NET_WIZNET)
+  {
+    // Keep lease and listener healthy during long blocking calibration loops.
+    static unsigned long lastMaintainMs = 0;
+    static unsigned long lastRebindMs = 0;
+    unsigned long nowMs = millis();
+    if (nowMs - lastMaintainMs >= 2000)
+    {
+      Ethernet.maintain();
+      lastMaintainMs = nowMs;
+    }
+    if (nowMs - lastRebindMs >= 3000)
+    {
+      Ethernet.init(WIZNET_SPI_CS);
+      ethServer.begin();
+      lastRebindMs = nowMs;
+    }
+
+    EthernetClient client = ethServer.available();
+    if (!client)
+      return;
+
+    client.setTimeout(50);
+    String req = client.readStringUntil('\r');
+    client.readStringUntil('\n');
+    req.trim();
+    while (client.available() && client.readStringUntil('\n') != "\r")
+      ;
+
+    // Keep the existing web page alive during calibration.
+    if (req.indexOf("GET /data") == 0)
+    {
+      serveSensorData(client);
+    }
+    else
+    {
+      serveChartPage(client);
+    }
+
+    delay(1);
+    client.stop();
+    releaseSPIBus();
+    return;
+  }
+
+  if (netMode == NET_WIFI)
+  {
+    WiFiClient client = wifiServer.accept();
+    if (!client)
+      return;
+
+    client.setTimeout(50);
+    String req = client.readStringUntil('\r');
+    client.readStringUntil('\n');
+    req.trim();
+    while (client.available() && client.readStringUntil('\n') != "\r")
+      ;
+
+    if (req.indexOf("GET /data") == 0)
+    {
+      serveSensorData(client);
+    }
+    else
+    {
+      serveChartPage(client);
+    }
+
+    delay(1);
+    client.stop();
+    releaseSPIBus();
+  }
+}
+
+static void delayWithCalibrationHttp(uint32_t durationMs)
+{
+  unsigned long startMs = millis();
+  while ((millis() - startMs) < durationMs)
+  {
+    serviceCalibrationHttpOnce();
+    delay(5);
+  }
 }
 
 // MMSE-Based Multipoint Calibration Algorithm (based on AN-1021)
@@ -1886,6 +2326,15 @@ void applyMMSECalibration(uint16_t touch_x, uint16_t touch_y, int &display_x, in
 void calibrateTouchController()
 // MMSE-based multipoint calibration (AN-1021 algorithm)
 {
+  touch_calibration_active = true;
+
+  // Ensure calibration UI is drawn in physical screen coordinates even if a
+  // scrolling display mode (e.g. spectrogram) was active before calibration.
+  menu_visible = false;
+  saved_scroll_offset = 0;
+  disp_column = SCROLL_TOP_FIXED_AREA;
+  scrollDisplay(0);
+
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.setTextColor(TFT_WHITE);
@@ -1894,7 +2343,7 @@ void calibrateTouchController()
   tft.printf("%d-point mode\n", NUM_CALIB_POINTS);
   tft.setTextSize(1);
   tft.print("Touch each crosshair\n");
-  delay(2000);
+  delayWithCalibrationHttp(2000);
 
   // Calibration points configuration
   // 5-point: 4 corners + center
@@ -1967,13 +2416,21 @@ void calibrateTouchController()
         debugSerialPrintf("Touch detected: x=%d, y=%d, z=%d\n",
                           touch_event_point.x, touch_event_point.y, touch_event_point.z);
       }
+      serviceCalibrationHttpOnce();
       delay(10);
     }
 
-    // Wait for touch release
-    delay(100);
+    // Wait for touch release, but do not block indefinitely on noisy/stuck touch.
+    delayWithCalibrationHttp(100);
+    unsigned long releaseStart = millis();
     while (tft.getTouch(&touch_event_point.x, &touch_event_point.y, TOUCH_THRESHOLD))
     {
+      if (millis() - releaseStart > 1500)
+      {
+        debugSerialPrintf("Touch release timeout at calibration point %d\n", i + 1);
+        break;
+      }
+      serviceCalibrationHttpOnce();
       delay(10);
     }
 
@@ -1992,32 +2449,19 @@ void calibrateTouchController()
   if (!calculateMMSECalibration(numPoints, lcd_x, lcd_y, touch_x, touch_y, mmseCalibMatrix))
   {
     tftPrint("Calibration failed!", true);
-    delay(2000);
+    delayWithCalibrationHttp(2000);
+    touch_calibration_active = false;
     return;
   }
 
-  // Save calibration matrix to LittleFS
-  File f = LittleFS.open("/touch_calib.txt", "w");
-  if (f)
-  {
-    // Save matrix coefficients
-    f.printf("MMSE\n"); // Header to identify MMSE calibration
-    f.printf("%.8f,%.8f,%.8f\n", mmseCalibMatrix.A, mmseCalibMatrix.B, mmseCalibMatrix.C);
-    f.printf("%.8f,%.8f,%.8f\n", mmseCalibMatrix.D, mmseCalibMatrix.E, mmseCalibMatrix.F);
-    // Also save raw calibration points for reference
-    for (int i = 0; i < numPoints; ++i)
-    {
-      f.printf("%d,%d,%d,%d\n", lcd_x[i], lcd_y[i], touch_x[i], touch_y[i]);
-    }
-    f.close();
-    debugSerialPrintln("MMSE calibration matrix saved to /touch_calib.txt");
-  }
-  else
-  {
-    debugSerialPrintln("Failed to save touch calibration!");
-  }
+  // IMPORTANT: Do not write LittleFS from inside this blocking calibration path.
+  // This path can run while networking/display SPI traffic is active and has shown
+  // hard stalls on some systems. Keep the new matrix in RAM and persist later.
+  touch_calibration_unsaved = true;
+  debugSerialPrintln("Touch calibration: matrix computed (RAM only, file save deferred)");
 
   // Verify calibration accuracy with 3 test points
+  debugSerialPrintln("Touch calibration: starting interactive verification phase");
   tft.fillScreen(TFT_BLACK);
   tft.setCursor(0, 0);
   tft.print("Verifying calibration...\n");
@@ -2038,6 +2482,8 @@ void calibrateTouchController()
       tft.height() * 3 / 4 // Center-bottom
   };
   uint16_t test_touch_x[numTestPoints], test_touch_y[numTestPoints];
+  bool test_point_valid[numTestPoints] = {false, false, false, false};
+  const unsigned long verifyPointTimeoutMs = 12000;
 
   for (int i = 0; i < numTestPoints; ++i)
   {
@@ -2048,6 +2494,7 @@ void calibrateTouchController()
     drawCalibrationCross(test_lcd_x[i], test_lcd_y[i], TFT_YELLOW);
 
     bool touch_detected = false;
+    unsigned long verifyPointStart = millis();
     uint16_t tx = 0, ty = 0;
     while (!touch_detected)
     {
@@ -2056,13 +2503,39 @@ void calibrateTouchController()
         test_touch_x[i] = tx;
         test_touch_y[i] = ty;
         touch_detected = true;
+        test_point_valid[i] = true;
+        debugSerialPrintf("Verification point %d touched: raw=(%u,%u)\n", i + 1, (unsigned int)tx, (unsigned int)ty);
       }
+      if (!touch_detected && (millis() - verifyPointStart > verifyPointTimeoutMs))
+      {
+        debugSerialPrintf("Verification point %d timeout after %lu ms, skipping point\n",
+                          i + 1, (unsigned long)(millis() - verifyPointStart));
+        break;
+      }
+      serviceCalibrationHttpOnce();
       delay(10);
     }
-    delay(100);
-    // Wait for touch release
+    if (!touch_detected)
+    {
+      tft.setCursor(10, tft.height() - 20);
+      tft.setTextColor(TFT_YELLOW);
+      tft.setTextSize(1);
+      tft.print("Verification timeout - skipped");
+      delayWithCalibrationHttp(700);
+      tft.fillScreen(TFT_BLACK);
+      continue;
+    }
+    delayWithCalibrationHttp(100);
+    // Wait for touch release with timeout so verification cannot hang forever.
+    unsigned long verifyReleaseStart = millis();
     while (tft.getTouch(&tx, &ty, TOUCH_THRESHOLD))
     {
+      if (millis() - verifyReleaseStart > 1500)
+      {
+        debugSerialPrintf("Touch release timeout at verification point %d\n", i + 1);
+        break;
+      }
+      serviceCalibrationHttpOnce();
       delay(10);
     }
 
@@ -2085,13 +2558,14 @@ void calibrateTouchController()
     tft.setTextSize(1);
     tft.printf("Err: %.1fpx", error);
 
-    delay(1500);
+    delayWithCalibrationHttp(1500);
     tft.fillScreen(TFT_BLACK);
   }
 
   // Calculate calibration accuracy
   float total_error = 0.0f;
   float max_error = 0.0f;
+  int valid_test_points = 0;
 
   debugSerialPrintln("\nCalibration Verification Results:");
   debugSerialPrintln("Point | Expected (X,Y) | Raw Touch (X,Y) | Calibrated (X,Y) | Error (pixels)");
@@ -2099,6 +2573,13 @@ void calibrateTouchController()
 
   for (int i = 0; i < numTestPoints; ++i)
   {
+    if (!test_point_valid[i])
+    {
+      debugSerialPrintf("  %d   | (%3d, %3d)     | (skip, skip)    | (skip, skip)      | skipped\n",
+                        i + 1, test_lcd_x[i], test_lcd_y[i]);
+      continue;
+    }
+
     int calibrated_x, calibrated_y;
     // Apply MMSE matrix directly to raw coordinates (no rotation)
     // The matrix was built from raw coordinates, so apply it directly during verification
@@ -2117,15 +2598,21 @@ void calibrateTouchController()
                       calibrated_x, calibrated_y, error);
 
     total_error += error;
+    valid_test_points++;
     if (error > max_error)
       max_error = error;
   }
 
-  float avg_error = total_error / numTestPoints;
+  float avg_error = (valid_test_points > 0) ? (total_error / valid_test_points) : 0.0f;
 
   debugSerialPrintln("------|----------------|------------------|---------------");
   debugSerialPrintf("Average error: %.2f pixels\n", avg_error);
   debugSerialPrintf("Maximum error: %.2f pixels\n", max_error);
+  if (valid_test_points < numTestPoints)
+  {
+    debugSerialPrintf("Verification coverage: %d/%d points (some skipped due to timeout)\n",
+                      valid_test_points, numTestPoints);
+  }
 
   // Display results on screen
   tft.fillScreen(TFT_BLACK);
@@ -2138,17 +2625,25 @@ void calibrateTouchController()
   tft.printf("Avg Error: %.1f px\n", avg_error);
   tft.printf("Max Error: %.1f px\n\n", max_error);
 
-  if (avg_error < 5.0f)
+  if (valid_test_points == 0)
+  {
+    tft.setTextColor(TFT_YELLOW);
+    tft.print("Verification skipped");
+    tft.setTextColor(TFT_WHITE);
+    delayWithCalibrationHttp(1500);
+  }
+
+  if (valid_test_points > 0 && avg_error < 5.0f)
   {
     tft.setTextColor(TFT_GREEN);
     tft.print("Excellent accuracy!");
   }
-  else if (avg_error < 10.0f)
+  else if (valid_test_points > 0 && avg_error < 10.0f)
   {
     tft.setTextColor(TFT_YELLOW);
     tft.print("Good accuracy");
   }
-  else
+  else if (valid_test_points > 0)
   {
     tft.setTextColor(TFT_RED);
     tft.print("Consider recalibrating");
@@ -2157,10 +2652,25 @@ void calibrateTouchController()
   // Reset text color to white for subsequent output
   tft.setTextColor(TFT_WHITE);
 
-  delay(3000);
+  delayWithCalibrationHttp(3000);
 
   // Clear screen to prevent cluttering of subsequent output
   tft.fillScreen(TFT_BLACK);
+
+  // Post-calibration cleanup: clear stale touch IRQ events and restore a known
+  // display/network-safe runtime state before returning to the main loop.
+  touch_event_flag = false;
+  gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true);
+  menu_visible = false;
+  saved_scroll_offset = 0;
+  disp_column = SCROLL_TOP_FIXED_AREA;
+  scrollDisplay(0);
+  releaseSPIBus();
+  if (touch_calibration_unsaved)
+  {
+    debugSerialPrintln("Touch calibration: pending automatic save.");
+  }
+  touch_calibration_active = false;
 }
 
 bool loadTouchCalibration()
@@ -2252,6 +2762,40 @@ bool loadTouchCalibration()
       return false;
     }
   }
+}
+
+static bool saveTouchCalibrationMatrixToFile()
+{
+  bool recordingWasEnabled = miniSeedRecordingEnabled;
+
+  if (recordingWasEnabled)
+  {
+    miniSeedRecordingEnabled = false;
+    miniSeedLogger.setRecordingEnabled(false);
+  }
+
+  File f = LittleFS.open("/touch_calib.txt", "w");
+  if (!f)
+  {
+    if (recordingWasEnabled)
+    {
+      miniSeedRecordingEnabled = true;
+      miniSeedLogger.setRecordingEnabled(true);
+    }
+    return false;
+  }
+
+  f.printf("MMSE\n");
+  f.printf("%.8f,%.8f,%.8f\n", mmseCalibMatrix.A, mmseCalibMatrix.B, mmseCalibMatrix.C);
+  f.printf("%.8f,%.8f,%.8f\n", mmseCalibMatrix.D, mmseCalibMatrix.E, mmseCalibMatrix.F);
+  f.close();
+
+  if (recordingWasEnabled)
+  {
+    miniSeedRecordingEnabled = true;
+    miniSeedLogger.setRecordingEnabled(true);
+  }
+  return true;
 }
 
 // ============================================================================
@@ -2350,24 +2894,23 @@ void initICM20948()
   bool success = icm.begin_I2C(ICM20948_ADDR, &ICM20948_I2C_PORT);
   if (!success)
   {
-    tftPrint("Failed to find ICM20948 chip, halting...\n");
-    while (1)
-    {
-      delay(10);
-    }
+    debugSerialPrintln("WARNING: ICM20948 not found – IMU data unavailable.");
+    tftPrint("ICM20948 not found, skipping IMU init.\n");
+    icmDetected = false;
+    return;
   }
+  icmDetected = true;
   tftPrint("ICM20948 Found!\n");
 
   int result = ICM20948_read_whoami();
   sprintf(resultstr, "ICM20948 Chip ID: 0x%02X\n", result);
   if (result != 0xEA)
   {
-    tftPrint("Error: ICM20948 Chip ID mismatch!\n");
+    debugSerialPrintln("WARNING: ICM20948 WHOAMI mismatch – IMU data unavailable.");
+    tftPrint("Error: ICM20948 Chip ID mismatch, skipping IMU init.\n");
     tftPrint(resultstr);
-    while (1)
-    {
-      delay(10);
-    }
+    icmDetected = false;
+    return;
   }
   tftPrint(resultstr);
   result = icm.readExternalRegister(0x8C, 0x01);
@@ -2375,12 +2918,10 @@ void initICM20948()
   tftPrint(resultstr);
   if (result != 0x09)
   {
-    tftPrint("Error: ICM20948 Magnetometer (AK09916) Chip ID mismatch!\n");
+    debugSerialPrintln("WARNING: AK09916 magnetometer not found – mag data unavailable.");
+    tftPrint("AK09916 Chip ID mismatch, skipping magnetometer.\n");
     tftPrint(resultstr);
-    while (1)
-    {
-      delay(10);
-    }
+    // Non-fatal: continue with accel/gyro only
   }
 
   // icm.setAccelRange(ICM20948_ACCEL_RANGE_16_G);
@@ -2473,6 +3014,65 @@ void initICM20948()
   gpio_set_irq_enabled_with_callback(ICM20948_INT, GPIO_IRQ_EDGE_FALL, true, &icm20948_int_isr);
   tftPrint("IMU initialized...\n");
   tftPrint("---------------------------------------------\n");
+}
+
+void initDigPots()
+{
+  // DigPot hardware (AD5142A / TPL0102) is optional.  Probe only when the
+  // I2C bus is known-good (ICM20948 detected).  Without pullups from the
+  // digpot board the RP2040 I2C peripheral can stall waiting for an ACK.
+  if (!icmDetected)
+  {
+    debugSerialPrintln("Skipping DigPot probe: I2C bus not confirmed ready (ICM20948 absent).");
+    tftPrint("DigPot probe skipped (I2C not ready).\n");
+    offsetPotDetected = false;
+    gainPotDetected = false;
+    return;
+  }
+
+  offsetPotDetected = digpot::probeAddress(AD5142A_I2C_PORT, AD5142A_ADDR);
+  gainPotDetected = digpot::probeAddress(TPL0102_I2C_PORT, TPL0102_ADDR);
+
+  if (offsetPotDetected)
+  {
+    for (uint8_t ch = 0; ch < 2; ++ch)
+    {
+      uint8_t rdac = 0;
+      if (offsetPot.readRdac(ch, rdac))
+      {
+        offsetPotWiperCache[ch] = rdac;
+        offsetPotVoltageCache[ch] = digpot::AD5142A::expectedVoltageForPosition(rdac, offsetPotVoltageDividerCfg);
+      }
+    }
+
+    tftPrint("AD5142A detected on I2C\n");
+    debugSerialPrintf("DigPot AD5142A detected at 0x%02X\n", AD5142A_ADDR);
+  }
+  else
+  {
+    tftPrint("AD5142A not detected on I2C\n");
+    debugSerialPrintf("DigPot AD5142A not detected at 0x%02X\n", AD5142A_ADDR);
+  }
+
+  if (gainPotDetected)
+  {
+    for (uint8_t ch = 0; ch < 2; ++ch)
+    {
+      uint8_t wiper = 0;
+      if (gainPot.readWiper(ch, wiper))
+      {
+        gainPotWiperCache[ch] = wiper;
+      }
+    }
+
+    tftPrint("TPL0102 detected on I2C\n");
+    debugSerialPrintf("DigPot TPL0102 detected at 0x%02X\n", TPL0102_ADDR);
+  }
+  else
+  {
+    tftPrint("TPL0102 not detected on I2C\n");
+    debugSerialPrintf("DigPot TPL0102 not detected at 0x%02X\n", TPL0102_ADDR);
+  }
 }
 
 void readICM20948()
@@ -2610,6 +3210,11 @@ NetworkMode initWiFi()
 
   if (WiFi.status() == WL_CONNECTED)
   {
+    // Disable WiFi power management to prevent connection timeouts
+    // This keeps the CYW43 WiFi chip awake and responsive
+    cyw43_wifi_pm(&cyw43_state, CYW43_NO_POWERSAVE_MODE);
+    debugSerialPrintln("WiFi power management disabled");
+
     IPAddress wifiIP = WiFi.localIP();
     if (wifiIP == IPAddress(0, 0, 0, 0) || wifiIP[0] > 255 || wifiIP[1] > 255 || wifiIP[2] > 255 || wifiIP[3] > 255)
     {
@@ -2630,6 +3235,11 @@ NetworkMode initWiFi()
       debugSerialPrint("WiFi RSSI: Invalid\n");
     }
     wifiServer.begin();
+    wifiUdpStream.stop();
+    wifiUdpStreamReady = (wifiUdpStream.begin(UDP_STREAM_PORT) != 0);
+    debugSerialPrintf("WiFi UDP stream socket %s on port %d\n",
+                      wifiUdpStreamReady ? "ready" : "FAILED",
+                      UDP_STREAM_PORT);
     return NET_WIFI;
   }
   else
@@ -2637,7 +3247,6 @@ NetworkMode initWiFi()
     debugSerialPrint("WiFi connection failed.\n");
     return NET_NONE;
   }
-  debugSerialPrint("WiFi initialized...\n");
 }
 
 /**
@@ -2661,7 +3270,6 @@ void wiznet5k_reset()
 void wiznet_init_spi()
 {
   debugSerialPrintln("Initializing WIZNET SPI...");
-  debugSerialPrintln("Using improved initialization strategy from test_all");
 
   // Reinitialize SPI using Arduino SPI API to keep it in sync with Ethernet library
   // This pattern is proven to work reliably from test_all
@@ -2785,6 +3393,11 @@ NetworkMode initNetworking()
     tftPrint(resultStr);
 
     ethServer.begin();
+    ethUdpStream.stop();
+    ethUdpStreamReady = (ethUdpStream.begin(UDP_STREAM_PORT) != 0);
+    debugSerialPrintf("Ethernet UDP stream socket %s on port %d\n",
+                      ethUdpStreamReady ? "ready" : "FAILED",
+                      UDP_STREAM_PORT);
     tftPrint("Ethernet Network initialized successfully!\n");
     return NET_WIZNET;
   }
@@ -3119,6 +3732,11 @@ void serveSensorData(Stream &client)
   time_t local = mktime(tm_info);
   tz_offset_sec = difftime(local, utc);
 
+  float magXCal = 0.0f;
+  float magYCal = 0.0f;
+  float magZCal = 0.0f;
+  applyMagCalibration(magData.magnetic.x, magData.magnetic.y, magData.magnetic.z, magXCal, magYCal, magZCal);
+
   // Send JSON in parts to avoid stack issues with large snprintf
   client.print("{");
   client.print("\"velocXraw\":");
@@ -3153,6 +3771,29 @@ void serveSensorData(Stream &client)
   client.print(gyroData.gyro.y, 5);
   client.print(",\"gyroZ\":");
   client.print(gyroData.gyro.z, 5);
+  client.print(",\"magXraw\":");
+  client.print(magData.magnetic.x, 5);
+  client.print(",\"magYraw\":");
+  client.print(magData.magnetic.y, 5);
+  client.print(",\"magZraw\":");
+  client.print(magData.magnetic.z, 5);
+  client.print(",\"magX\":");
+  client.print(magXCal, 5);
+  client.print(",\"magY\":");
+  client.print(magYCal, 5);
+  client.print(",\"magZ\":");
+  client.print(magZCal, 5);
+  client.print(",\"magCalValid\":");
+  client.print(magCalParams.valid ? "true" : "false");
+  client.print(",\"magCalActive\":");
+  client.print(magCalSession.active ? "true" : "false");
+  client.print(",\"magCalStep\":");
+  client.print(magCalSession.step);
+  client.print(",\"magCalTotalSteps\":");
+  client.print((int)MagCalibrationSession::totalSteps);
+  client.print(",\"magCalMessage\":\"");
+  client.print(magCalSession.message);
+  client.print("\"");
   client.print(",\"mac\":\"");
   client.print(macString);
   client.print("\",\"nettype\":\"");
@@ -3181,77 +3822,205 @@ void serveSensorData(Stream &client)
   client.print(",\"miniSeedFormat\":\"");
   client.print(miniSeedLogger.getFormatString());
   client.print("\"");
+  client.print(",\"touchCalActive\":");
+  client.print(touch_calibration_active ? "true" : "false");
   client.print(",\"sdCardReady\":");
   client.print(sd_card_ready ? "true" : "false");
+  client.print(",\"offsetPotDetected\":");
+  client.print(offsetPotDetected ? "true" : "false");
+  client.print(",\"gainPotDetected\":");
+  client.print(gainPotDetected ? "true" : "false");
+  client.print(",\"offsetPotCh0Wiper\":");
+  client.print(offsetPotWiperCache[0]);
+  client.print(",\"offsetPotCh1Wiper\":");
+  client.print(offsetPotWiperCache[1]);
+  client.print(",\"offsetPotCh0Voltage\":");
+  client.print(offsetPotVoltageCache[0], 5);
+  client.print(",\"offsetPotCh1Voltage\":");
+  client.print(offsetPotVoltageCache[1], 5);
+  client.print(",\"gainPotCh0Wiper\":");
+  client.print(gainPotWiperCache[0]);
+  client.print(",\"gainPotCh1Wiper\":");
+  client.print(gainPotWiperCache[1]);
+  client.print(",\"udpVelocX\":");
+  client.print(udpStreamEnable[0] ? "true" : "false");
+  client.print(",\"udpVelocY\":");
+  client.print(udpStreamEnable[1] ? "true" : "false");
+  client.print(",\"udpAccelX\":");
+  client.print(udpStreamEnable[2] ? "true" : "false");
+  client.print(",\"udpAccelY\":");
+  client.print(udpStreamEnable[3] ? "true" : "false");
+  client.print(",\"udpAccelZ\":");
+  client.print(udpStreamEnable[4] ? "true" : "false");
   client.println("}");
   client.flush();
 }
 
-void sendSensorUDPStream(const char *channel, const float *data, size_t count)
+bool sendSensorUDPStream(const char *channel, const float *data, size_t count)
 {
   if (count == 0)
-    return;
+    return false;
 
   time_t now = time(NULL);
 
   char packet[128 + UDP_PACKET_SIZE * 16] = {0};
   int len = snprintf(packet, sizeof(packet), "%s,%ld", channel, (long)now);
+  if (len < 0)
+  {
+    return false;
+  }
+
+  size_t used = (size_t)len;
+  if (used >= sizeof(packet))
+  {
+    used = sizeof(packet) - 1;
+  }
 
   for (size_t i = 0; i < count; ++i)
   {
-    len += snprintf(packet + len, sizeof(packet) - len, ",%.5f", data[i]);
-  }
-  snprintf(packet + len, sizeof(packet) - len, "\n");
+    size_t remaining = sizeof(packet) - used;
+    if (remaining <= 1)
+    {
+      break;
+    }
 
-  if (netMode == NET_WIZNET)
-  {
-    ethUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    ethUdpStream.write((const uint8_t *)packet, strlen(packet));
-    ethUdpStream.endPacket();
-  }
-  else if (netMode == NET_WIFI)
-  {
-    wifiUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    wifiUdpStream.write((const uint8_t *)packet, strlen(packet));
-    wifiUdpStream.endPacket();
+    int wrote = snprintf(packet + used, remaining, ",%.5f", data[i]);
+    if (wrote < 0)
+    {
+      break;
+    }
+
+    if ((size_t)wrote >= remaining)
+    {
+      used = sizeof(packet) - 1;
+      packet[used] = '\0';
+      break;
+    }
+
+    used += (size_t)wrote;
   }
 
-  // Release SPI bus after UDP transmission to prevent state corruption
-  releaseSPIBus();
+  if (used + 1 < sizeof(packet))
+  {
+    packet[used++] = '\n';
+    packet[used] = '\0';
+  }
+
+  const size_t packetLen = strnlen(packet, sizeof(packet));
+  bool sent = false;
+
+  if (netMode == NET_WIZNET && ethUdpStreamReady)
+  {
+    if (ethUdpStream.beginPacket(udpBroadcastIp, UDP_STREAM_PORT))
+    {
+      ethUdpStream.write((const uint8_t *)packet, packetLen);
+      ethUdpStream.endPacket();
+      sent = true;
+    }
+    else
+    {
+      ethUdpStreamReady = false;
+    }
+  }
+  else if (netMode == NET_WIFI && wifiUdpStreamReady)
+  {
+    if (wifiUdpStream.beginPacket(udpBroadcastIp, UDP_STREAM_PORT))
+    {
+      wifiUdpStream.write((const uint8_t *)packet, packetLen);
+      wifiUdpStream.endPacket();
+      sent = true;
+    }
+    else
+    {
+      wifiUdpStreamReady = false;
+    }
+  }
+
+  return sent;
 }
 
-void sendSensorUDPStream(const char *channel, const int *data, size_t count)
+bool sendSensorUDPStream(const char *channel, const int *data, size_t count)
 // Overloaded for int data
 {
   if (count == 0)
-    return;
+    return false;
 
   time_t now = time(NULL);
 
   char packet[128 + UDP_PACKET_SIZE * 16] = {0};
   int len = snprintf(packet, sizeof(packet), "%s,%ld", channel, (long)now);
+  if (len < 0)
+  {
+    return false;
+  }
+
+  size_t used = (size_t)len;
+  if (used >= sizeof(packet))
+  {
+    used = sizeof(packet) - 1;
+  }
 
   for (size_t i = 0; i < count; ++i)
   {
-    len += snprintf(packet + len, sizeof(packet) - len, ",%d", data[i]);
-  }
-  snprintf(packet + len, sizeof(packet) - len, "\n");
+    size_t remaining = sizeof(packet) - used;
+    if (remaining <= 1)
+    {
+      break;
+    }
 
-  if (netMode == NET_WIZNET)
-  {
-    ethUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    ethUdpStream.write((const uint8_t *)packet, strlen(packet));
-    ethUdpStream.endPacket();
-  }
-  else if (netMode == NET_WIFI)
-  {
-    wifiUdpStream.beginPacket("255.255.255.255", UDP_STREAM_PORT);
-    wifiUdpStream.write((const uint8_t *)packet, strlen(packet));
-    wifiUdpStream.endPacket();
+    int wrote = snprintf(packet + used, remaining, ",%d", data[i]);
+    if (wrote < 0)
+    {
+      break;
+    }
+
+    if ((size_t)wrote >= remaining)
+    {
+      used = sizeof(packet) - 1;
+      packet[used] = '\0';
+      break;
+    }
+
+    used += (size_t)wrote;
   }
 
-  // Release SPI bus after UDP transmission to prevent state corruption
-  releaseSPIBus();
+  if (used + 1 < sizeof(packet))
+  {
+    packet[used++] = '\n';
+    packet[used] = '\0';
+  }
+
+  const size_t packetLen = strnlen(packet, sizeof(packet));
+  bool sent = false;
+
+  if (netMode == NET_WIZNET && ethUdpStreamReady)
+  {
+    if (ethUdpStream.beginPacket(udpBroadcastIp, UDP_STREAM_PORT))
+    {
+      ethUdpStream.write((const uint8_t *)packet, packetLen);
+      ethUdpStream.endPacket();
+      sent = true;
+    }
+    else
+    {
+      ethUdpStreamReady = false;
+    }
+  }
+  else if (netMode == NET_WIFI && wifiUdpStreamReady)
+  {
+    if (wifiUdpStream.beginPacket(udpBroadcastIp, UDP_STREAM_PORT))
+    {
+      wifiUdpStream.write((const uint8_t *)packet, packetLen);
+      wifiUdpStream.endPacket();
+      sent = true;
+    }
+    else
+    {
+      wifiUdpStreamReady = false;
+    }
+  }
+
+  return sent;
 }
 
 void serveUDPStreamControl(Stream &client, const String &req)
@@ -3274,6 +4043,31 @@ void serveUDPStreamControl(Stream &client, const String &req)
   {
     enable = (req.charAt(enableIdx + 7) == '1');
   }
+
+  if (enable)
+  {
+    if (netMode == NET_WIZNET && !ethUdpStreamReady)
+    {
+      ethUdpStream.stop();
+      ethUdpStreamReady = (ethUdpStream.begin(UDP_STREAM_PORT) != 0);
+      debugSerialPrintf("UDP enable: Ethernet socket %s\n", ethUdpStreamReady ? "ready" : "FAILED");
+      if (!ethUdpStreamReady)
+      {
+        enable = false;
+      }
+    }
+    else if (netMode == NET_WIFI && !wifiUdpStreamReady)
+    {
+      wifiUdpStream.stop();
+      wifiUdpStreamReady = (wifiUdpStream.begin(UDP_STREAM_PORT) != 0);
+      debugSerialPrintf("UDP enable: WiFi socket %s\n", wifiUdpStreamReady ? "ready" : "FAILED");
+      if (!wifiUdpStreamReady)
+      {
+        enable = false;
+      }
+    }
+  }
+
   if (chIdx >= 0)
     udpStreamEnable[chIdx] = enable;
 
@@ -3282,6 +4076,59 @@ void serveUDPStreamControl(Stream &client, const String &req)
   client.println("Connection: close");
   client.println();
   client.printf("OK %d %d\n", chIdx, enable ? 1 : 0);
+}
+
+void serveUDPStatus(Stream &client)
+{
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+
+  client.print("{");
+  client.print("\"netMode\":");
+  client.print((int)netMode);
+  client.print(",\"socketReady\":{");
+  client.print("\"ethernet\":");
+  client.print(ethUdpStreamReady ? "true" : "false");
+  client.print(",\"wifi\":");
+  client.print(wifiUdpStreamReady ? "true" : "false");
+  client.print("}");
+
+  client.print(",\"channels\":{");
+  client.print("\"velocX\":{\"enabled\":");
+  client.print(udpStreamEnable[0] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[0]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[0]);
+  client.print("},\"velocY\":{\"enabled\":");
+  client.print(udpStreamEnable[1] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[1]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[1]);
+  client.print("},\"accelX\":{\"enabled\":");
+  client.print(udpStreamEnable[2] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[2]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[2]);
+  client.print("},\"accelY\":{\"enabled\":");
+  client.print(udpStreamEnable[3] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[3]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[3]);
+  client.print("},\"accelZ\":{\"enabled\":");
+  client.print(udpStreamEnable[4] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[4]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[4]);
+  client.print("}}");
+  client.println("}");
+  client.flush();
 }
 
 void serveModeControl(Stream &client, const String &req)
@@ -3359,6 +4206,138 @@ void serveAxisControl(Stream &client, const String &req)
   client.printf("OK axis=%c\n", axisChar);
 }
 
+void serveGainPotControl(Stream &client, const String &req)
+{
+  int channelIdx = req.indexOf("channel=");
+  int wiperIdx = req.indexOf("wiper=");
+
+  if (channelIdx == -1 || wiperIdx == -1)
+  {
+    client.println("HTTP/1.1 400 Bad Request");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.println("{\"ok\":false,\"error\":\"missing channel or wiper parameter\"}");
+    return;
+  }
+
+  int channel = req.substring(channelIdx + 8).toInt();
+  int wiper = req.substring(wiperIdx + 6).toInt();
+
+  if (channel < 0 || channel > 1 || wiper < 0 || wiper > 255)
+  {
+    client.println("HTTP/1.1 400 Bad Request");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.println("{\"ok\":false,\"error\":\"channel must be 0..1 and wiper 0..255\"}");
+    return;
+  }
+
+  if (!gainPotDetected)
+  {
+    client.println("HTTP/1.1 503 Service Unavailable");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.println("{\"ok\":false,\"error\":\"GainPot not detected\"}");
+    return;
+  }
+
+  bool ok = gainPot.writeWiper((uint8_t)channel, (uint8_t)wiper);
+  uint8_t readback = gainPotWiperCache[channel];
+  if (ok)
+  {
+    if (gainPot.readWiper((uint8_t)channel, readback))
+    {
+      gainPotWiperCache[channel] = readback;
+    }
+    else
+    {
+      readback = (uint8_t)wiper;
+      gainPotWiperCache[channel] = readback;
+    }
+  }
+
+  client.println(ok ? "HTTP/1.1 200 OK" : "HTTP/1.1 500 Internal Server Error");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.print("{\"ok\":");
+  client.print(ok ? "true" : "false");
+  client.print(",\"channel\":");
+  client.print(channel);
+  client.print(",\"wiper\":");
+  client.print(readback);
+  client.println("}");
+}
+
+void serveOffsetPotControl(Stream &client, const String &req)
+{
+  int channelIdx = req.indexOf("channel=");
+  int voltageIdx = req.indexOf("voltage=");
+
+  if (channelIdx == -1 || voltageIdx == -1)
+  {
+    client.println("HTTP/1.1 400 Bad Request");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.println("{\"ok\":false,\"error\":\"missing channel or voltage parameter\"}");
+    return;
+  }
+
+  int channel = req.substring(channelIdx + 8).toInt();
+  float targetVoltage = req.substring(voltageIdx + 8).toFloat();
+
+  if (channel < 0 || channel > 1)
+  {
+    client.println("HTTP/1.1 400 Bad Request");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.println("{\"ok\":false,\"error\":\"channel must be 0..1\"}");
+    return;
+  }
+
+  if (!offsetPotDetected)
+  {
+    client.println("HTTP/1.1 503 Service Unavailable");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close");
+    client.println();
+    client.println("{\"ok\":false,\"error\":\"OffsetPot not detected\"}");
+    return;
+  }
+
+  digpot::AD5142A::VoltageDividerResult result = {};
+  bool ok = offsetPot.voltdivWrite((uint8_t)channel, targetVoltage, offsetPotVoltageDividerCfg, result);
+
+  if (ok)
+  {
+    offsetPotWiperCache[channel] = result.position;
+    offsetPotVoltageCache[channel] = result.expectedVoltage;
+  }
+
+  client.println(ok ? "HTTP/1.1 200 OK" : "HTTP/1.1 500 Internal Server Error");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.print("{\"ok\":");
+  client.print(ok ? "true" : "false");
+  client.print(",\"channel\":");
+  client.print(channel);
+  client.print(",\"targetVoltage\":");
+  client.print(targetVoltage, 6);
+  client.print(",\"appliedVoltage\":");
+  client.print(result.expectedVoltage, 6);
+  client.print(",\"wiper\":");
+  client.print(result.position);
+  client.print(",\"errorVoltage\":");
+  client.print(result.errorVoltage, 6);
+  client.println("}");
+}
+
 void serveTouchCalibrate(Stream &client, const String &req)
 {
   // Parse points parameter from request: /touchcalibrate?points=5 or points=9
@@ -3430,6 +4409,194 @@ void serveTouchCalibData(Stream &client, const String &req)
     client.println("touch_calib.txt not found!");
     debugPrintln("touch_calib.txt not found!");
   }
+}
+
+void serveMagCalibData(Stream &client, const String &req)
+{
+  File f = LittleFS.open(MAG_CAL_FILE, "r");
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/plain");
+  client.println("Connection: close");
+  client.println();
+
+  if (f)
+  {
+    client.println("=== mag_calib.txt content ===");
+    while (f.available())
+    {
+      client.write(f.read());
+    }
+    client.println("\n=== End of file ===");
+    f.close();
+
+#ifdef DEBUG_BUILD
+    debugPrintln("Mag calibration data requested via HTTP");
+#endif
+  }
+  else
+  {
+    client.println("mag_calib.txt not found!");
+    debugPrintln("mag_calib.txt not found!");
+  }
+}
+
+void serveMagCalibrate(Stream &client, const String &req)
+{
+  int actionIdx = req.indexOf("action=");
+  String action = "status";
+  if (actionIdx != -1)
+  {
+    action = req.substring(actionIdx + 7);
+    int endIdx = action.indexOf(' ');
+    if (endIdx != -1)
+      action = action.substring(0, endIdx);
+    action.trim();
+  }
+
+  if (action == "start")
+  {
+    startMagCalibrationSession();
+    tftPrint("MagCal started. Step 1: Top face UP.\n");
+  }
+  else if (action == "cancel")
+  {
+    magCalSession.active = false;
+    snprintf(magCalSession.message, sizeof(magCalSession.message), "Mag calibration canceled");
+  }
+  else if (action == "capture")
+  {
+    if (!magCalSession.active)
+    {
+      snprintf(magCalSession.message, sizeof(magCalSession.message), "Mag calibration is not active");
+    }
+    else
+    {
+      float meanX, meanY, meanZ, minX, minY, minZ, maxX, maxY, maxZ;
+      uint32_t captureMs = (magCalSession.step == 6) ? 6000 : 1500;
+      uint32_t captureIntervalMs = (magCalSession.step == 6) ? 30 : 20;
+
+      bool ok = collectMagStats(captureMs,
+                                captureIntervalMs,
+                                meanX,
+                                meanY,
+                                meanZ,
+                                minX,
+                                minY,
+                                minZ,
+                                maxX,
+                                maxY,
+                                maxZ);
+
+      if (!ok)
+      {
+        snprintf(magCalSession.message, sizeof(magCalSession.message), "Capture failed (IMU unavailable)");
+      }
+      else
+      {
+        uint8_t s = magCalSession.step;
+        if (s < MagCalibrationSession::totalSteps)
+        {
+          magCalSession.poseMean[s][0] = meanX;
+          magCalSession.poseMean[s][1] = meanY;
+          magCalSession.poseMean[s][2] = meanZ;
+        }
+
+        if (minX < magCalSession.minV[0])
+          magCalSession.minV[0] = minX;
+        if (minY < magCalSession.minV[1])
+          magCalSession.minV[1] = minY;
+        if (minZ < magCalSession.minV[2])
+          magCalSession.minV[2] = minZ;
+        if (maxX > magCalSession.maxV[0])
+          magCalSession.maxV[0] = maxX;
+        if (maxY > magCalSession.maxV[1])
+          magCalSession.maxV[1] = maxY;
+        if (maxZ > magCalSession.maxV[2])
+          magCalSession.maxV[2] = maxZ;
+
+        magCalSession.step++;
+
+        if (magCalSession.step >= MagCalibrationSession::totalSteps)
+        {
+          finalizeMagCalibration();
+          magCalSession.active = false;
+          tftPrint("MagCal finished.\n");
+        }
+        else
+        {
+          snprintf(magCalSession.message,
+                   sizeof(magCalSession.message),
+                   "Step %d/%d: Place sensor %s and capture",
+                   magCalSession.step + 1,
+                   MagCalibrationSession::totalSteps,
+                   magCalPoseName(magCalSession.step));
+          tftPrint((String("MagCal next: ") + magCalPoseName(magCalSession.step) + "\n").c_str());
+        }
+      }
+    }
+  }
+  else if (action == "reset")
+  {
+    magCalParams.valid = false;
+    magCalParams.offset[0] = magCalParams.offset[1] = magCalParams.offset[2] = 0.0f;
+    magCalParams.scale[0] = magCalParams.scale[1] = magCalParams.scale[2] = 1.0f;
+
+    bool recordingWasEnabled = miniSeedRecordingEnabled;
+    if (recordingWasEnabled)
+    {
+      miniSeedRecordingEnabled = false;
+      miniSeedLogger.setRecordingEnabled(false);
+    }
+
+    LittleFS.remove(MAG_CAL_FILE);
+
+    if (recordingWasEnabled)
+    {
+      miniSeedRecordingEnabled = true;
+      miniSeedLogger.setRecordingEnabled(true);
+    }
+
+    snprintf(magCalSession.message, sizeof(magCalSession.message), "Mag calibration reset");
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: application/json");
+  client.println("Connection: close");
+  client.println();
+  client.print("{\"ok\":true");
+  client.print(",\"action\":\"");
+  client.print(action);
+  client.print("\"");
+  client.print(",\"active\":");
+  client.print(magCalSession.active ? "true" : "false");
+  client.print(",\"step\":");
+  client.print(magCalSession.step);
+  client.print(",\"totalSteps\":");
+  client.print((int)MagCalibrationSession::totalSteps);
+  client.print(",\"nextPose\":\"");
+  client.print(magCalPoseName(magCalSession.step));
+  client.print("\"");
+  client.print(",\"message\":\"");
+  client.print(magCalSession.message);
+  client.print("\"");
+  client.print(",\"calValid\":");
+  client.print(magCalParams.valid ? "true" : "false");
+  client.print(",\"offset\":[");
+  client.print(magCalParams.offset[0], 5);
+  client.print(",");
+  client.print(magCalParams.offset[1], 5);
+  client.print(",");
+  client.print(magCalParams.offset[2], 5);
+  client.print("]");
+  client.print(",\"scale\":[");
+  client.print(magCalParams.scale[0], 5);
+  client.print(",");
+  client.print(magCalParams.scale[1], 5);
+  client.print(",");
+  client.print(magCalParams.scale[2], 5);
+  client.print("]");
+  client.println("}");
 }
 
 void serveHighchartsStatus(Stream &client, const String &req)
@@ -4244,6 +5411,15 @@ void setup()
 
   LittleFS.begin(); // Initialize LittleFS filesystem
   tftPrint("Filesystem initialized...\n");
+  if (loadMagCalibration())
+  {
+    tftPrint("Mag calibration loaded...\n");
+    debugSerialPrintln("Mag calibration loaded from /mag_calib.txt");
+  }
+  else
+  {
+    debugSerialPrintln("No valid /mag_calib.txt found, using identity calibration");
+  }
 
 #if ENABLE_SD_CARD
   initSDCard(); // Initialize SD card - also initializes miniSEED logger
@@ -4301,6 +5477,7 @@ void setup()
   initADS1256();
   // initMPU6500();
   initICM20948();
+  initDigPots();
 
   // Set your local timezone here (example: Central Europe)
   setLocalTimezone(LOCAL_TIMEZONE);
@@ -4463,16 +5640,19 @@ void loop()
 
   // Read ICM20948 only every 5th iteration to improve overall sampling rate
   // This gives ~40 Hz for IMU data which is sufficient for slow vibrations
-  icm_read_counter++;
-  if (icm_read_counter >= 5)
+  if (icmDetected)
   {
-    block_start_time = micros();
-    readICM20948();
-    if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+    icm_read_counter++;
+    if (icm_read_counter >= 5)
     {
-      debugSerialPrintf("TIMING: ICM20948 Read: %lu us\n", micros() - block_start_time);
+      block_start_time = micros();
+      readICM20948();
+      if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
+      {
+        debugSerialPrintf("TIMING: ICM20948 Read: %lu us\n", micros() - block_start_time);
+      }
+      icm_read_counter = 0;
     }
-    icm_read_counter = 0;
   }
 
   // ----------------------------------------------------------------------------
@@ -4504,19 +5684,20 @@ void loop()
   {
     time_t now = time(nullptr);
 
-    static uint32_t write_error_count = 0;
-    static unsigned long last_error_log = 0;
-    bool write_ok = true;
+    static uint32_t record_err_count = 0;
+    static unsigned long last_record_warning = 0;
+    bool record_ok = true;
 
     // VEL channels: Store raw ADC counts (int32_t) at 500 Hz
     // Scaling: 1 count ≈ 0.596 nV per LSB (from ADS1256 datasheet with Vref=2.5V, PGA=1)
     // Raw counts preserve full ADC resolution for post-processing calibration
+    // Direct call on Core 0 - no queue, no cross-core races.
     if (!miniSeedLogger.recordSample("VEL_X", (int32_t)adcValue0, 500, now))
-      write_ok = false;
+      record_ok = false;
     if (!miniSeedLogger.recordSample("VEL_Y", (int32_t)adcValue7, 500, now))
-      write_ok = false;
+      record_ok = false;
 
-    if (icm_read_counter == 0) // Record IMU data every 5th sample (40 Hz)
+    if (icmDetected && icm_read_counter == 0) // Record IMU data every 5th sample (40 Hz)
     {
       // ACC channels: Convert from m/s² to micro-g (µg) for seismic compatibility
       // Standard conversion: 1 g = 9.80665 m/s²
@@ -4526,11 +5707,11 @@ void loop()
       int32_t acc_z_ug = (int32_t)(accelData.acceleration.z * 1000000.0f / 9.80665f);
 
       if (!miniSeedLogger.recordSample("ACC_X", acc_x_ug, 100, now))
-        write_ok = false;
+        record_ok = false;
       if (!miniSeedLogger.recordSample("ACC_Y", acc_y_ug, 100, now))
-        write_ok = false;
+        record_ok = false;
       if (!miniSeedLogger.recordSample("ACC_Z", acc_z_ug, 100, now))
-        write_ok = false;
+        record_ok = false;
 
       // GYRO channels: Convert from rad/s to milli-degrees/s (mdps)
       // Standard conversion: 1 rad/s = 57.2958 deg/s = 57295.8 mdps
@@ -4539,29 +5720,26 @@ void loop()
       int32_t gyro_z_mdps = (int32_t)(gyroData.gyro.z * 57295.8f);
 
       if (!miniSeedLogger.recordSample("GYRO_X", gyro_x_mdps, 100, now))
-        write_ok = false;
+        record_ok = false;
       if (!miniSeedLogger.recordSample("GYRO_Y", gyro_y_mdps, 100, now))
-        write_ok = false;
+        record_ok = false;
       if (!miniSeedLogger.recordSample("GYRO_Z", gyro_z_mdps, 100, now))
-        write_ok = false;
+        record_ok = false;
     }
 
-    // Track and log write errors
-    if (!write_ok)
+    // Track and log recording errors
+    if (!record_ok)
     {
-      write_error_count++;
-      // Log errors every 5 seconds to avoid spam
-      if (millis() - last_error_log > 5000)
+      record_err_count++;
+      // Log warnings every 5 seconds to avoid spam
+      if (millis() - last_record_warning > 5000)
       {
-        debugSerialPrintf("WARNING: miniSEED write errors detected (total: %lu). Check SD card/directory.\n",
-                          (unsigned long)write_error_count);
-        last_error_log = millis();
+        debugSerialPrintf("WARNING: miniSEED recordSample failed (%lu errors).\n",
+                          (unsigned long)record_err_count);
+        last_record_warning = millis();
+        record_err_count = 0;
       }
     }
-
-    // Intentionally avoid periodic forced flush here.
-    // High-rate channels flush on buffer-full, and recording stop triggers close/flush.
-    // Avoiding synchronous 5-second flush reduces acquisition stalls and trace splitting.
   }
   else if (miniSeedRecordingEnabled && !sd_card_ready)
   {
@@ -4678,28 +5856,58 @@ void loop()
     block_start_time = micros();
     if (udpStreamEnable[0])
     {
-      debugSerialPrintf("Sending UDP stream for velocXraw, count: %d\n", UDP_PACKET_SIZE);
-      sendSensorUDPStream("velocX", velocXraw_block, UDP_PACKET_SIZE);
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for velocXraw, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("velocX", velocXraw_block, UDP_PACKET_SIZE))
+        udpPacketsSent[0]++;
+      else
+        udpPacketsDropped[0]++;
     }
     if (udpStreamEnable[1])
     {
-      debugSerialPrintf("Sending UDP stream for velocYraw, count: %d\n", UDP_PACKET_SIZE);
-      sendSensorUDPStream("velocY", velocYraw_block, UDP_PACKET_SIZE);
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for velocYraw, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("velocY", velocYraw_block, UDP_PACKET_SIZE))
+        udpPacketsSent[1]++;
+      else
+        udpPacketsDropped[1]++;
     }
     if (udpStreamEnable[2])
     {
-      debugSerialPrintf("Sending UDP stream for accelX, count: %d\n", UDP_PACKET_SIZE);
-      sendSensorUDPStream("accelX", accelX_block, UDP_PACKET_SIZE);
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for accelX, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("accelX", accelX_block, UDP_PACKET_SIZE))
+        udpPacketsSent[2]++;
+      else
+        udpPacketsDropped[2]++;
     }
     if (udpStreamEnable[3])
     {
-      debugSerialPrintf("Sending UDP stream for accelY, count: %d\n", UDP_PACKET_SIZE);
-      sendSensorUDPStream("accelY", accelY_block, UDP_PACKET_SIZE);
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for accelY, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("accelY", accelY_block, UDP_PACKET_SIZE))
+        udpPacketsSent[3]++;
+      else
+        udpPacketsDropped[3]++;
     }
     if (udpStreamEnable[4])
     {
-      debugSerialPrintf("Sending UDP stream for accelZ, count: %d\n", UDP_PACKET_SIZE);
-      sendSensorUDPStream("accelZ", accelZ_block, UDP_PACKET_SIZE);
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for accelZ, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("accelZ", accelZ_block, UDP_PACKET_SIZE))
+        udpPacketsSent[4]++;
+      else
+        udpPacketsDropped[4]++;
     }
     block_idx = 0;
     if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
@@ -4725,50 +5933,75 @@ void loop()
     static uint32_t httpSoftResyncCount = 0;
     static uint32_t httpHardResyncCount = 0;
     static uint32_t httpResyncFailStreak = 0;
-    static uint32_t httpMaxNoClientLoops = 0;
 
     // TIMING BLOCK 5: HTTP/WEBSERVER NETWORKING
     block_start_time = micros();
     unsigned long http_accept_start = micros();
     if (netMode == NET_WIZNET)
     {
-      static uint32_t wiznetNoClientLoops = 0;
-      static unsigned long lastWiznetResyncMs = 0;
+      // Maintain Ethernet connection (renew DHCP lease, handle network stack)
+      // Throttled to once per 30 seconds (DHCP renewal happens on hour timescales)
+      static unsigned long lastMaintainMs = 0;
+      if (millis() - lastMaintainMs >= 30000)
+      {
+        Ethernet.maintain();
+        lastMaintainMs = millis();
+      }
 
-      if (wiznetNoClientLoops > 5000 && (millis() - lastWiznetResyncMs) > 10000)
+      // Track last time any client was successfully accepted (millis).
+      // Resync is only triggered after a long idle period – NOT on every few
+      // dozen loop iterations, which would corrupt the shared SPI0 bus and
+      // break the W5500 socket table.
+      static unsigned long lastClientSeenMs = millis();
+      static unsigned long lastWiznetResyncMs = 0;
+      // 5 minutes with no client before attempting a resync, then at most
+      // once per minute so the bus is not thrashed.
+      const unsigned long RESYNC_NO_CLIENT_MS = 5UL * 60 * 1000;
+      const unsigned long RESYNC_COOLDOWN_MS = 60UL * 1000;
+
+      if ((millis() - lastClientSeenMs) > RESYNC_NO_CLIENT_MS &&
+          (millis() - lastWiznetResyncMs) > RESYNC_COOLDOWN_MS)
       {
         bool useHardReset = (httpResyncFailStreak >= 2);
 
         if (logVerbosity >= LOG_DEBUG)
         {
-          debugSerialPrintf("HTTP: WIZNET %s resync after %lu no-client loops\n",
+          debugSerialPrintf("HTTP: WIZNET %s resync after %lu ms with no client\n",
                             useHardReset ? "HARD" : "SOFT",
-                            (unsigned long)wiznetNoClientLoops);
+                            (unsigned long)(millis() - lastClientSeenMs));
         }
 
         releaseSPIBus();
         if (useHardReset)
         {
+          // Full hardware reset: tear down SPI, reset chip, reinit SPI.
           wiznet5k_reset();
+          wiznet_init_spi();
           httpHardResyncCount++;
         }
         else
         {
+          // Soft resync: SPI bus is already running (shared with TFT/touch),
+          // so only re-register the CS pin and re-open the listening socket.
           httpSoftResyncCount++;
         }
-        wiznet_init_spi();
         Ethernet.init(WIZNET_SPI_CS);
         ethServer.begin();
+        ethUdpStream.stop();
+        ethUdpStreamReady = (ethUdpStream.begin(UDP_STREAM_PORT) != 0);
+        if (logVerbosity >= LOG_DEBUG)
+        {
+          debugSerialPrintf("HTTP: Resync Ethernet UDP socket %s\n", ethUdpStreamReady ? "ready" : "FAILED");
+        }
 
         httpResyncFailStreak++;
         lastWiznetResyncMs = millis();
-        wiznetNoClientLoops = 0;
       }
 
       EthernetClient client = ethServer.available();
       if (client)
       {
-        wiznetNoClientLoops = 0;
+        lastClientSeenMs = millis();
         httpAcceptedClients++;
         httpResyncFailStreak = 0;
 
@@ -4839,6 +6072,11 @@ void loop()
           debugSerialPrintln("HTTP: /udpstream");
           serveUDPStreamControl(client, req);
         }
+        else if (req.indexOf("GET /udpstatus") == 0)
+        {
+          debugSerialPrintln("HTTP: /udpstatus");
+          serveUDPStatus(client);
+        }
         else if (req.indexOf("GET /setmode") == 0)
         {
           debugSerialPrintln("HTTP: /setmode");
@@ -4848,6 +6086,16 @@ void loop()
         {
           debugSerialPrintln("HTTP: /setaxis");
           serveAxisControl(client, req);
+        }
+        else if (req.indexOf("GET /setgainpot") == 0)
+        {
+          debugSerialPrintln("HTTP: /setgainpot");
+          serveGainPotControl(client, req);
+        }
+        else if (req.indexOf("GET /setoffsetpot") == 0)
+        {
+          debugSerialPrintln("HTTP: /setoffsetpot");
+          serveOffsetPotControl(client, req);
         }
         else if (req.indexOf("GET /setloglevel") == 0)
         {
@@ -4864,6 +6112,16 @@ void loop()
           debugSerialPrintln("HTTP: /touchcalibdata");
           serveTouchCalibData(client, req);
         }
+        else if (req.indexOf("GET /magcalibdata") == 0)
+        {
+          debugSerialPrintln("HTTP: /magcalibdata");
+          serveMagCalibData(client, req);
+        }
+        else if (req.indexOf("GET /magcalibrate") == 0)
+        {
+          debugSerialPrintln("HTTP: /magcalibrate");
+          serveMagCalibrate(client, req);
+        }
         else if (req.indexOf("GET /miniseed") == 0)
         {
           debugSerialPrintln("HTTP: /miniseed");
@@ -4878,6 +6136,11 @@ void loop()
         {
           debugSerialPrintln("HTTP: /mseedfile");
           serveMseedFile(client, req);
+        }
+        else if (req.indexOf("GET /deletemseed") == 0)
+        {
+          debugSerialPrintln("HTTP: /deletemseed");
+          serveDeleteMseedFile(client, req);
         }
         else if (req.indexOf("GET /mseedviewer") == 0)
         {
@@ -4919,14 +6182,6 @@ void loop()
         if (logVerbosity >= LOG_DEBUG)
         {
           debugSerialPrintln("HTTP: Ethernet client closed");
-        }
-      }
-      else
-      {
-        wiznetNoClientLoops++;
-        if (wiznetNoClientLoops > httpMaxNoClientLoops)
-        {
-          httpMaxNoClientLoops = wiznetNoClientLoops;
         }
       }
     }
@@ -5004,6 +6259,11 @@ void loop()
           debugSerialPrintln("HTTP: /udpstream");
           serveUDPStreamControl(client, req);
         }
+        else if (req.indexOf("GET /udpstatus") == 0)
+        {
+          debugSerialPrintln("HTTP: /udpstatus");
+          serveUDPStatus(client);
+        }
         else if (req.indexOf("GET /setmode") == 0)
         {
           debugSerialPrintln("HTTP: /setmode");
@@ -5013,6 +6273,16 @@ void loop()
         {
           debugSerialPrintln("HTTP: /setaxis");
           serveAxisControl(client, req);
+        }
+        else if (req.indexOf("GET /setgainpot") == 0)
+        {
+          debugSerialPrintln("HTTP: /setgainpot");
+          serveGainPotControl(client, req);
+        }
+        else if (req.indexOf("GET /setoffsetpot") == 0)
+        {
+          debugSerialPrintln("HTTP: /setoffsetpot");
+          serveOffsetPotControl(client, req);
         }
         else if (req.indexOf("GET /setloglevel") == 0)
         {
@@ -5029,6 +6299,16 @@ void loop()
           debugSerialPrintln("HTTP: /touchcalibdata");
           serveTouchCalibData(client, req);
         }
+        else if (req.indexOf("GET /magcalibdata") == 0)
+        {
+          debugSerialPrintln("HTTP: /magcalibdata");
+          serveMagCalibData(client, req);
+        }
+        else if (req.indexOf("GET /magcalibrate") == 0)
+        {
+          debugSerialPrintln("HTTP: /magcalibrate");
+          serveMagCalibrate(client, req);
+        }
         else if (req.indexOf("GET /miniseed") == 0)
         {
           debugSerialPrintln("HTTP: /miniseed");
@@ -5043,6 +6323,11 @@ void loop()
         {
           debugSerialPrintln("HTTP: /mseedfile");
           serveMseedFile(client, req);
+        }
+        else if (req.indexOf("GET /deletemseed") == 0)
+        {
+          debugSerialPrintln("HTTP: /deletemseed");
+          serveDeleteMseedFile(client, req);
         }
         else if (req.indexOf("GET /mseedviewer") == 0)
         {
@@ -5091,11 +6376,10 @@ void loop()
     if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
     {
       debugSerialPrintf("TIMING: HTTP Networking: %lu us\n", micros() - block_start_time);
-      debugSerialPrintf("HTTP Stats: accepted=%lu softResync=%lu hardResync=%lu maxNoClientLoops=%lu\n",
+      debugSerialPrintf("HTTP Stats: accepted=%lu softResync=%lu hardResync=%lu\n",
                         (unsigned long)httpAcceptedClients,
                         (unsigned long)httpSoftResyncCount,
-                        (unsigned long)httpHardResyncCount,
-                        (unsigned long)httpMaxNoClientLoops);
+                        (unsigned long)httpHardResyncCount);
     }
   }
 
@@ -5136,6 +6420,84 @@ void loop()
     trigger_touch_calibration = false;
     debugPrintf("Starting touch calibration with %d points...\\n", NUM_CALIB_POINTS);
     calibrateTouchController();
+
+    // Automatic persistence after calibration using dual-core-safe LittleFS save.
+    if (touch_calibration_unsaved)
+    {
+      releaseSPIBus();
+      if (saveTouchCalibrationMatrixToFile())
+      {
+        touch_calibration_unsaved = false;
+        debugSerialPrintln("Touch calibration: automatic save to /touch_calib.txt completed");
+      }
+      else
+      {
+        debugSerialPrintln("Touch calibration: automatic save failed");
+      }
+    }
+
+    // One-shot Ethernet socket stack reset/reconfigure after blocking
+    // calibration to recover from refused connections.
+    if (netMode == NET_WIZNET)
+    {
+      releaseSPIBus();
+
+      byte mac[6];
+      getWiznetMAC(mac);
+
+      wiznet5k_reset();
+      wiznet_init_spi();
+      Ethernet.init(WIZNET_SPI_CS);
+
+      bool usedStatic = false;
+      if (assignedIP[0] != 0 && assignedSubnet[0] != 0)
+      {
+        Ethernet.begin(mac, assignedIP, assignedDNS, assignedGateway, assignedSubnet);
+        usedStatic = true;
+      }
+      else
+      {
+        int dhcpRc = Ethernet.begin(mac);
+        if (dhcpRc == 0)
+        {
+          IPAddress fallbackIP(10, 0, 1, 222);
+          IPAddress fallbackGateway(10, 0, 0, 1);
+          IPAddress fallbackSubnet(255, 255, 252, 0);
+          IPAddress fallbackDNS(8, 8, 8, 8);
+          Ethernet.begin(mac, fallbackIP, fallbackDNS, fallbackGateway, fallbackSubnet);
+          assignedIP = fallbackIP;
+          assignedGateway = fallbackGateway;
+          assignedSubnet = fallbackSubnet;
+          assignedDNS = fallbackDNS;
+          usedStatic = true;
+        }
+      }
+
+      if (!usedStatic)
+      {
+        assignedIP = Ethernet.localIP();
+        assignedGateway = Ethernet.gatewayIP();
+        assignedSubnet = Ethernet.subnetMask();
+        assignedDNS = Ethernet.dnsServerIP();
+      }
+
+      ethServer.begin();
+      ethUdpStream.stop();
+      ethUdpStreamReady = (ethUdpStream.begin(UDP_STREAM_PORT) != 0);
+      debugSerialPrintf("HTTP: Reinit Ethernet UDP socket %s\n", ethUdpStreamReady ? "ready" : "FAILED");
+      Ethernet.maintain();
+      debugSerialPrintf("HTTP: One-shot Ethernet stack reset complete, IP=%d.%d.%d.%d\n",
+                        assignedIP[0], assignedIP[1], assignedIP[2], assignedIP[3]);
+    }
+    else if (netMode == NET_WIFI)
+    {
+      wifiServer.begin();
+      wifiUdpStream.stop();
+      wifiUdpStreamReady = (wifiUdpStream.begin(UDP_STREAM_PORT) != 0);
+      debugSerialPrintf("HTTP: Reinit WiFi UDP socket %s\n", wifiUdpStreamReady ? "ready" : "FAILED");
+      debugSerialPrintln("HTTP: Rebound WiFi server after touch calibration");
+    }
+
     tft.fillScreen(TFT_BLACK);
     tft.setCursor(0, 0);
     // Reset display mode flags

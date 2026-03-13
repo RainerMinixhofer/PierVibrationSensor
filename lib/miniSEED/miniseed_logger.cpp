@@ -69,6 +69,8 @@ bool MinISeedLogger::init(fs_info_t *fs_info_ptr, const char *station_code_in, c
     strncpy(data_dir, data_dir_in, sizeof(data_dir) - 1);
     data_dir[sizeof(data_dir) - 1] = '\0';
 
+    record_sequence = 1;
+
     return true;
 }
 
@@ -101,6 +103,15 @@ int MinISeedLogger::findChannelBuffer(const char *channel)
 {
     for (int i = 0; i < MAX_CHANNELS; i++)
     {
+        // Self-heal invalid slot state observed in diagnostics: active slot with empty channel name.
+        if (channel_buffers[i].active && channel_buffers[i].channel_name[0] == '\0')
+        {
+            channel_buffers[i].active = false;
+            channel_buffers[i].sample_count = 0;
+            channel_buffers[i].filename[0] = '\0';
+            channel_buffers[i].current_day = 0;
+            continue;
+        }
         if (channel_buffers[i].active && strcmp(channel_buffers[i].channel_name, channel) == 0)
         {
             return i;
@@ -115,14 +126,18 @@ int MinISeedLogger::allocateChannelBuffer(const char *channel)
     // First try to find an inactive slot
     for (int i = 0; i < MAX_CHANNELS; i++)
     {
-        if (!channel_buffers[i].active)
+        if (!channel_buffers[i].active || channel_buffers[i].channel_name[0] == '\0')
         {
             channel_buffers[i].active = true;
             channel_buffers[i].sample_count = 0;
             channel_buffers[i].start_time_epoch = 0.0;
+            channel_buffers[i].samples_emitted = 0;
+            channel_buffers[i].next_record_start_0001 = 0;
+            channel_buffers[i].record_sequence = 1;
             channel_buffers[i].next_expected_time = 0.0;
             channel_buffers[i].filename[0] = '\0'; // Clear filename - will be set on first sample
             channel_buffers[i].current_day = 0;    // Clear day tracking
+            channel_buffers[i].channel_name[0] = '\0';
             strncpy(channel_buffers[i].channel_name, channel, sizeof(channel_buffers[i].channel_name) - 1);
             channel_buffers[i].channel_name[sizeof(channel_buffers[i].channel_name) - 1] = '\0';
             return i;
@@ -146,6 +161,9 @@ int MinISeedLogger::allocateChannelBuffer(const char *channel)
     channel_buffers[oldest_idx].active = true;
     channel_buffers[oldest_idx].sample_count = 0;
     channel_buffers[oldest_idx].start_time_epoch = 0.0;
+    channel_buffers[oldest_idx].samples_emitted = 0;
+    channel_buffers[oldest_idx].next_record_start_0001 = 0;
+    channel_buffers[oldest_idx].record_sequence = 1;
     channel_buffers[oldest_idx].next_expected_time = 0.0;
     channel_buffers[oldest_idx].filename[0] = '\0';
     channel_buffers[oldest_idx].current_day = 0;
@@ -155,7 +173,7 @@ int MinISeedLogger::allocateChannelBuffer(const char *channel)
 }
 
 // Flush a specific channel buffer
-bool MinISeedLogger::flushChannel(int channel_idx)
+bool MinISeedLogger::flushChannel(int channel_idx, uint32_t max_records_to_write)
 {
     if (channel_idx < 0 || channel_idx >= MAX_CHANNELS)
         return false;
@@ -169,18 +187,21 @@ bool MinISeedLogger::flushChannel(int channel_idx)
     // Each miniSEED v2 record can hold max 114 samples (512 bytes - 56 byte overhead)
     bool all_success = true;
     uint32_t samples_written = 0;
+    uint32_t records_written = 0;
 
-    // Use double precision for accurate timestamp calculation
-    double timestamp_offset_seconds = 0.0;
-
-    while (samples_written < cb.sample_count)
+    while (samples_written < cb.sample_count && records_written < max_records_to_write)
     {
         uint32_t samples_this_record = cb.sample_count - samples_written;
         if (samples_this_record > SAMPLES_PER_MINISEED_RECORD)
             samples_this_record = SAMPLES_PER_MINISEED_RECORD;
 
-        // Calculate current timestamp with sub-second precision
-        double current_timestamp = cb.start_time_epoch + timestamp_offset_seconds;
+        // Deterministic per-record timing in 0.0001 s units for strict miniSEED readers.
+        // This avoids occasional floating-state resets that can duplicate header windows.
+        double current_timestamp = cb.start_time_epoch;
+        if (cb.next_record_start_0001 > 0)
+        {
+            current_timestamp = (double)cb.next_record_start_0001 / 10000.0;
+        }
 
         bool result = writeRecordToFile(cb.filename,
                                         cb.samples + samples_written,
@@ -195,17 +216,40 @@ bool MinISeedLogger::flushChannel(int channel_idx)
             break; // Stop on first error
         }
 
-        samples_written += samples_this_record;
-
-        // Update timestamp offset for next record
-        // Time increment = samples_this_record / sample_rate (in seconds)
         if (cb.sample_rate > 0)
-            timestamp_offset_seconds += (double)samples_this_record / (double)cb.sample_rate;
+        {
+            int64_t delta_0001 = (int64_t)llround(((double)samples_this_record * 10000.0) / (double)cb.sample_rate);
+            if (delta_0001 < 1)
+                delta_0001 = 1;
+            cb.next_record_start_0001 += delta_0001;
+        }
+
+        samples_written += samples_this_record;
+        records_written++;
     }
 
-    // Reset buffer for next batch of samples
-    // Keep filename and channel info, just reset sample count
-    cb.sample_count = 0;
+    // Always advance start_time_epoch by every sample written, whether the flush
+    // was full or partial. This ensures correct timestamps even if a write error
+    // caused early loop exit (samples_written = 0 would leave start_time_epoch
+    // unchanged, which is still correct — no records were emitted that time).
+    if (samples_written > 0 && cb.sample_rate > 0)
+    {
+        cb.start_time_epoch += (double)samples_written / (double)cb.sample_rate;
+        cb.samples_emitted += (uint64_t)samples_written;
+    }
+
+    if (samples_written >= cb.sample_count)
+    {
+        // Buffer fully flushed.
+        cb.sample_count = 0;
+    }
+    else if (samples_written > 0)
+    {
+        // Keep unwritten samples; start_time_epoch already advanced above.
+        const uint32_t remaining = cb.sample_count - samples_written;
+        memmove(cb.samples, cb.samples + samples_written, remaining * sizeof(cb.samples[0]));
+        cb.sample_count = remaining;
+    }
     // NOTE: cb.filename remains the same for continued appending to daily file
 
     return all_success;
@@ -223,25 +267,45 @@ bool MinISeedLogger::writeRecordV2(const char *filename, const int32_t *samples,
     uint8_t record[512];
     memset(record, 0, sizeof(record));
 
-    time_t start_seconds = (time_t)floor(start_timestamp_epoch);
-    double frac_seconds = start_timestamp_epoch - (double)start_seconds;
-    if (frac_seconds < 0.0)
-        frac_seconds = 0.0;
-
-    uint16_t frac_0001 = (uint16_t)lround(frac_seconds * 10000.0);
-    if (frac_0001 >= 10000)
+    // Convert to 0.0001-second ticks first to avoid floating drift in header fields.
+    int64_t ts_0001 = (int64_t)llround(start_timestamp_epoch * 10000.0);
+    time_t start_seconds = (time_t)(ts_0001 / 10000);
+    int64_t frac_ticks = ts_0001 % 10000;
+    if (frac_ticks < 0)
     {
-        start_seconds += 1;
-        frac_0001 = 0;
+        start_seconds -= 1;
+        frac_ticks += 10000;
     }
+    uint16_t frac_0001 = (uint16_t)frac_ticks;
 
     struct tm *tm_info = gmtime(&start_seconds);
     if (!tm_info)
         return false;
 
     // Fill miniSEED header (48 bytes)
-    // Sequence number (positions 0-5): "000001"
-    snprintf((char *)record, 7, "000001");
+    // Sequence number (positions 0-5): use per-channel counter for better
+    // compatibility with readers that segment by stream-local sequence continuity.
+    uint32_t seq = record_sequence;
+    int seq_idx = findChannelBuffer(channel);
+    if (seq_idx >= 0)
+    {
+        if (channel_buffers[seq_idx].record_sequence == 0 || channel_buffers[seq_idx].record_sequence > 999999)
+            channel_buffers[seq_idx].record_sequence = 1;
+        seq = channel_buffers[seq_idx].record_sequence;
+        channel_buffers[seq_idx].record_sequence++;
+        if (channel_buffers[seq_idx].record_sequence > 999999)
+            channel_buffers[seq_idx].record_sequence = 1;
+    }
+    else
+    {
+        if (record_sequence == 0 || record_sequence > 999999)
+            record_sequence = 1;
+        seq = record_sequence;
+        record_sequence++;
+        if (record_sequence > 999999)
+            record_sequence = 1;
+    }
+    snprintf((char *)record, 7, "%06lu", (unsigned long)seq);
 
     // Data quality (position 6): 'D' for good data
     record[6] = 'D';
@@ -359,10 +423,15 @@ bool MinISeedLogger::writeRecordV3(const char *filename, const int32_t *samples,
     if (!fs_info)
         return false;
 
-    time_t start_seconds = (time_t)floor(start_timestamp_epoch);
-    double frac_seconds = start_timestamp_epoch - (double)start_seconds;
-    if (frac_seconds < 0.0)
-        frac_seconds = 0.0;
+    // Use integer nanoseconds decomposition to minimize cumulative floating error.
+    int64_t ts_nanos = (int64_t)llround(start_timestamp_epoch * 1000000000.0);
+    time_t start_seconds = (time_t)(ts_nanos / 1000000000ll);
+    int64_t nanos_i64 = ts_nanos % 1000000000ll;
+    if (nanos_i64 < 0)
+    {
+        start_seconds -= 1;
+        nanos_i64 += 1000000000ll;
+    }
 
     const uint32_t header_size = 256;
     uint32_t data_size = sample_count * 4;
@@ -380,12 +449,7 @@ bool MinISeedLogger::writeRecordV3(const char *filename, const int32_t *samples,
     record[2] = 3;    // Version
     record[3] = 0x01; // Flags
 
-    uint32_t nanos = (uint32_t)lround(frac_seconds * 1000000000.0);
-    if (nanos >= 1000000000u)
-    {
-        start_seconds += 1;
-        nanos = 0;
-    }
+    uint32_t nanos = (uint32_t)nanos_i64;
 
     struct tm *tm_info = gmtime(&start_seconds);
     if (!tm_info)
@@ -451,7 +515,7 @@ bool MinISeedLogger::writeRecordToFile(const char *filename, const int32_t *samp
 bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
                                   uint16_t sample_rate, time_t timestamp)
 {
-    if (!channel || !recording_enabled)
+    if (!channel || channel[0] == '\0' || !recording_enabled)
         return false;
 
     // Find or allocate channel buffer
@@ -463,12 +527,8 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
 
     ChannelBuffer &cb = channel_buffers[idx];
 
-    struct tm *tm_info = gmtime(&timestamp);
-    if (!tm_info)
-        return false;
-
-    // Calculate current day number (days since epoch)
-    int current_day = tm_info->tm_year * 1000 + tm_info->tm_yday;
+    // Fast day tracking without expensive calendar conversion for every sample.
+    int current_day = (int)(timestamp / 86400);
 
     // Check if we need to create a new filename (first sample OR day changed)
     if (cb.filename[0] == '\0' || cb.current_day != current_day)
@@ -483,11 +543,18 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
         // NOTE: All channels for a given day write to the same file.
         // This is standard miniSEED format - one daily file contains multiple traces (channels).
         // Each 512-byte record includes channel identification in the SEED header.
+        struct tm *tm_info = gmtime(&timestamp);
+        if (!tm_info)
+            return false;
+
         snprintf(cb.filename, sizeof(cb.filename), "%s/%04d%02d%02d.MSE",
                  data_dir, tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday);
 
         cb.current_day = current_day;
         cb.start_time_epoch = 0.0;
+        cb.samples_emitted = 0;
+        cb.next_record_start_0001 = 0;
+        cb.record_sequence = 1;
         cb.next_expected_time = 0.0;
     }
 
@@ -510,6 +577,11 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
             cb.start_time_epoch = incoming_time;
         }
 
+        if (cb.next_record_start_0001 <= 0)
+        {
+            cb.next_record_start_0001 = (int64_t)llround(cb.start_time_epoch * 10000.0);
+        }
+
         cb.next_expected_time = cb.start_time_epoch + sample_period;
     }
     else
@@ -523,6 +595,8 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
                 return false;
             cb.sample_rate = sample_rate;
             cb.start_time_epoch = (double)timestamp;
+            cb.samples_emitted = 0;
+            cb.next_record_start_0001 = (int64_t)llround(cb.start_time_epoch * 10000.0);
             cb.next_expected_time = cb.start_time_epoch + sample_period;
         }
         else
@@ -531,26 +605,45 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
         }
     }
 
-    // Add sample to buffer
-    cb.samples[cb.sample_count++] = sample;
-
-    // Flush in smaller chunks to avoid long blocking SD write bursts.
-    // High-rate channels (500 Hz) flush after ~0.9-1.1 s and are staggered by channel name
-    // so multiple channels do not flush in the same loop iteration.
-    uint32_t target_records = (sample_rate >= 400) ? 4u : 8u;
-    if (sample_rate >= 400)
+    // Add sample to buffer with hard bounds protection.
+    // If writer falls behind, never allow out-of-bounds writes that can corrupt
+    // channel metadata (active/name/day/sequence).
+    if (cb.sample_count >= (uint32_t)MAX_SAMPLES_PER_CHANNEL)
     {
-        const uint32_t channel_stagger = ((uint8_t)cb.channel_name[0] + (uint8_t)cb.channel_name[1]) & 0x1u;
-        target_records += channel_stagger; // 4 or 5 records for desynchronization
+        // Try to free space by flushing pending records.
+        if (!flushChannel(idx))
+            return false;
+
+        // If still full, drop oldest sample to preserve memory integrity.
+        if (cb.sample_count >= (uint32_t)MAX_SAMPLES_PER_CHANNEL)
+        {
+            memmove(cb.samples, cb.samples + 1, ((uint32_t)MAX_SAMPLES_PER_CHANNEL - 1u) * sizeof(cb.samples[0]));
+            cb.sample_count = (uint32_t)MAX_SAMPLES_PER_CHANNEL - 1u;
+            if (cb.sample_rate > 0)
+            {
+                const double dt = 1.0 / (double)cb.sample_rate;
+                cb.start_time_epoch += dt;
+                cb.next_expected_time += dt;
+                cb.samples_emitted += 1u;
+                if (cb.next_record_start_0001 > 0)
+                {
+                    int64_t dt_0001 = (int64_t)llround(10000.0 / (double)cb.sample_rate);
+                    if (dt_0001 < 1)
+                        dt_0001 = 1;
+                    cb.next_record_start_0001 += dt_0001;
+                }
+            }
+        }
     }
 
-    uint32_t auto_flush_threshold = target_records * (uint32_t)SAMPLES_PER_MINISEED_RECORD;
-    if (auto_flush_threshold > (uint32_t)MAX_SAMPLES_PER_CHANNEL)
-        auto_flush_threshold = (uint32_t)MAX_SAMPLES_PER_CHANNEL;
+    cb.samples[cb.sample_count++] = sample;
 
-    if (cb.sample_count >= auto_flush_threshold)
+    // Deterministic write policy: emit exactly one full miniSEED record whenever
+    // 114 samples are available. This avoids variable chunk boundaries and keeps
+    // writer behavior stable for strict external readers.
+    if (cb.sample_count >= (uint32_t)SAMPLES_PER_MINISEED_RECORD)
     {
-        if (!flushChannel(idx))
+        if (!flushChannel(idx, 1u))
             return false;
     }
 
@@ -600,13 +693,21 @@ bool MinISeedLogger::closeFile()
 {
     bool result = flush();
 
+    // Reset sequence for next recording session.
+    record_sequence = 1;
+
     // Deactivate all channel buffers
     for (int i = 0; i < MAX_CHANNELS; i++)
     {
         channel_buffers[i].active = false;
         channel_buffers[i].sample_count = 0;
         channel_buffers[i].start_time_epoch = 0.0;
+        channel_buffers[i].samples_emitted = 0;
+        channel_buffers[i].next_record_start_0001 = 0;
+        channel_buffers[i].record_sequence = 1;
         channel_buffers[i].next_expected_time = 0.0;
+        channel_buffers[i].channel_name[0] = '\0';
+        channel_buffers[i].filename[0] = '\0';
     }
 
     return result;

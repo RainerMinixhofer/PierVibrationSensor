@@ -70,6 +70,15 @@
             background: #0b7dda;
         }
 
+        .btn-danger {
+            background: #d32f2f;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #b71c1c;
+        }
+
         .back-btn {
             display: inline-block;
             margin: 10px 0;
@@ -119,6 +128,43 @@
         .file-info p {
             margin: 5px 0;
         }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .stats-card {
+            background: #f7fbff;
+            border: 1px solid #d6e7f8;
+            border-radius: 4px;
+            padding: 10px;
+        }
+
+        .mono {
+            font-family: Consolas, Monaco, monospace;
+        }
+
+        .trace-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+            font-size: 0.92em;
+        }
+
+        .trace-table th,
+        .trace-table td {
+            border: 1px solid #d9e5f1;
+            padding: 6px 8px;
+            text-align: left;
+        }
+
+        .trace-table th {
+            background: #eef5fc;
+            color: #1f4d79;
+        }
     </style>
 </head>
 
@@ -163,29 +209,221 @@
                 html += "<div class='file-item'>";
                 html += "<div><strong>" + file.name + "</strong><br><span class='info'>Size: " + sizeKB + " KB</span></div>";
                 html += "<div>";
-                html += "<button class='btn btn-secondary' data-index='" + i + "'>View Info</button>";
-                html += "<button class='btn btn-primary' data-index='" + i + "'>Download</button>";
+                html += "<button class='btn btn-secondary' data-action='view' data-index='" + i + "'>View Info</button>";
+                html += "<button class='btn btn-primary' data-action='download' data-index='" + i + "'>Download</button>";
+                html += "<button class='btn btn-danger' data-action='delete' data-index='" + i + "'>Delete Trace</button>";
                 html += "</div></div>";
             }
             html += "</div>";
             content.innerHTML = html;
 
-            // Attach event listeners
-            var btnsSecondary = document.querySelectorAll('.btn-secondary');
-            for (let i = 0; i < btnsSecondary.length; i++) {
-                btnsSecondary[i].addEventListener('click', function () {
+            const viewButtons = document.querySelectorAll('[data-action="view"]');
+            for (let i = 0; i < viewButtons.length; i++) {
+                viewButtons[i].addEventListener('click', function () {
                     viewFile(parseInt(this.dataset.index));
                 });
             }
-            var btnsPrimary = document.querySelectorAll('.btn-primary');
-            for (let i = 0; i < btnsPrimary.length; i++) {
-                btnsPrimary[i].addEventListener('click', function () {
+
+            const downloadButtons = document.querySelectorAll('[data-action="download"]');
+            for (let i = 0; i < downloadButtons.length; i++) {
+                downloadButtons[i].addEventListener('click', function () {
                     downloadFile(parseInt(this.dataset.index));
+                });
+            }
+
+            const deleteButtons = document.querySelectorAll('[data-action="delete"]');
+            for (let i = 0; i < deleteButtons.length; i++) {
+                deleteButtons[i].addEventListener('click', function () {
+                    deleteTraceFile(parseInt(this.dataset.index));
                 });
             }
         }
 
-        function viewFile(index) {
+        function readAscii(dataView, start, len) {
+            let out = '';
+            for (let i = 0; i < len; i++) {
+                out += String.fromCharCode(dataView.getUint8(start + i));
+            }
+            return out.trim();
+        }
+
+        function int16be(dataView, offset) {
+            return dataView.getInt16(offset, false);
+        }
+
+        function uint16be(dataView, offset) {
+            return dataView.getUint16(offset, false);
+        }
+
+        function sampleRateFromSeed(factor, multiplier) {
+            if (factor === 0 || multiplier === 0) return 0;
+            if (factor > 0 && multiplier > 0) return factor * multiplier;
+            if (factor > 0 && multiplier < 0) return factor / Math.abs(multiplier);
+            if (factor < 0 && multiplier > 0) return multiplier / Math.abs(factor);
+            return 1.0 / (Math.abs(factor) * Math.abs(multiplier));
+        }
+
+        function parseMiniSeedV2Info(arrayBuffer) {
+            const recordSize = 512;
+            const byteLength = arrayBuffer.byteLength;
+            const dataView = new DataView(arrayBuffer);
+            const recordCount = Math.floor(byteLength / recordSize);
+
+            const rawRecords = [];
+            const channelSet = new Set();
+            let parsedRecords = 0;
+
+            for (let rec = 0; rec < recordCount; rec++) {
+                const base = rec * recordSize;
+                const quality = String.fromCharCode(dataView.getUint8(base + 6));
+                if (!(quality === 'D' || quality === 'R' || quality === 'Q' || quality === 'M')) {
+                    continue;
+                }
+
+                const station = readAscii(dataView, base + 8, 5);
+                const location = readAscii(dataView, base + 13, 2) || '--';
+                const channel = readAscii(dataView, base + 15, 3);
+                const network = readAscii(dataView, base + 18, 2);
+                const year = uint16be(dataView, base + 20);
+                const doy = uint16be(dataView, base + 22);
+                const hour = dataView.getUint8(base + 24);
+                const minute = dataView.getUint8(base + 25);
+                const second = dataView.getUint8(base + 26);
+                const frac = uint16be(dataView, base + 28); // 0.0001 s units
+                const nsamp = uint16be(dataView, base + 30);
+                const srFactor = int16be(dataView, base + 32);
+                const srMultiplier = int16be(dataView, base + 34);
+
+                if (!station || !channel || !network || year < 1900 || doy < 1 || doy > 366) {
+                    continue;
+                }
+
+                const rate = sampleRateFromSeed(srFactor, srMultiplier);
+                const durationSec = (rate > 0 && nsamp > 0) ? (nsamp / rate) : 0;
+                const startMs = Date.UTC(year, 0, 1, hour, minute, second, 0)
+                    + ((doy - 1) * 86400000)
+                    + (frac / 10.0);
+                const endMs = startMs + (durationSec * 1000.0);
+                const traceId = network + '.' + station + '.' + location + '.' + channel;
+
+                channelSet.add(channel);
+                parsedRecords++;
+                rawRecords.push({ traceId, channel, startMs, endMs, durationSec, rate, nsamp });
+            }
+
+            // Sort by (traceId, startMs), then merge only contiguous records into trace segments.
+            // A gap larger than 1.5 sample periods starts a new trace segment.
+            rawRecords.sort((a, b) => {
+                const c = a.traceId.localeCompare(b.traceId);
+                return c !== 0 ? c : a.startMs - b.startMs;
+            });
+
+            const traces = [];
+            for (let i = 0; i < rawRecords.length; i++) {
+                const r = rawRecords[i];
+                const sampleMs = r.rate > 0 ? (1000.0 / r.rate) : 0;
+                const tolerance = Math.max(sampleMs * 1.5, 10); // 1.5 sample periods, min 10 ms
+
+                if (traces.length > 0) {
+                    const last = traces[traces.length - 1];
+                    const gap = r.startMs - last.endMs;
+                    if (last.traceId === r.traceId && gap <= tolerance) {
+                        // Merge contiguous and overlapping records into one trace segment.
+                        last.records++;
+                        last.samples += r.nsamp;
+                        if (r.endMs > last.endMs) last.endMs = r.endMs;
+                        if (r.startMs < last.startMs) last.startMs = r.startMs;
+                        last.durationSec = (last.endMs - last.startMs) / 1000.0;
+                        continue;
+                    }
+                }
+                // Gap or new channel — start a fresh trace segment
+                traces.push({
+                    traceId: r.traceId,
+                    channel: r.channel,
+                    records: 1,
+                    samples: r.nsamp,
+                    durationSec: r.durationSec,
+                    startMs: r.startMs,
+                    endMs: r.endMs,
+                    rate: r.rate
+                });
+            }
+
+            const channels = Array.from(channelSet.values()).sort();
+
+            return {
+                byteLength,
+                recordCount,
+                parsedRecords,
+                traces,
+                channels,
+                totalTraces: traces.length,
+                totalChannels: channels.length
+            };
+        }
+
+        function fmtDate(ms) {
+            return new Date(ms).toISOString();
+        }
+
+        function fmtDuration(sec) {
+            if (!isFinite(sec) || sec < 0) return 'n/a';
+            if (sec < 60) return sec.toFixed(2) + ' s';
+            const m = Math.floor(sec / 60);
+            const s = sec - (m * 60);
+            return m + ' min ' + s.toFixed(1) + ' s';
+        }
+
+        async function buildAdvancedInfoHtml(file) {
+            const response = await fetch('/mseedfile?file=' + encodeURIComponent(file.name));
+            if (!response.ok) {
+                throw new Error('File fetch failed (' + response.status + ')');
+            }
+            const arrayBuffer = await response.arrayBuffer();
+            const info = parseMiniSeedV2Info(arrayBuffer);
+
+            let html = "<div class='file-info'>";
+            html += "<h3>Parsed miniSEED Information</h3>";
+            html += "<div class='stats-grid'>";
+            html += "<div class='stats-card'><strong>Records (raw)</strong><br>" + info.recordCount + "</div>";
+            html += "<div class='stats-card'><strong>Records (parsed)</strong><br>" + info.parsedRecords + "</div>";
+            html += "<div class='stats-card'><strong>Number of Traces</strong><br>" + info.totalTraces + "</div>";
+            html += "<div class='stats-card'><strong>Number of Channels</strong><br>" + info.totalChannels + "</div>";
+            html += "</div>";
+
+            html += "<p><strong>Included Channels:</strong> <span class='mono'>" + (info.channels.length ? info.channels.join(', ') : 'none detected') + "</span></p>";
+
+            if (info.traces.length > 0) {
+                html += "<h4>Trace Durations</h4>";
+                html += "<table class='trace-table'>";
+                html += "<thead><tr><th>Trace ID</th><th>Channel</th><th>Records</th><th>Duration</th><th>Start (UTC)</th><th>End (UTC)</th><th>Rate (Hz)</th></tr></thead><tbody>";
+                for (let i = 0; i < info.traces.length; i++) {
+                    const t = info.traces[i];
+                    const rateText = t.rate > 0 ? t.rate.toFixed(2) : 'n/a';
+                    const durationFromSamples = (t.rate > 0 && t.samples > 0) ? (t.samples / t.rate) : 0;
+                    const displayDurationSec = Math.max(t.durationSec, durationFromSamples);
+                    const displayEndMs = t.startMs + (displayDurationSec * 1000.0);
+                    html += "<tr>";
+                    html += "<td class='mono'>" + t.traceId + "</td>";
+                    html += "<td>" + t.channel + "</td>";
+                    html += "<td>" + t.records + "</td>";
+                    html += "<td>" + fmtDuration(displayDurationSec) + "</td>";
+                    html += "<td class='mono'>" + fmtDate(t.startMs) + "</td>";
+                    html += "<td class='mono'>" + fmtDate(displayEndMs) + "</td>";
+                    html += "<td>" + rateText + "</td>";
+                    html += "</tr>";
+                }
+                html += "</tbody></table>";
+            } else {
+                html += "<p class='info'>No parseable miniSEED v2 records were detected in this file.</p>";
+            }
+
+            html += "</div>";
+            return html;
+        }
+
+        async function viewFile(index) {
             const file = files[index];
             const content = document.getElementById('content');
             const sizeKB = (file.size / 1024).toFixed(2);
@@ -196,7 +434,9 @@
             html += "<p><strong>Size:</strong> " + sizeKB + " KB (" + file.size + " bytes)</p>";
             html += "<p><strong>Path:</strong> /data/miniseed/" + file.name + "</p>";
             html += "<button class='btn btn-primary' id='downloadBtn' data-index='" + index + "' style='margin-top:10px;'>Download File</button>";
+            html += "<button class='btn btn-danger' id='deleteBtn' data-index='" + index + "' style='margin-top:10px;'>Delete Trace</button>";
             html += "</div>";
+            html += "<div class='loading' id='parseStatus'>Parsing miniSEED metadata...</div>";
             html += "<div class='info'>";
             html += "<h3>About MiniSEED Files</h3>";
             html += "<p>MiniSEED is a data format for seismic data storage and exchange. ";
@@ -213,11 +453,58 @@
             document.getElementById('downloadBtn').addEventListener('click', function () {
                 downloadFile(parseInt(this.dataset.index));
             });
+            document.getElementById('deleteBtn').addEventListener('click', function () {
+                deleteTraceFile(parseInt(this.dataset.index), true);
+            });
+
+            try {
+                const detailsHtml = await buildAdvancedInfoHtml(file);
+                const parseStatus = document.getElementById('parseStatus');
+                if (parseStatus) {
+                    parseStatus.outerHTML = detailsHtml;
+                }
+            } catch (error) {
+                const parseStatus = document.getElementById('parseStatus');
+                if (parseStatus) {
+                    parseStatus.outerHTML = "<div class='error'>Could not parse miniSEED metadata: " + error.message + "</div>";
+                }
+            }
         }
 
         function downloadFile(index) {
             const file = files[index];
             window.location.href = '/mseedfile?file=' + encodeURIComponent(file.name);
+        }
+
+        async function deleteTraceFile(index, returnToListAfterDelete = false) {
+            const file = files[index];
+            if (!file) {
+                showError('Selected file not found.');
+                return;
+            }
+
+            const ok = window.confirm('Delete trace file "' + file.name + '"? This cannot be undone.');
+            if (!ok) {
+                return;
+            }
+
+            try {
+                const response = await fetch('/deletemseed?file=' + encodeURIComponent(file.name));
+                const result = await response.json();
+
+                if (!result.success) {
+                    throw new Error(result.error || 'Delete failed');
+                }
+
+                files.splice(index, 1);
+                if (returnToListAfterDelete) {
+                    displayFileList();
+                } else {
+                    loadFileList();
+                }
+            } catch (error) {
+                showError('Failed to delete trace file: ' + error.message);
+            }
         }
 
         function showError(message) {

@@ -140,6 +140,28 @@
 #define ICM20948_ADDR 0x69          // I2C address with AD0 pin high
 
 // ============================================================================
+// AD5142A 10k Digital Potentiometer - I2C @ 400 kHz
+// used to adjust the AD620 amplifier offset of the x and y geophone vibration sensor signals
+// Note: AD5142A is not currently used in the design, but pin definitions are included for future expansion
+// ============================================================================
+#define AD5142A_I2C_PORT Wire
+#define AD5142A_I2C_BPS 400 * 1000 // 400 kHz I2C clock
+#define AD5142A_I2C_SDA 8          // GP8  - I/O: I2C Data (shared with ICM20948)
+#define AD5142A_I2C_SCL 9          // GP9  - Output: I2C Clock (with pull-up, shared with ICM20948
+#define AD5142A_ADDR 0x23          // I2C address for AD5142A (ADDR0 grounded /ADDR1 pin VLogic/VDD)
+
+// ============================================================================
+// TPL0102 100k Digital Potentiometer - I2C @ 400 kHz
+// used to adjust the AD620 amplifier gain of the x and y geophone vibration sensor signals
+// Note: TPL0102 is not currently used in the design, but pin definitions are included for future expansion
+// ============================================================================
+#define TPL0102_I2C_PORT Wire
+#define TPL0102_I2C_BPS 400 * 1000 // 400 kHz I2C clock
+#define TPL0102_I2C_SDA 8          // GP8  - I/O: I2C Data (shared with ICM20948)
+#define TPL0102_I2C_SCL 9          // GP9  - Output: I2C Clock (with pull-up, shared with ICM20948)
+#define TPL0102_ADDR 0x50          // I2C address for TPL0102 (A0-A2 pins grounded)
+
+// ============================================================================
 // Pin Summary by GPIO Number
 // ============================================================================
 /*

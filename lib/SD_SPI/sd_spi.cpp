@@ -1275,61 +1275,75 @@ static bool fat_write_fat_entry(const fs_info_t *fs_info, uint32_t cluster, uint
 {
     if (fs_info->type == 3) // FAT32
     {
-        // Each FAT32 entry is 4 bytes
+        // Each FAT32 entry is 4 bytes. Update all FAT copies to keep host readers in sync.
         uint32_t fat_offset = cluster * 4;
-        uint32_t fat_sector = fs_info->partition_offset + fs_info->reserved_sectors + (fat_offset / 512);
+        uint32_t fat_sector_offset = fat_offset / 512;
         uint16_t fat_offset_in_sector = fat_offset % 512;
 
-        if (!fat_cache_load_sector(fat_sector))
-            return false;
+        for (uint32_t fat_index = 0; fat_index < fs_info->fat_count; fat_index++)
+        {
+            uint32_t fat_sector = fs_info->partition_offset + fs_info->reserved_sectors +
+                                  (fat_index * fs_info->fat_sectors) + fat_sector_offset;
 
-        // Write the next cluster (preserve top 4 bits for status)
-        fat_cache_data[fat_offset_in_sector] = (uint8_t)(next_cluster & 0xFF);
-        fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 8) & 0xFF);
-        fat_cache_data[fat_offset_in_sector + 2] = (uint8_t)((next_cluster >> 16) & 0xFF);
-        fat_cache_data[fat_offset_in_sector + 3] = (uint8_t)((next_cluster >> 24) & 0x0F);
-        fat_cache_dirty = true;
+            if (!fat_cache_load_sector(fat_sector))
+                return false;
+
+            uint8_t preserved_status = fat_cache_data[fat_offset_in_sector + 3] & 0xF0;
+            fat_cache_data[fat_offset_in_sector] = (uint8_t)(next_cluster & 0xFF);
+            fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 8) & 0xFF);
+            fat_cache_data[fat_offset_in_sector + 2] = (uint8_t)((next_cluster >> 16) & 0xFF);
+            fat_cache_data[fat_offset_in_sector + 3] = preserved_status | (uint8_t)((next_cluster >> 24) & 0x0F);
+            fat_cache_dirty = true;
+        }
     }
     else if (fs_info->type == 2) // FAT16
     {
-        // Each FAT16 entry is 2 bytes
         uint32_t fat_offset = cluster * 2;
-        uint32_t fat_sector = fs_info->partition_offset + fs_info->reserved_sectors + (fat_offset / 512);
+        uint32_t fat_sector_offset = fat_offset / 512;
         uint16_t fat_offset_in_sector = fat_offset % 512;
 
-        if (!fat_cache_load_sector(fat_sector))
-            return false;
+        for (uint32_t fat_index = 0; fat_index < fs_info->fat_count; fat_index++)
+        {
+            uint32_t fat_sector = fs_info->partition_offset + fs_info->reserved_sectors +
+                                  (fat_index * fs_info->fat_sectors) + fat_sector_offset;
 
-        fat_cache_data[fat_offset_in_sector] = (uint8_t)(next_cluster & 0xFF);
-        fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 8) & 0xFF);
-        fat_cache_dirty = true;
+            if (!fat_cache_load_sector(fat_sector))
+                return false;
+
+            fat_cache_data[fat_offset_in_sector] = (uint8_t)(next_cluster & 0xFF);
+            fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 8) & 0xFF);
+            fat_cache_dirty = true;
+        }
     }
     else if (fs_info->type == 1) // FAT12
     {
-        // FAT12 entries are 12 bits - more complex
         uint32_t fat_offset = (cluster * 12) / 8;
-        uint32_t fat_sector = fs_info->partition_offset + fs_info->reserved_sectors + (fat_offset / 512);
+        uint32_t fat_sector_offset = fat_offset / 512;
         uint16_t fat_offset_in_sector = fat_offset % 512;
 
-        if (!fat_cache_load_sector(fat_sector))
-            return false;
-
-        if ((cluster & 1) == 0)
+        for (uint32_t fat_index = 0; fat_index < fs_info->fat_count; fat_index++)
         {
-            // Even cluster - entry is in lower 12 bits
-            fat_cache_data[fat_offset_in_sector] = (uint8_t)(next_cluster & 0xFF);
-            fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 8) & 0x0F) |
-                                                       (fat_cache_data[fat_offset_in_sector + 1] & 0xF0);
-        }
-        else
-        {
-            // Odd cluster - entry is in upper 12 bits
-            fat_cache_data[fat_offset_in_sector] = (uint8_t)((next_cluster << 4) & 0xF0) |
-                                                   (fat_cache_data[fat_offset_in_sector] & 0x0F);
-            fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 4) & 0xFF);
-        }
+            uint32_t fat_sector = fs_info->partition_offset + fs_info->reserved_sectors +
+                                  (fat_index * fs_info->fat_sectors) + fat_sector_offset;
 
-        fat_cache_dirty = true;
+            if (!fat_cache_load_sector(fat_sector))
+                return false;
+
+            if ((cluster & 1) == 0)
+            {
+                fat_cache_data[fat_offset_in_sector] = (uint8_t)(next_cluster & 0xFF);
+                fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 8) & 0x0F) |
+                                                           (fat_cache_data[fat_offset_in_sector + 1] & 0xF0);
+            }
+            else
+            {
+                fat_cache_data[fat_offset_in_sector] = (uint8_t)((next_cluster << 4) & 0xF0) |
+                                                       (fat_cache_data[fat_offset_in_sector] & 0x0F);
+                fat_cache_data[fat_offset_in_sector + 1] = (uint8_t)((next_cluster >> 4) & 0xFF);
+            }
+
+            fat_cache_dirty = true;
+        }
     }
 
     return true;
@@ -1393,12 +1407,13 @@ static uint32_t fat_read_fat_entry(const fs_info_t *fs_info, uint32_t cluster)
 // Helper: Find free cluster
 static uint32_t fat_find_free_cluster(const fs_info_t *fs_info)
 {
+    uint32_t max_cluster_number = fs_info->cluster_count + 2;
     uint32_t start_cluster = fat_next_free_cluster_hint;
-    if (start_cluster < 2 || start_cluster >= fs_info->cluster_count)
+    if (start_cluster < 2 || start_cluster >= max_cluster_number)
         start_cluster = 2;
 
     // Scan from hint to end.
-    for (uint32_t cluster = start_cluster; cluster < fs_info->cluster_count; cluster++)
+    for (uint32_t cluster = start_cluster; cluster < max_cluster_number; cluster++)
     {
         uint32_t fat_entry = fat_read_fat_entry(fs_info, cluster);
         if (fat_entry == 0) // Free cluster
@@ -2002,19 +2017,30 @@ int sd_spi_write_file(const fs_info_t *fs_info, const char *filepath, const uint
     }
 
     cluster_chain[0] = first_cluster;
+    if (!fat_write_fat_entry(fs_info, first_cluster, 0x0FFFFFF8))
+    {
+        free(cluster_chain);
+        return -1;
+    }
 
     uint32_t current_cluster = first_cluster;
     for (uint32_t i = 1; i < clusters_needed; i++)
     {
-        // Link to next cluster
         uint32_t next_cluster = fat_find_free_cluster(fs_info);
-        if (next_cluster == 0)
+        if (next_cluster == 0 || next_cluster == current_cluster)
         {
             free(cluster_chain);
             return -1;
         }
 
         cluster_chain[i] = next_cluster;
+
+        // Mark the new cluster allocated before the next free-cluster search.
+        if (!fat_write_fat_entry(fs_info, next_cluster, 0x0FFFFFF8))
+        {
+            free(cluster_chain);
+            return -1;
+        }
 
         if (!fat_write_fat_entry(fs_info, current_cluster, next_cluster))
         {
@@ -2024,14 +2050,6 @@ int sd_spi_write_file(const fs_info_t *fs_info, const char *filepath, const uint
 
         current_cluster = next_cluster;
     }
-
-    // Mark last cluster as end of chain
-    if (!fat_write_fat_entry(fs_info, current_cluster, 0x0FFFFFF8))
-    {
-        free(cluster_chain);
-        return -1;
-    }
-
     if (!fat_cache_flush())
     {
         free(cluster_chain);
@@ -2299,15 +2317,15 @@ int sd_spi_append_file_fast(const fs_info_t *fs_info, const char *filepath, cons
     for (uint32_t i = 0; i < additional_clusters && bytes_written < size; i++)
     {
         uint32_t new_cluster = fat_find_free_cluster(fs_info);
-        if (new_cluster == 0)
+        if (new_cluster == 0 || new_cluster == current_cluster)
             return -1; // No free space
+
+        // Mark the cluster allocated first so the allocator cannot hand it out again.
+        if (!fat_write_fat_entry(fs_info, new_cluster, 0x0FFFFFF8))
+            return -1;
 
         // Link previous cluster to new cluster
         if (!fat_write_fat_entry(fs_info, current_cluster, new_cluster))
-            return -1;
-
-        // Mark new cluster as end of chain (will be updated if more clusters follow)
-        if (!fat_write_fat_entry(fs_info, new_cluster, 0x0FFFFFF8))
             return -1;
 
         current_cluster = new_cluster;
@@ -2584,6 +2602,135 @@ int sd_spi_read_file_chunk(const fs_info_t *fs_info, const char *filepath, uint3
     }
 
     return (int)bytes_read;
+}
+
+// ============================================================================
+// OPTIMIZED FILE STREAMING API (for fast downloads)
+// ============================================================================
+
+bool sd_spi_read_multiple_blocks(uint32_t start_block, uint32_t block_count, uint8_t *buffer)
+{
+    if (!card_initialized || !buffer || block_count == 0)
+        return false;
+
+    // For efficiency, read blocks one at a time but could be optimized with CMD18
+    for (uint32_t i = 0; i < block_count; i++)
+    {
+        if (!sd_spi_read_block(start_block + i, buffer + (i * 512)))
+            return false;
+    }
+    return true;
+}
+
+bool sd_spi_open_file(const fs_info_t *fs_info, const char *filepath, file_handle_t *handle)
+{
+    if (!fs_info || !filepath || !handle)
+        return false;
+
+    const char *last_slash = strrchr(filepath, '/');
+    char parent_path[512];
+    const char *filename;
+
+    if (last_slash)
+    {
+        int parent_len = last_slash - filepath;
+        strncpy(parent_path, filepath, parent_len);
+        parent_path[parent_len] = 0;
+        filename = last_slash + 1;
+    }
+    else
+    {
+        parent_path[0] = 0;
+        filename = filepath;
+    }
+
+    uint32_t parent_cluster = (fs_info->type == 3) ? fs_info->root_dir_cluster : 0;
+    if (parent_path[0] && !fat_navigate_to_dir(fs_info, parent_path, &parent_cluster))
+        return false;
+
+    fat_dir_entry_t file_entry;
+    if (!fat_find_entry_in_dir(fs_info, parent_cluster, filename, &file_entry, NULL))
+        return false;
+
+    if (file_entry.attributes & FAT_ATTR_DIRECTORY)
+        return false;
+
+    // Initialize handle
+    handle->fs_info = fs_info;
+    handle->file_size = file_entry.file_size;
+    handle->current_cluster = fat_get_cluster(&file_entry, fs_info->type);
+    handle->bytes_per_cluster = fs_info->bytes_per_sector * fs_info->sectors_per_cluster;
+    handle->position = 0;
+    handle->is_open = true;
+
+    return true;
+}
+
+int sd_spi_read_from_handle(file_handle_t *handle, uint8_t *buffer, uint32_t size)
+{
+    if (!handle || !handle->is_open || !buffer || size == 0)
+        return -1;
+
+    if (handle->position >= handle->file_size)
+        return 0; // EOF
+
+    uint32_t bytes_remaining = handle->file_size - handle->position;
+    uint32_t bytes_to_read = (size < bytes_remaining) ? size : bytes_remaining;
+    uint32_t bytes_read = 0;
+
+    while (bytes_read < bytes_to_read && handle->current_cluster < 0x0FFFFFF0)
+    {
+        // Calculate position within current cluster
+        uint32_t cluster_position = handle->position % handle->bytes_per_cluster;
+        uint32_t bytes_left_in_cluster = handle->bytes_per_cluster - cluster_position;
+        uint32_t bytes_to_read_cluster = (bytes_to_read - bytes_read < bytes_left_in_cluster)
+                                             ? (bytes_to_read - bytes_read)
+                                             : bytes_left_in_cluster;
+
+        // Calculate sector within cluster
+        uint32_t sector_in_cluster = cluster_position / handle->fs_info->bytes_per_sector;
+        uint32_t byte_in_sector = cluster_position % handle->fs_info->bytes_per_sector;
+        uint32_t cluster_sector = fat_cluster_to_sector(handle->fs_info, handle->current_cluster);
+
+        // Read data sector by sector
+        while (bytes_to_read_cluster > 0 && sector_in_cluster < handle->fs_info->sectors_per_cluster)
+        {
+            uint8_t sector_buffer[512];
+            if (!sd_spi_read_block(cluster_sector + sector_in_cluster, sector_buffer))
+                return -1;
+
+            uint32_t bytes_available = handle->fs_info->bytes_per_sector - byte_in_sector;
+            uint32_t bytes_to_copy = (bytes_to_read_cluster < bytes_available)
+                                         ? bytes_to_read_cluster
+                                         : bytes_available;
+
+            memcpy(buffer + bytes_read, sector_buffer + byte_in_sector, bytes_to_copy);
+            bytes_read += bytes_to_copy;
+            bytes_to_read_cluster -= bytes_to_copy;
+            handle->position += bytes_to_copy;
+            byte_in_sector = 0; // Next reads start at beginning of sector
+            sector_in_cluster++;
+        }
+
+        // Advance to the next cluster whenever the current one has been fully consumed.
+        // This must also happen when the caller's requested read size ends exactly on a
+        // cluster boundary; otherwise the next read call starts over at the same cluster.
+        if (handle->position < handle->file_size &&
+            handle->position % handle->bytes_per_cluster == 0)
+        {
+            handle->current_cluster = fat_read_fat_entry(handle->fs_info, handle->current_cluster);
+        }
+    }
+
+    return (int)bytes_read;
+}
+
+void sd_spi_close_file(file_handle_t *handle)
+{
+    if (handle)
+    {
+        handle->is_open = false;
+    }
 }
 
 int sd_spi_read_directory(const fs_info_t *fs_info, dirent_t *entries, int max_entries)

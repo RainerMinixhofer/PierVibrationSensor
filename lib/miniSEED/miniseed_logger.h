@@ -107,6 +107,7 @@ private:
     char station_code[6];
     char network_code[3];
     char data_dir[64];
+    uint32_t record_sequence = 1;
 
     // Per-channel buffering for efficient multi-channel recording
     static const int MAX_CHANNELS = 8;
@@ -120,12 +121,15 @@ private:
         uint32_t sample_count;
         uint16_t sample_rate;
         double start_time_epoch;
+        uint64_t samples_emitted;
+        int64_t next_record_start_0001;
+        uint32_t record_sequence;
         char filename[128];
         int current_day; // Track day changes for daily file rollover
         bool active;
         double next_expected_time; // Expected next sample time in epoch seconds
 
-        ChannelBuffer() : sample_count(0), sample_rate(0), start_time_epoch(0.0), current_day(0), active(false), next_expected_time(0.0)
+        ChannelBuffer() : sample_count(0), sample_rate(0), start_time_epoch(0.0), samples_emitted(0), next_record_start_0001(0), record_sequence(1), current_day(0), active(false), next_expected_time(0.0)
         {
             channel_name[0] = '\0';
             filename[0] = '\0';
@@ -138,7 +142,7 @@ private:
     const char *mapChannelCode(const char *channel);
     int findChannelBuffer(const char *channel);
     int allocateChannelBuffer(const char *channel);
-    bool flushChannel(int channel_idx);
+    bool flushChannel(int channel_idx, uint32_t max_records_to_write = 0xFFFFFFFFu);
     bool writeRecordV2(const char *filename, const int32_t *samples, uint32_t sample_count,
                        const char *channel, uint16_t sample_rate, double timestamp_epoch);
     bool writeRecordV3(const char *filename, const int32_t *samples, uint32_t sample_count,

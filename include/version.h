@@ -1,8 +1,8 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define GIT_COMMIT_SHORT "b9662fa (dirty)"
-#define GIT_COMMIT_FULL "b9662fa2d7546c997a7b9eb48322b58f01f2d2ee"
-#define GIT_COMMIT_DATE "2026-03-08 11:34:24 +0100"
+#define GIT_COMMIT_SHORT "36b1ec1 (dirty)"
+#define GIT_COMMIT_FULL "36b1ec1560c9f2a9d40da809dc009d10a547bf9c"
+#define GIT_COMMIT_DATE "2026-03-14 00:48:12 +0100"
 
 #endif // VERSION_H

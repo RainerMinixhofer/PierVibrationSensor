@@ -113,7 +113,7 @@
 
     .udp-grid {
       display: grid;
-      grid-template-columns: repeat(2, max-content);
+      grid-template-columns: repeat(3, max-content);
       gap: 4px 8px;
       justify-content: start;
       margin-top: 6px;
@@ -127,6 +127,43 @@
 
     .udp-col .stream-btn {
       margin: 3px 0;
+    }
+
+    .button-grid-4 {
+      display: grid;
+      grid-template-columns: repeat(4, max-content);
+      gap: 4px 10px;
+      justify-content: start;
+      margin-top: 6px;
+    }
+
+    .button-col {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+
+    .button-col .stream-btn {
+      margin: 3px 0;
+    }
+
+    .compact-controls .stream-btn {
+      display: block;
+      margin: 3px 0;
+    }
+
+    .storage-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(220px, max-content));
+      gap: 0 16px;
+      align-items: start;
+      margin-top: 4px;
+    }
+
+    .storage-col {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
     }
 
     .accel-chart-wrap {
@@ -177,6 +214,11 @@
       .udp-grid {
         grid-template-columns: 1fr;
       }
+
+      .button-grid-4,
+      .storage-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -188,7 +230,7 @@
     &nbsp;|&nbsp;
     Network: <span id="nettype">unknown</span>
     &nbsp;|&nbsp;
-    Display Mode: <span id="current-mode">3</span>
+    Display Mode/Component: <span id="current-mode">3</span>
     &nbsp;|&nbsp;
     Charts: <span id="highcharts-status" style="color: #ff9800;">Loading...</span><br>
     Spectrogram Scale: <span id="spectrogram-scale">---</span><br>
@@ -207,20 +249,38 @@
         Show: SI Units
       </button>
       <div style="margin-top: 20px;">
-        <h3 style="margin: 5px 0;">Display Mode</h3>
-        <button id="mode-1" class="stream-btn disabled" onclick="setMode(-1)">-1: Off</button><br>
-        <button id="mode0" class="stream-btn disabled" onclick="setMode(0)">0: Text</button><br>
-        <button id="mode1" class="stream-btn disabled" onclick="setMode(1)">1: Waveform</button><br>
-        <button id="mode2" class="stream-btn disabled" onclick="setMode(2)">2: FFT</button><br>
-        <button id="mode3" class="stream-btn enabled" onclick="setMode(3)">3: Spectrogram</button>
-      </div>
-      <div style="margin-top: 20px;">
-        <h3 style="margin: 5px 0;">Display Velocity Component</h3>
-        <button id="axisX" class="stream-btn enabled" onclick="setAxis('X')">vx</button><br>
-        <button id="axisY" class="stream-btn disabled" onclick="setAxis('Y')">vy</button><br>
-        <button id="axisR" class="stream-btn disabled" onclick="setAxis('R')">vr</button>
+        <h3 style="margin: 5px 0;">Display Mode/Component</h3>
+        <div class="button-grid-4">
+          <div class="button-col">
+            <button id="mode-1" class="stream-btn disabled" onclick="setMode(-1)">-1: Off</button>
+            <button id="mode0" class="stream-btn disabled" onclick="setMode(0)">0: Text</button>
+            <button id="mode1" class="stream-btn disabled" onclick="setMode(1)">1: Waveform</button>
+            <button id="mode2" class="stream-btn disabled" onclick="setMode(2)">2: FFT</button>
+            <button id="mode3" class="stream-btn enabled" onclick="setMode(3)">3: Spectrogram</button>
+          </div>
+          <div class="button-col">
+            <button id="axisX" class="stream-btn enabled" onclick="setAxis('VX')">vx</button>
+            <button id="axisY" class="stream-btn disabled" onclick="setAxis('VY')">vy</button>
+            <button id="axisR" class="stream-btn disabled" onclick="setAxis('VR')">vr</button>
+          </div>
+          <div class="button-col">
+            <button id="axisAX" class="stream-btn disabled" onclick="setAxis('AX')">ax</button>
+            <button id="axisAY" class="stream-btn disabled" onclick="setAxis('AY')">ay</button>
+            <button id="axisAZ" class="stream-btn disabled" onclick="setAxis('AZ')">az</button>
+            <button id="axisAR" class="stream-btn disabled" onclick="setAxis('AR')">ar</button>
+          </div>
+          <div class="button-col">
+            <button id="axisBX" class="stream-btn disabled" onclick="setAxis('BX')">bx</button>
+            <button id="axisBY" class="stream-btn disabled" onclick="setAxis('BY')">by</button>
+            <button id="axisBZ" class="stream-btn disabled" onclick="setAxis('BZ')">bz</button>
+            <button id="axisBR" class="stream-btn disabled" onclick="setAxis('BR')">br</button>
+          </div>
+        </div>
         <div style="margin-top: 14px;">
           <h3 style="margin: 5px 0;">UDP Streams</h3>
+          <a id="udpStatusLink" href="/udpstatus" target="_blank" rel="noopener"
+            style="display: inline-block; margin: 2px 0 6px 0; color: #1e88e5; text-decoration: none;">Open UDP
+            Status</a>
           <div class="udp-grid">
             <div class="udp-col">
               <button id="velocXBtn" class="stream-btn disabled" onclick="toggleStream('velocX')">vx</button>
@@ -231,10 +291,15 @@
               <button id="accelYBtn" class="stream-btn disabled" onclick="toggleStream('accelY')">ay</button>
               <button id="accelZBtn" class="stream-btn disabled" onclick="toggleStream('accelZ')">az</button>
             </div>
+            <div class="udp-col">
+              <button id="magXBtn" class="stream-btn disabled" onclick="toggleStream('magX')">bx</button>
+              <button id="magYBtn" class="stream-btn disabled" onclick="toggleStream('magY')">by</button>
+              <button id="magZBtn" class="stream-btn disabled" onclick="toggleStream('magZ')">bz</button>
+            </div>
           </div>
         </div>
       </div>
-      <div style="margin-top: 20px;">
+      <div class="compact-controls" style="margin-top: 20px;">
         <h3 style="margin: 5px 0;">Touch Calibration</h3>
         <label for="calibPoints">Points:</label>
         <select id="calibPoints" style="margin-bottom: 5px;">
@@ -242,41 +307,46 @@
           <option value="9">9 Points</option>
           <option value="25">25 Points</option>
         </select><br>
-        <button class="stream-btn" onclick="startCalibration()">Calibrate Touch</button><br>
+        <button class="stream-btn" onclick="startCalibration()">Calibrate Touch</button>
         <button id="calibDataBtn" class="stream-btn" onclick="toggleCalibrationData()">Show Calibration Data</button>
       </div>
-      <div style="margin-top: 16px;">
+      <div class="compact-controls" style="margin-top: 16px;">
         <h3 style="margin: 5px 0;">Magnetometer Calibration</h3>
         <button id="magCalStartBtn" class="stream-btn" onclick="magCalAction('start')">Start Guided
-          Calibration</button><br>
+          Calibration</button>
         <button id="magCalCaptureBtn" class="stream-btn hidden" onclick="magCalAction('capture')">Capture Current
-          Pose</button><br>
-        <button id="magCalStatusBtn" class="stream-btn" onclick="magCalAction('status')">Refresh Status</button><br>
-        <button id="magCalCancelBtn" class="stream-btn hidden" onclick="magCalAction('cancel')">Cancel</button><br>
+          Pose</button>
+        <button id="magCalStatusBtn" class="stream-btn" onclick="magCalAction('status')">Refresh Status</button>
+        <button id="magCalCancelBtn" class="stream-btn hidden" onclick="magCalAction('cancel')">Cancel</button>
         <button id="magCalResetBtn" class="stream-btn" onclick="magCalAction('reset')">Reset Stored Calibration</button>
         <button id="magCalDataBtn" class="stream-btn" onclick="toggleMagCalibrationData()">Show Mag Calibration
           Data</button>
         <div id="magCalStatus" class="magcal-status">MagCal: idle</div>
       </div>
       <div style="margin-top: 20px;">
-        <h3 style="margin: 5px 0;">Data Recording</h3>
-        <button id="miniseedBtn" class="stream-btn disabled" onclick="toggleMiniSEED()">miniSEED: OFF</button><br>
-        <label for="miniseedFormat" style="display:block; margin-top:8px; color:#444;">Format:</label>
-        <select id="miniseedFormat" onchange="setMiniSEEDFormat()" style="margin-top:4px;">
-          <option value="v2" selected>miniSEED v2</option>
-          <option value="v3">miniSEED v3</option>
-        </select>
-        <small style="color: #666; display: block; margin-top: 5px;">Records to SD card in Raspberry Shake<br>compatible
-          miniSEED format</small>
-      </div>
-      <div style="margin-top: 15px;">
-        <h3 style="margin: 5px 0;">SD Card Management</h3>
-        <button id="unmountBtn" class="stream-btn" onclick="unmountSDCard()" style="background: #ff9800;">Unmount SD
-          Card</button><br>
-        <button id="viewMseedBtn" class="stream-btn" onclick="openMseedViewer()"
-          style="background: #2196F3; margin-top: 8px;">View MiniSEED Files</button><br>
-        <small style="color: #666; display: block; margin-top: 5px;">Safely unmount SD card before removal<br>(flushes
-          buffers, closes files)</small>
+        <h3 style="margin: 5px 0;">Storage</h3>
+        <div class="storage-grid">
+          <div class="storage-col">
+            <button id="miniseedBtn" class="stream-btn disabled" onclick="toggleMiniSEED()">miniSEED: OFF</button>
+            <label for="miniseedFormat" style="display:block; margin-top:8px; color:#444;">Format:</label>
+            <select id="miniseedFormat" onchange="setMiniSEEDFormat()" style="margin-top:4px;">
+              <option value="v2" selected>miniSEED v2</option>
+              <option value="v3">miniSEED v3</option>
+            </select>
+            <small style="color: #666; display: block; margin-top: 5px;">Records to SD card in Raspberry
+              Shake<br>compatible
+              miniSEED format</small>
+          </div>
+          <div class="storage-col compact-controls">
+            <button id="unmountBtn" class="stream-btn" onclick="unmountSDCard()" style="background: #ff9800;">Unmount SD
+              Card</button>
+            <button id="viewMseedBtn" class="stream-btn" onclick="openMseedViewer()" style="background: #2196F3;">View
+              MiniSEED Files</button>
+            <small style="color: #666; display: block; margin-top: 5px;">Safely unmount SD card before
+              removal<br>(flushes
+              buffers, closes files)</small>
+          </div>
+        </div>
       </div>
       <div id="calibDataDisplay" style="margin-top: 10px; display: none; max-width: 400px;">
         <h4 style="margin: 5px 0;">Calibration Data:</h4>
@@ -384,7 +454,10 @@
       velocY: false,
       accelX: false,
       accelY: false,
-      accelZ: false
+      accelZ: false,
+      magX: false,
+      magY: false,
+      magZ: false
     };
 
     const udpStreamLabels = {
@@ -392,7 +465,10 @@
       velocY: 'vy',
       accelX: 'ax',
       accelY: 'ay',
-      accelZ: 'az'
+      accelZ: 'az',
+      magX: 'bx',
+      magY: 'by',
+      magZ: 'bz'
     };
 
     let miniSeedRecording = false;
@@ -895,6 +971,15 @@
       if (d.udpAccelZ !== undefined) {
         setUdpStreamButtonState('accelZ', d.udpAccelZ);
       }
+      if (d.udpMagX !== undefined) {
+        setUdpStreamButtonState('magX', d.udpMagX);
+      }
+      if (d.udpMagY !== undefined) {
+        setUdpStreamButtonState('magY', d.udpMagY);
+      }
+      if (d.udpMagZ !== undefined) {
+        setUdpStreamButtonState('magZ', d.udpMagZ);
+      }
     }
 
     function toggleStream(channel) {
@@ -1013,8 +1098,8 @@
         .then(response => response.text())
         .then(result => {
           console.log('Axis set result:', result);
-          // Try to extract axis from backend response, fallback to requested axis
-          let match = result.match(/axis=([A-Z])/i);
+          // Try to extract axis from backend response (supports one- or two-letter axis tokens).
+          let match = result.match(/axis=([A-Za-z]+)/i);
           let axisFromBackend = match ? match[1].toUpperCase() : axis;
           updateAxisButtons(axisFromBackend);
         })
@@ -1024,9 +1109,27 @@
     }
 
     function updateAxisButtons(currentAxis) {
-      document.getElementById('axisX').className = currentAxis === 'X' ? 'stream-btn enabled' : 'stream-btn disabled';
-      document.getElementById('axisY').className = currentAxis === 'Y' ? 'stream-btn enabled' : 'stream-btn disabled';
-      document.getElementById('axisR').className = currentAxis === 'R' ? 'stream-btn enabled' : 'stream-btn disabled';
+      const normalizedAxis = String(currentAxis || '').trim().toUpperCase();
+      const axisButtons = {
+        VX: 'axisX',
+        VY: 'axisY',
+        VR: 'axisR',
+        AX: 'axisAX',
+        AY: 'axisAY',
+        AZ: 'axisAZ',
+        AR: 'axisAR',
+        BX: 'axisBX',
+        BY: 'axisBY',
+        BZ: 'axisBZ',
+        BR: 'axisBR'
+      };
+
+      Object.entries(axisButtons).forEach(([axisCode, buttonId]) => {
+        const buttonEl = document.getElementById(buttonId);
+        if (buttonEl) {
+          buttonEl.className = normalizedAxis === axisCode ? 'stream-btn enabled' : 'stream-btn disabled';
+        }
+      });
     }
 
     function startCalibration() {
@@ -1344,6 +1447,10 @@
     }
 
     drawOrientationInset(orientationState);
+    const udpStatusLinkEl = document.getElementById('udpStatusLink');
+    if (udpStatusLinkEl && window.location && window.location.host) {
+      udpStatusLinkEl.href = 'http://' + window.location.host + '/udpstatus';
+    }
     magCalAction('status');
     scheduleNextFetch();
   </script>

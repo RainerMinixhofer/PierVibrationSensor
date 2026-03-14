@@ -110,6 +110,11 @@ uint8_t gainPotWiperCache[2] = {0, 0};
 #define RINGBUFFER_ACCELX_RAW 3
 #define RINGBUFFER_ACCELY_RAW 4
 #define RINGBUFFER_ACCELZ_RAW 5
+#define RINGBUFFER_ACCELR_RAW 6
+#define RINGBUFFER_MAGX_RAW 7
+#define RINGBUFFER_MAGY_RAW 8
+#define RINGBUFFER_MAGZ_RAW 9
+#define RINGBUFFER_MAGR_RAW 10
 
 // Constants for TFT display with TFT_eSPI
 #define TFT_TEXT_SIZE 1             // Set the default text size for the display
@@ -458,8 +463,8 @@ static void startMagCalibrationSession()
 // --- Touch Event Handling ---
 static volatile bool forceTouchCalibration = FORCETOUCHCALIBRATION; // Set to true if force touch calibration should be enforced at startup ignoring any calibration file data
 static volatile bool touch_event_flag = false;
-static volatile int irq_save = 0;             // Save the IRQ state for touch events
 static volatile uint32_t touch_irq_count = 0; // Debug: number of touch IRQ triggers
+static const bool use_touch_irq_callback = false;
 // Note: TFT_eSPI uses getTouch(&x, &y) instead of TS_Point structure
 
 // --- Sensor Data and Flags ---
@@ -475,9 +480,9 @@ sensors_event_t magData;                   // mag structure to hold latest magne
 sensors_event_t tempData;                  // temp structure to hold latest temperature data
 
 // --- UDP Streaming Control ---
-volatile bool udpStreamEnable[5] = {false, false, false, false, false};
-volatile uint32_t udpPacketsSent[5] = {0, 0, 0, 0, 0};
-volatile uint32_t udpPacketsDropped[5] = {0, 0, 0, 0, 0};
+volatile bool udpStreamEnable[8] = {false, false, false, false, false, false, false, false};
+volatile uint32_t udpPacketsSent[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+volatile uint32_t udpPacketsDropped[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 // --- miniSEED Recording Control (Raspberry Shake compatible data format) ---
 MinISeedLogger miniSeedLogger;                  ///< miniSEED logger for Raspberry Shake compatible data storage
@@ -500,21 +505,156 @@ static void stopMiniSeedRecording(const char *reason)
 }
 
 // --- Display Mode and State ---
-volatile int mode = 3;         // -1 = off 0 = text 1 = waveform, 2 = fft, 3 = sgram
-volatile int display_axis = 0; // 0 = X axis, 1 = Y axis, 2 = radial velocity
+volatile int mode = 3;                             // -1 = off 0 = text 1 = waveform, 2 = fft, 3 = sgram
+volatile int display_axis = RINGBUFFER_VELOCX_RAW; // Selected TFT source: VX/VY/VR/AX/AY/AZ/AR/BX/BY/BZ/BR
 // --- Radial velocity calculation ---
 float velocR = 0.0; // Latest radial velocity value in m/s
 bool mode_initialized = false;
+
+static const char *displayAxisCode(int axis)
+{
+  switch (axis)
+  {
+  case RINGBUFFER_VELOCX_RAW:
+    return "VX";
+  case RINGBUFFER_VELOCY_RAW:
+    return "VY";
+  case RINGBUFFER_VELOCR_RAW:
+    return "VR";
+  case RINGBUFFER_ACCELX_RAW:
+    return "AX";
+  case RINGBUFFER_ACCELY_RAW:
+    return "AY";
+  case RINGBUFFER_ACCELZ_RAW:
+    return "AZ";
+  case RINGBUFFER_ACCELR_RAW:
+    return "AR";
+  case RINGBUFFER_MAGX_RAW:
+    return "BX";
+  case RINGBUFFER_MAGY_RAW:
+    return "BY";
+  case RINGBUFFER_MAGZ_RAW:
+    return "BZ";
+  case RINGBUFFER_MAGR_RAW:
+    return "BR";
+  default:
+    return "VX";
+  }
+}
+
+static bool isRadialDisplayAxis(int axis)
+{
+  return axis == RINGBUFFER_VELOCR_RAW || axis == RINGBUFFER_ACCELR_RAW || axis == RINGBUFFER_MAGR_RAW;
+}
+
+static bool isMagDisplayAxis(int axis)
+{
+  return axis == RINGBUFFER_MAGX_RAW || axis == RINGBUFFER_MAGY_RAW || axis == RINGBUFFER_MAGZ_RAW || axis == RINGBUFFER_MAGR_RAW;
+}
 
 // --- Highcharts Status Tracking ---
 volatile bool highchartsWorking = false; // Track if Highcharts loaded successfully
 unsigned long highchartsLastReport = 0;  // Timestamp of last Highcharts status report
 
 // --- Menu State ---
-const int NUM_MENU_BUTTONS = 5;
 bool menu_visible = false;
 int saved_scroll_offset = 0;     // Remember current scroll offset while menu is shown
 bool text_block_refresh = false; // Request to clear and overwrite text output block
+
+enum TouchMenuScreen
+{
+  TOUCH_MENU_NONE = 0,
+  TOUCH_MENU_MAIN,
+  TOUCH_MENU_DISPLAY_MODE,
+  TOUCH_MENU_UDP_STREAMS,
+  TOUCH_MENU_CALIBRATION,
+  TOUCH_MENU_CALIB_TOUCH,
+  TOUCH_MENU_CALIB_MAG,
+  TOUCH_MENU_STORAGE,
+  TOUCH_MENU_SETTINGS,
+  TOUCH_MENU_COMPONENTS,
+  TOUCH_MENU_FILE_LIST
+};
+
+enum TouchMenuAction
+{
+  MENU_ACTION_NONE = 0,
+  MENU_ACTION_CLOSE,
+  MENU_ACTION_OPEN_MAIN,
+  MENU_ACTION_OPEN_DISPLAY_MODE,
+  MENU_ACTION_OPEN_UDP_STREAMS,
+  MENU_ACTION_OPEN_CALIBRATION,
+  MENU_ACTION_OPEN_STORAGE,
+  MENU_ACTION_OPEN_SETTINGS,
+  MENU_ACTION_OPEN_COMPONENTS,
+  MENU_ACTION_MODE_OFF,
+  MENU_ACTION_MODE_TEXT,
+  MENU_ACTION_MODE_WAVE,
+  MENU_ACTION_MODE_FFT,
+  MENU_ACTION_MODE_SGRAM,
+  MENU_ACTION_UDP_VX,
+  MENU_ACTION_UDP_VY,
+  MENU_ACTION_UDP_AX,
+  MENU_ACTION_UDP_AY,
+  MENU_ACTION_UDP_AZ,
+  MENU_ACTION_UDP_BX,
+  MENU_ACTION_UDP_BY,
+  MENU_ACTION_UDP_BZ,
+  MENU_ACTION_CAL_TOUCH_MENU,
+  MENU_ACTION_CAL_MAG_MENU,
+  MENU_ACTION_CAL_TOUCH_5,
+  MENU_ACTION_CAL_TOUCH_9,
+  MENU_ACTION_MAG_START,
+  MENU_ACTION_MAG_CAPTURE,
+  MENU_ACTION_MAG_CANCEL,
+  MENU_ACTION_MAG_RESET,
+  MENU_ACTION_MAG_STATUS,
+  MENU_ACTION_STORAGE_MINISEED,
+  MENU_ACTION_STORAGE_FORMAT,
+  MENU_ACTION_STORAGE_UNMOUNT,
+  MENU_ACTION_STORAGE_VIEW,
+  MENU_ACTION_FILE_PAGE_PREV,
+  MENU_ACTION_FILE_PAGE_NEXT,
+  MENU_ACTION_LOG_DOWN,
+  MENU_ACTION_LOG_UP,
+  MENU_ACTION_UNITS_TOGGLE,
+  MENU_ACTION_AXIS_VX,
+  MENU_ACTION_AXIS_VY,
+  MENU_ACTION_AXIS_VR,
+  MENU_ACTION_AXIS_AX,
+  MENU_ACTION_AXIS_AY,
+  MENU_ACTION_AXIS_AZ,
+  MENU_ACTION_AXIS_AR,
+  MENU_ACTION_AXIS_BX,
+  MENU_ACTION_AXIS_BY,
+  MENU_ACTION_AXIS_BZ,
+  MENU_ACTION_AXIS_BR
+};
+
+struct TouchMenuButton
+{
+  int x;
+  int y;
+  int w;
+  int h;
+  TouchMenuAction action;
+  const char *label;
+  uint16_t color;
+};
+
+static TouchMenuScreen active_touch_menu = TOUCH_MENU_NONE;
+static TouchMenuButton touch_menu_buttons[24];
+static int touch_menu_button_count = 0;
+static bool tft_use_si_units = true;
+static char touch_menu_status[96] = "";
+
+// File list popup state
+static dirent_t file_list_entries[64];
+static int file_list_count = 0;
+static int file_list_page = 0;
+
+unsigned long menu_show_time = 0;
+const unsigned long MENU_TIMEOUT_MS = 5000; // Menu auto-hides after 5 seconds without touch
 
 // --- Sample Tracking ---
 int total_samples = 0;
@@ -528,6 +668,7 @@ const int waveform_w = 320;
 const int waveform_y = 0;
 const int waveform_h = 240;
 const int waveform_mid_y = waveform_y + waveform_h / 2;
+const int fft_axis_y = 228;
 const int LAST_POINTS_SIZE = 1024;
 short last_points[LAST_POINTS_SIZE];
 
@@ -567,33 +708,6 @@ const int FFT_SIZE = 1024;
 // --- Magnitude Spectrum ---
 const int mag_spec_len = 512;
 
-// --- Menu Button Definition ---
-struct MenuButton
-{
-  int x;
-  int y;
-  int w;
-  int h;
-  const char *label;
-  int mode_value;
-  uint16_t color;
-};
-
-/* Define menu buttons for mode selection
- *
- * Each button has position (x, y), size (w, h), label text, associated mode value,
- * and a color for visual distinction.
- */
-MenuButton menu_buttons[NUM_MENU_BUTTONS] = {
-    {10, 30, 60, 32, "OFF", -1, TFT_RED},
-    {10, 66, 60, 32, "TEXT", 0, TFT_BLUE},
-    {10, 102, 60, 32, "WAVE", 1, TFT_GREEN},
-    {10, 138, 60, 32, "FFT", 2, TFT_CYAN},
-    {10, 174, 60, 32, "SGRAM", 3, TFT_MAGENTA}};
-
-unsigned long menu_show_time = 0;
-const unsigned long MENU_TIMEOUT_MS = 15000; // Menu auto-hides after 15 seconds
-
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
@@ -624,7 +738,6 @@ void touch_irq_isr(uint gpio, uint32_t events)
   (void)gpio;
   (void)events;
   // Set a volatile flag for main loop processing
-  gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false); // disable IRQ to prevent triggering during processing
   // For hardware SPI, just set the flag - don't read in IRQ context
   // Reading will be done in main loop after flag is detected
   touch_event_flag = true;
@@ -844,6 +957,31 @@ void releaseSPIBus()
 #if defined(WIZNET_SPI_CS) && WIZNET_SPI_CS != -1
   digitalWrite(WIZNET_SPI_CS, HIGH);
 #endif
+}
+
+/**
+ * @brief Restore network-facing SPI state after touch controller transactions.
+ *
+ * Touch reads can leave SPI mode/CS in a state that prevents WIZNET socket
+ * accept operations from seeing new clients on the next loop iteration.
+ */
+void restoreNetworkSPIAfterTouch()
+{
+  releaseSPIBus();
+
+  if (netMode == NET_WIZNET)
+  {
+    // Touch/TFT access can leave SPI0 pin mux/config in TFT state.
+    // Restore full Wiznet SPI pin routing and transaction settings.
+    SPI.end();
+    SPI.setSCK(WIZNET_SCLK);
+    SPI.setTX(WIZNET_MOSI);
+    SPI.setRX(WIZNET_MISO);
+    SPI.begin();
+    SPI.beginTransaction(SPISettings(WIZNET_SPI_BPS, MSBFIRST, SPI_MODE0));
+    SPI.endTransaction();
+    Ethernet.init(WIZNET_SPI_CS);
+  }
 }
 
 /**
@@ -1226,7 +1364,7 @@ void drawMenuIndicator(int scroll_offset)
   int y_base = 0;
 
   int w = tft.width();
-  int h = tft.height();
+  (void)tft.height();
 
   // Clear background with a slightly larger area to remove old border pixels from scrolling
   tft.fillRect(x_base - 1, y_base, 18, 16, TFT_BLACK);
@@ -1237,6 +1375,31 @@ void drawMenuIndicator(int scroll_offset)
   tft.fillRect(x_base + 3, y_base + 12, 10, 2, TFT_WHITE);
   // Add a small border
   tft.drawRect(x_base, y_base, 16, 16, COLOR_GREY);
+
+  // Show selected TFT component source in a compact badge (modes 1..3).
+  if (mode != 0)
+  {
+    const int badge_w = 20;
+    const int badge_h = 16;
+    int badge_x = scroll_offset % w;
+    if (badge_x < 0)
+      badge_x += w;
+    int badge_y = tft.height() - badge_h - 2;
+
+    if (mode != 3)
+    {
+      tft.fillRect(badge_x - 1, badge_y, badge_w + 2, badge_h, TFT_BLACK);
+      tft.drawRect(badge_x, badge_y, badge_w, badge_h, COLOR_GREY);
+    }
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    const char *badgeText = displayAxisCode(display_axis);
+    int textLen = strlen(badgeText);
+    int textWidth = textLen * 6;
+    int textX = badge_x + (mode == 3 ? 2 : (badge_w - textWidth) / 2);
+    tft.setCursor(textX, badge_y + 4);
+    tft.print(badgeText);
+  }
 }
 
 /**
@@ -1402,6 +1565,15 @@ void scrollDisplay(int offset)
     scroll_x_start = SCROLL_TOP_FIXED_AREA;
 
   scrollAddress(scroll_x_start);
+}
+
+void resetHardwareScrollState()
+{
+  // Keep reset lightweight during runtime transitions; full setup is done during TFT init.
+  scroll_x_start = SCROLL_TOP_FIXED_AREA;
+  scrollAddress(scroll_x_start);
+  disp_column = SCROLL_TOP_FIXED_AREA;
+  saved_scroll_offset = SCROLL_TOP_FIXED_AREA;
 }
 
 // ============================================================================
@@ -2660,7 +2832,6 @@ void calibrateTouchController()
   // Post-calibration cleanup: clear stale touch IRQ events and restore a known
   // display/network-safe runtime state before returning to the main loop.
   touch_event_flag = false;
-  gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true);
   menu_visible = false;
   saved_scroll_offset = 0;
   disp_column = SCROLL_TOP_FIXED_AREA;
@@ -3805,9 +3976,7 @@ void serveSensorData(Stream &client)
   client.print(",\"mode\":");
   client.print(mode);
   client.print(",\"axis\":\"");
-  char axisChar = (display_axis == 0) ? 'X' : (display_axis == 1) ? 'Y'
-                                                                  : 'R';
-  client.print(axisChar);
+  client.print(displayAxisCode(display_axis));
   client.print("\"");
   client.print(",\"spectrogramMin\":");
   client.print(spectrogram_min);
@@ -3852,6 +4021,12 @@ void serveSensorData(Stream &client)
   client.print(udpStreamEnable[3] ? "true" : "false");
   client.print(",\"udpAccelZ\":");
   client.print(udpStreamEnable[4] ? "true" : "false");
+  client.print(",\"udpMagX\":");
+  client.print(udpStreamEnable[5] ? "true" : "false");
+  client.print(",\"udpMagY\":");
+  client.print(udpStreamEnable[6] ? "true" : "false");
+  client.print(",\"udpMagZ\":");
+  client.print(udpStreamEnable[7] ? "true" : "false");
   client.println("}");
   client.flush();
 }
@@ -4036,6 +4211,12 @@ void serveUDPStreamControl(Stream &client, const String &req)
     chIdx = 3;
   else if (req.indexOf("accelZ") != -1)
     chIdx = 4;
+  else if (req.indexOf("magX") != -1)
+    chIdx = 5;
+  else if (req.indexOf("magY") != -1)
+    chIdx = 6;
+  else if (req.indexOf("magZ") != -1)
+    chIdx = 7;
 
   int enableIdx = req.indexOf("enable=");
   bool enable = false;
@@ -4126,6 +4307,24 @@ void serveUDPStatus(Stream &client)
   client.print((unsigned long)udpPacketsSent[4]);
   client.print(",\"dropped\":");
   client.print((unsigned long)udpPacketsDropped[4]);
+  client.print("},\"magX\":{\"enabled\":");
+  client.print(udpStreamEnable[5] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[5]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[5]);
+  client.print("},\"magY\":{\"enabled\":");
+  client.print(udpStreamEnable[6] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[6]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[6]);
+  client.print("},\"magZ\":{\"enabled\":");
+  client.print(udpStreamEnable[7] ? "true" : "false");
+  client.print(",\"sent\":");
+  client.print((unsigned long)udpPacketsSent[7]);
+  client.print(",\"dropped\":");
+  client.print((unsigned long)udpPacketsDropped[7]);
   client.print("}}");
   client.println("}");
   client.flush();
@@ -4133,7 +4332,7 @@ void serveUDPStatus(Stream &client)
 
 void serveModeControl(Stream &client, const String &req)
 {
-  // Parse mode parameter from request: /setmode?mode=X
+  // Parse mode parameter from request: /setmode?mode=VX
   int modeIdx = req.indexOf("mode=");
   if (modeIdx != -1)
   {
@@ -4168,32 +4367,84 @@ void serveModeControl(Stream &client, const String &req)
 
 void serveAxisControl(Stream &client, const String &req)
 {
-  // Parse axis parameter from request: /setaxis?axis=X or /setaxis?axis=Y
+  // Parse axis parameter from request: /setaxis?axis=VX, AX, BX, etc.
   int axisIdx = req.indexOf("axis=");
   if (axisIdx != -1)
   {
-    String axisStr = req.substring(axisIdx + 5, axisIdx + 6); // Get single character
+    String axisStr = req.substring(axisIdx + 5);
+    int endAmp = axisStr.indexOf('&');
+    if (endAmp != -1)
+      axisStr = axisStr.substring(0, endAmp);
+    int endSpace = axisStr.indexOf(' ');
+    if (endSpace != -1)
+      axisStr = axisStr.substring(0, endSpace);
     axisStr.toUpperCase();
 
-    if (axisStr == "X")
+    if (axisStr == "VX")
     {
-      display_axis = 0;
-      // Reset display flags to force re-initialization with new axis data
+      display_axis = RINGBUFFER_VELOCX_RAW;
       mode_initialized = false;
-      debugPrintln("Display axis changed to X");
+      debugPrintln("Display axis changed to VX");
     }
-    else if (axisStr == "Y")
+    else if (axisStr == "VY")
     {
-      display_axis = 1;
-      // Reset display flags to force re-initialization with new axis data
+      display_axis = RINGBUFFER_VELOCY_RAW;
       mode_initialized = false;
-      debugPrintln("Display axis changed to Y");
+      debugPrintln("Display axis changed to VY");
     }
-    else if (axisStr == "R")
+    else if (axisStr == "VR")
     {
-      display_axis = 2;
+      display_axis = RINGBUFFER_VELOCR_RAW;
       mode_initialized = false;
-      debugPrintln("Display axis changed to R (radial)");
+      debugPrintln("Display axis changed to VR (radial)");
+    }
+    else if (axisStr == "AX")
+    {
+      display_axis = RINGBUFFER_ACCELX_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to AX");
+    }
+    else if (axisStr == "AY")
+    {
+      display_axis = RINGBUFFER_ACCELY_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to AY");
+    }
+    else if (axisStr == "AZ")
+    {
+      display_axis = RINGBUFFER_ACCELZ_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to AZ");
+    }
+    else if (axisStr == "AR")
+    {
+      display_axis = RINGBUFFER_ACCELR_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to AR");
+    }
+    else if (axisStr == "BX")
+    {
+      display_axis = RINGBUFFER_MAGX_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to BX");
+    }
+    else if (axisStr == "BY")
+    {
+      display_axis = RINGBUFFER_MAGY_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to BY");
+    }
+    else if (axisStr == "BZ")
+    {
+      display_axis = RINGBUFFER_MAGZ_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to BZ");
+    }
+    else if (axisStr == "BR")
+    {
+      display_axis = RINGBUFFER_MAGR_RAW;
+      mode_initialized = false;
+      debugPrintln("Display axis changed to BR");
     }
   }
 
@@ -4201,9 +4452,7 @@ void serveAxisControl(Stream &client, const String &req)
   client.println("Content-Type: text/plain");
   client.println("Connection: close");
   client.println();
-  char axisChar = (display_axis == 0) ? 'X' : (display_axis == 1) ? 'Y'
-                                                                  : 'R';
-  client.printf("OK axis=%c\n", axisChar);
+  client.printf("OK axis=%s\n", displayAxisCode(display_axis));
 }
 
 void serveGainPotControl(Stream &client, const String &req)
@@ -4674,12 +4923,11 @@ void draw_fft_frequency_axis()
   // Display width: 320 pixels (showing FFT_SIZE/2 = 512 bins)
   // But waveform displays in compressed form, need to check actual display
 
-  const int axis_y = 228;                       // Position to leave room for labels (text height = 8 pixels)
   const float sample_rate = 500.0;              // SPS
   const float nyquist_freq = sample_rate / 2.0; // 250 Hz
 
   // Draw axis line
-  tft.drawLine(0, axis_y, 320, axis_y, TFT_WHITE);
+  tft.drawLine(0, fft_axis_y, 320, fft_axis_y, TFT_WHITE);
 
   // Draw frequency labels: 0, 50, 100, 150, 200, 250 Hz
   tft.setTextSize(1);
@@ -4689,7 +4937,7 @@ void draw_fft_frequency_axis()
   {
     int x_pos = (int)(freq / nyquist_freq * 320);
     // Draw tick mark
-    tft.drawLine(x_pos, axis_y, x_pos, axis_y - 3, TFT_WHITE);
+    tft.drawLine(x_pos, fft_axis_y, x_pos, fft_axis_y - 3, TFT_WHITE);
     // Draw label (positioned above the axis line to stay on screen)
     // Adjust label position based on number of digits and keep rightmost label on screen
     int label_offset;
@@ -4702,12 +4950,12 @@ void draw_fft_frequency_axis()
     else
       label_offset = 9; // Center 3-digit numbers
 
-    tft.setCursor(x_pos - label_offset, axis_y - 10);
+    tft.setCursor(x_pos - label_offset, fft_axis_y - 10);
     tft.print(freq);
   }
 
   // Label the axis
-  tft.setCursor(280, axis_y - 10);
+  tft.setCursor(280, fft_axis_y - 10);
   tft.print("Hz");
 }
 
@@ -4715,15 +4963,23 @@ void waveform_display(short *samples, int n_samples, int color, bool draw_trigge
 {
   // Draw exactly n_samples points (should match screen width)
   int last_x = waveform_x;
-  int last_y = waveform_mid_y;
+  const bool is_fft_plot = (mode == 2 && !draw_triggers);
+  const int baseline_y = is_fft_plot ? fft_axis_y : waveform_mid_y;
+  int last_y = baseline_y;
   int last_old_y = last_y;
 
-  // Calculate scale factor so CROSSING_THRESHOLD is at 1/8 from top/bottom
-  // For vr (radial), the max value is always positive and can be much higher, so use a different scale
+  // Calculate scale factor.
+  // Magnetic channels use dedicated Earth-field scaling, others keep threshold-based scaling.
   float scale;
-  if (display_axis == 2)
+  if (isMagDisplayAxis(display_axis))
   {
-    // Estimate max expected vr (e.g., sqrt(2) * threshold for two maxed channels)
+    // Samples are in 0.1 uT. Use +/-50 uT full-scale to boost visual amplitude by 2x.
+    const float mag_full_scale_tenth_uT = 500.0f;
+    scale = (3.0f * waveform_h / 8.0f) / mag_full_scale_tenth_uT;
+  }
+  else if (isRadialDisplayAxis(display_axis))
+  {
+    // Estimate max expected radial value (e.g., sqrt(2) * threshold for two maxed channels)
     scale = (3.0f * waveform_h / 8.0f) / (CROSSING_THRESHOLD * 1.5f);
   }
   else
@@ -4731,20 +4987,25 @@ void waveform_display(short *samples, int n_samples, int color, bool draw_trigge
     scale = (3.0f * waveform_h / 8.0f) / CROSSING_THRESHOLD;
   }
 
+  if (is_fft_plot && !isMagDisplayAxis(display_axis))
+  {
+    scale *= 2.0f;
+  }
+
   // Calculate trigger level positions for redrawing
   int trigger_offset = 3 * waveform_h / 8;
-  int upper_trigger_y = waveform_mid_y - trigger_offset;
-  int lower_trigger_y = waveform_mid_y + trigger_offset;
+  int upper_trigger_y = baseline_y - trigger_offset;
+  int lower_trigger_y = baseline_y + trigger_offset;
 
   for (int i = 0; i < n_samples; ++i)
   {
     int x_val = waveform_x + i;
     // Scale samples so trigger levels appear at 1/8 from edges
-    int y_val = waveform_mid_y - (int)(samples[i] * scale);
+    int y_val = baseline_y - (int)(samples[i] * scale);
     int old_y_val = last_points[i];
 
     // Choose color: red if outside threshold, otherwise use specified color
-    bool outside_threshold = (samples[i] > CROSSING_THRESHOLD) || (samples[i] < -CROSSING_THRESHOLD);
+    bool outside_threshold = !is_fft_plot && ((samples[i] > CROSSING_THRESHOLD) || (samples[i] < -CROSSING_THRESHOLD));
     int line_color = outside_threshold ? TFT_RED : color;
 
     if (i > 0)
@@ -5007,102 +5268,622 @@ int magnitude_spectrum(SAMPLE_ *in_buf, SAMPLE_ *out_buf, int len)
 // TOUCH MENU SYSTEM
 // ============================================================================
 
-/**
- * @brief Draws the mode selection menu on the TFT display.
- *
- * This function renders a semi-transparent background, a title, and buttons for each mode option.
- * The buttons are drawn with their respective colors and labels.
- * The menu visibility state and show time are updated accordingly.
- */
-void drawModeMenu()
+static bool isTouchInRect(int touch_x, int touch_y, int x, int y, int w, int h)
 {
-  // Freeze scrolling and reset origin so the menu is always drawn at the top-left
-  saved_scroll_offset = disp_column;
-  // Do not change scroll position; compensate with offsets instead to avoid shifting content
-
-  // Determine the physical top-left coordinates under current scroll/rotation
-  int origin_x = 0;
-  int origin_y = 0;
-  if (TFT_ROTATION == 1 || TFT_ROTATION == 3)
-  {
-    origin_x = saved_scroll_offset % tft.width();
-  }
-  else
-  {
-    origin_y = saved_scroll_offset % tft.height();
-  }
-
-  // Clear old menu indicator artifacts before drawing the menu
-  tft.fillRect(origin_x, origin_y, 24, 20, TFT_BLACK);
-
-  // Draw semi-transparent background (simulate with black box)
-  tft.fillRect(origin_x, origin_y + 20, 80, 220, TFT_BLACK);
-
-  // Draw title
-  tft.setCursor(origin_x + 10, origin_y + 25);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.print("MODE");
-
-  // Draw buttons
-  for (int i = 0; i < NUM_MENU_BUTTONS; i++)
-  {
-    MenuButton &btn = menu_buttons[i];
-    tft.fillRect(origin_x + btn.x, origin_y + btn.y, btn.w, btn.h, btn.color);
-    tft.drawRect(origin_x + btn.x, origin_y + btn.y, btn.w, btn.h, TFT_WHITE);
-
-    // Center text in button
-    tft.setCursor(origin_x + btn.x + 5, origin_y + btn.y + 15);
-    tft.setTextColor(TFT_WHITE, btn.color);
-    tft.setTextSize(1);
-    tft.print(btn.label);
-  }
-
-  menu_visible = true;
-  menu_show_time = millis();
+  return (touch_x >= x && touch_x <= (x + w) && touch_y >= y && touch_y <= (y + h));
 }
 
-/**
- * @brief Checks if the given touch coordinates are within the bounds of a button.
- *
- * @param touch_x The x-coordinate of the touch event.
- * @param touch_y The y-coordinate of the touch event.
- * @param btn Reference to the MenuButton object to check against.
- * @return true if the touch is inside the button's area, false otherwise.
- */
-bool isTouchInButton(int touch_x, int touch_y, MenuButton &btn)
+static void setTouchMenuStatus(const char *fmt, ...)
 {
-  return (touch_x >= btn.x && touch_x <= (btn.x + btn.w) &&
-          touch_y >= btn.y && touch_y <= (btn.y + btn.h));
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(touch_menu_status, sizeof(touch_menu_status), fmt, args);
+  va_end(args);
+}
+
+static void clearTouchMenuButtons()
+{
+  touch_menu_button_count = 0;
+}
+
+static void addTouchMenuButton(int x, int y, int w, int h, TouchMenuAction action, const char *label, uint16_t color)
+{
+  if (touch_menu_button_count >= (int)(sizeof(touch_menu_buttons) / sizeof(touch_menu_buttons[0])))
+    return;
+
+  touch_menu_buttons[touch_menu_button_count++] = {x, y, w, h, action, label, color};
+
+  tft.fillRect(x, y, w, h, color);
+  tft.drawRect(x, y, w, h, TFT_WHITE);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, color);
+  tft.setCursor(x + 6, y + (h / 2) - 3);
+  tft.print(label);
+}
+
+static void drawTouchMenuHeader(const char *title)
+{
+  resetHardwareScrollState();
+  saved_scroll_offset = 0;
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(8, 8);
+  tft.print(title);
+
+  addTouchMenuButton(248, 6, 66, 20, MENU_ACTION_CLOSE, "Close", TFT_DARKGREY);
+}
+
+static void drawTouchMenu(TouchMenuScreen screen)
+{
+  active_touch_menu = screen;
+  menu_visible = true;
+  menu_show_time = millis();
+  clearTouchMenuButtons();
+
+  if (touch_menu_status[0] == '\0')
+  {
+    snprintf(touch_menu_status, sizeof(touch_menu_status), "Ready");
+  }
+
+  switch (screen)
+  {
+  case TOUCH_MENU_MAIN:
+    drawTouchMenuHeader("Main Menu");
+    addTouchMenuButton(20, 36, 280, 28, MENU_ACTION_OPEN_DISPLAY_MODE, "1) Display Mode", TFT_BLUE);
+    addTouchMenuButton(20, 68, 280, 28, MENU_ACTION_OPEN_UDP_STREAMS, "2) UDP Streams", TFT_DARKGREEN);
+    addTouchMenuButton(20, 100, 280, 28, MENU_ACTION_OPEN_CALIBRATION, "3) Calibration", TFT_BROWN);
+    addTouchMenuButton(20, 132, 280, 28, MENU_ACTION_OPEN_STORAGE, "4) Storage", TFT_MAGENTA);
+    addTouchMenuButton(20, 164, 280, 28, MENU_ACTION_OPEN_SETTINGS, "5) Settings", TFT_NAVY);
+    break;
+
+  case TOUCH_MENU_DISPLAY_MODE:
+    drawTouchMenuHeader("Display Mode");
+    addTouchMenuButton(16, 36, 94, 28, MENU_ACTION_MODE_OFF, "Off", TFT_RED);
+    addTouchMenuButton(113, 36, 94, 28, MENU_ACTION_MODE_TEXT, "Text", TFT_BLUE);
+    addTouchMenuButton(210, 36, 94, 28, MENU_ACTION_MODE_WAVE, "Wave", TFT_GREEN);
+    addTouchMenuButton(16, 68, 94, 28, MENU_ACTION_MODE_FFT, "FFT", TFT_CYAN);
+    addTouchMenuButton(113, 68, 94, 28, MENU_ACTION_MODE_SGRAM, "Spectrogram", TFT_MAGENTA);
+    addTouchMenuButton(210, 68, 94, 28, MENU_ACTION_OPEN_COMPONENTS, "Components", COLOR_GREY);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(16, 110);
+    tft.printf("Current mode: %d", mode);
+    tft.setCursor(16, 124);
+    tft.printf("Current source: %s", displayAxisCode(display_axis));
+    break;
+
+  case TOUCH_MENU_UDP_STREAMS:
+  {
+    drawTouchMenuHeader("UDP Streams");
+    const char *names[8] = {"VX", "VY", "AX", "AY", "AZ", "BX", "BY", "BZ"};
+    const TouchMenuAction actions[8] = {
+        MENU_ACTION_UDP_VX, MENU_ACTION_UDP_VY, MENU_ACTION_UDP_AX, MENU_ACTION_UDP_AY,
+        MENU_ACTION_UDP_AZ, MENU_ACTION_UDP_BX, MENU_ACTION_UDP_BY, MENU_ACTION_UDP_BZ};
+
+    for (int i = 0; i < 8; ++i)
+    {
+      int col = i % 2;
+      int row = i / 2;
+      char label[20];
+      snprintf(label, sizeof(label), "%s: %s", names[i], udpStreamEnable[i] ? "ON" : "OFF");
+      addTouchMenuButton(16 + col * 150, 36 + row * 30, 142, 26, actions[i], label,
+                         udpStreamEnable[i] ? TFT_DARKGREEN : TFT_DARKGREY);
+    }
+    break;
+  }
+
+  case TOUCH_MENU_CALIBRATION:
+    drawTouchMenuHeader("Calibration");
+    addTouchMenuButton(20, 44, 280, 34, MENU_ACTION_CAL_TOUCH_MENU, "Touch Calibration", TFT_BLUE);
+    addTouchMenuButton(20, 84, 280, 34, MENU_ACTION_CAL_MAG_MENU, "Magnetometer Calibration", TFT_DARKGREEN);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setCursor(20, 132);
+    tft.print("Choose a calibration workflow.");
+    break;
+
+  case TOUCH_MENU_CALIB_TOUCH:
+    drawTouchMenuHeader("Touch Calibration");
+    addTouchMenuButton(20, 40, 130, 32, MENU_ACTION_CAL_TOUCH_5, "Start 5-point", TFT_BLUE);
+    addTouchMenuButton(170, 40, 130, 32, MENU_ACTION_CAL_TOUCH_9, "Start 9-point", TFT_BLUE);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.setCursor(20, 88);
+    tft.print("Screen will switch to guided calibration.");
+    break;
+
+  case TOUCH_MENU_CALIB_MAG:
+    drawTouchMenuHeader("Mag Calibration");
+    addTouchMenuButton(20, 168, 132, 30, MENU_ACTION_MAG_START, "Start", TFT_DARKGREEN);
+    addTouchMenuButton(168, 168, 132, 30, MENU_ACTION_MAG_RESET, "Reset", TFT_BROWN);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.setCursor(16, 36);
+    tft.print("Instructions:");
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(16, 52);
+    tft.print("1) Press Start.");
+    tft.setCursor(16, 66);
+    tft.print("2) Rotate sensor slowly through");
+    tft.setCursor(16, 80);
+    tft.print("   all orientations for 20-30s.");
+    tft.setCursor(16, 94);
+    tft.print("3) Keep away from metal parts.");
+    tft.setCursor(16, 108);
+    tft.print("4) Use web page for capture/status.");
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setCursor(16, 128);
+    tft.printf("State: %s", magCalSession.active ? "active" : "idle");
+    tft.setCursor(16, 142);
+    tft.printf("Msg: %.28s", magCalSession.message);
+    break;
+
+  case TOUCH_MENU_STORAGE:
+  {
+    drawTouchMenuHeader("Storage");
+    char recLabel[28];
+    snprintf(recLabel, sizeof(recLabel), "miniSEED: %s", miniSeedRecordingEnabled ? "ON" : "OFF");
+    addTouchMenuButton(16, 38, 144, 30, MENU_ACTION_STORAGE_MINISEED, recLabel,
+                       miniSeedRecordingEnabled ? TFT_DARKGREEN : TFT_DARKGREY);
+    char fmtLabel[28];
+    snprintf(fmtLabel, sizeof(fmtLabel), "Format: %s", miniSeedLogger.getFormatString());
+    addTouchMenuButton(164, 38, 140, 30, MENU_ACTION_STORAGE_FORMAT, fmtLabel, TFT_BLUE);
+    addTouchMenuButton(16, 74, 144, 30, MENU_ACTION_STORAGE_UNMOUNT, "Unmount SD", TFT_ORANGE);
+    addTouchMenuButton(164, 74, 140, 30, MENU_ACTION_STORAGE_VIEW, "View Files", TFT_NAVY);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(16, 114);
+    tft.printf("SD ready: %s", sd_card_ready ? "yes" : "no");
+    break;
+  }
+
+  case TOUCH_MENU_SETTINGS:
+  {
+    drawTouchMenuHeader("Settings");
+    addTouchMenuButton(16, 38, 70, 28, MENU_ACTION_LOG_DOWN, "Log -", TFT_DARKGREY);
+    addTouchMenuButton(90, 38, 70, 28, MENU_ACTION_LOG_UP, "Log +", TFT_DARKGREY);
+    char unitLabel[24];
+    snprintf(unitLabel, sizeof(unitLabel), "Units: %s", tft_use_si_units ? "SI" : "Raw");
+    addTouchMenuButton(164, 38, 140, 28, MENU_ACTION_UNITS_TOGGLE, unitLabel, TFT_BLUE);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(16, 76);
+    tft.printf("Log level: %d", logVerbosity);
+    tft.setCursor(16, 92);
+    tft.printf("Network: %s", netMode == NET_WIZNET ? "WIZNET" : (netMode == NET_WIFI ? "WiFi" : "None"));
+    tft.setCursor(16, 108);
+    tft.printf("IP: %d.%d.%d.%d", assignedIP[0], assignedIP[1], assignedIP[2], assignedIP[3]);
+    tft.setCursor(16, 124);
+    tft.printf("GW: %d.%d.%d.%d", assignedGateway[0], assignedGateway[1], assignedGateway[2], assignedGateway[3]);
+    tft.setCursor(16, 140);
+    tft.printf("DNS: %d.%d.%d.%d", assignedDNS[0], assignedDNS[1], assignedDNS[2], assignedDNS[3]);
+    break;
+  }
+
+  case TOUCH_MENU_COMPONENTS:
+    drawTouchMenuHeader("Component Select");
+    addTouchMenuButton(12, 36, 70, 26, MENU_ACTION_AXIS_VX, "VX", TFT_DARKGREY);
+    addTouchMenuButton(86, 36, 70, 26, MENU_ACTION_AXIS_VY, "VY", TFT_DARKGREY);
+    addTouchMenuButton(160, 36, 70, 26, MENU_ACTION_AXIS_VR, "VR", TFT_DARKGREY);
+    addTouchMenuButton(234, 36, 70, 26, MENU_ACTION_AXIS_AX, "AX", TFT_DARKGREY);
+
+    addTouchMenuButton(12, 66, 70, 26, MENU_ACTION_AXIS_AY, "AY", TFT_DARKGREY);
+    addTouchMenuButton(86, 66, 70, 26, MENU_ACTION_AXIS_AZ, "AZ", TFT_DARKGREY);
+    addTouchMenuButton(160, 66, 70, 26, MENU_ACTION_AXIS_AR, "AR", TFT_DARKGREY);
+    addTouchMenuButton(234, 66, 70, 26, MENU_ACTION_AXIS_BX, "BX", TFT_DARKGREY);
+
+    addTouchMenuButton(12, 96, 70, 26, MENU_ACTION_AXIS_BY, "BY", TFT_DARKGREY);
+    addTouchMenuButton(86, 96, 70, 26, MENU_ACTION_AXIS_BZ, "BZ", TFT_DARKGREY);
+    addTouchMenuButton(160, 96, 70, 26, MENU_ACTION_AXIS_BR, "BR", TFT_DARKGREY);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setCursor(12, 128);
+    tft.printf("Current: %s", displayAxisCode(display_axis));
+    break;
+
+  case TOUCH_MENU_FILE_LIST:
+  {
+    drawTouchMenuHeader("miniSEED Files");
+    const int FPP = 7; // files per page
+    int fl_start = file_list_page * FPP;
+    if (file_list_count == 0)
+    {
+      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      tft.setCursor(16, 80);
+      tft.print(sd_card_ready ? "No .mseed files found" : "SD card not ready");
+    }
+    else
+    {
+      tft.setTextSize(1);
+      for (int fi = 0; fi < FPP; fi++)
+      {
+        int idx = fl_start + fi;
+        if (idx >= file_list_count)
+          break;
+        int ry = 30 + fi * 22;
+        uint16_t rowBg = (fi & 1) ? (uint16_t)TFT_NAVY : (uint16_t)TFT_BLACK;
+        tft.fillRect(1, ry, 318, 20, rowBg);
+        tft.setTextColor(TFT_WHITE, rowBg);
+        tft.setCursor(4, ry + 4);
+        const dirent_t &fe = file_list_entries[idx];
+        const char *fn = fe.filename;
+        int fnlen = (int)strlen(fn);
+        if (fnlen > 34)
+          fn += (fnlen - 34);
+        uint32_t kb = (fe.file_size + 512) / 1024;
+        tft.printf("%-34s%4luK", fn, (unsigned long)kb);
+      }
+      int total_pages = (file_list_count + FPP - 1) / FPP;
+      if (file_list_page > 0)
+        addTouchMenuButton(4, 194, 110, 22, MENU_ACTION_FILE_PAGE_PREV, "< Prev", TFT_DARKGREY);
+      if (file_list_page < total_pages - 1)
+        addTouchMenuButton(206, 194, 110, 22, MENU_ACTION_FILE_PAGE_NEXT, "Next >", TFT_DARKGREY);
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.setCursor(120, 198);
+      tft.printf("%d / %d", file_list_page + 1, total_pages);
+    }
+    break;
+  }
+
+  case TOUCH_MENU_NONE:
+  default:
+    break;
+  }
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(8, 220);
+  tft.printf("%-.50s", touch_menu_status);
+}
+
+void drawModeMenu()
+{
+  drawTouchMenu(TOUCH_MENU_MAIN);
+}
+
+static bool closeTouchMenu()
+{
+  menu_visible = false;
+  active_touch_menu = TOUCH_MENU_NONE;
+  mode_initialized = false;
+  tft.fillScreen(TFT_BLACK);
+  return false;
+}
+
+static bool applyTouchMenuAction(TouchMenuAction action, volatile int &current_mode)
+{
+  if (action == MENU_ACTION_CLOSE)
+  {
+    return closeTouchMenu();
+  }
+
+  if (action == MENU_ACTION_OPEN_MAIN)
+  {
+    drawTouchMenu(TOUCH_MENU_MAIN);
+    return false;
+  }
+
+  if (action == MENU_ACTION_OPEN_DISPLAY_MODE)
+  {
+    drawTouchMenu(TOUCH_MENU_DISPLAY_MODE);
+    return false;
+  }
+
+  if (action == MENU_ACTION_OPEN_UDP_STREAMS)
+  {
+    drawTouchMenu(TOUCH_MENU_UDP_STREAMS);
+    return false;
+  }
+
+  if (action == MENU_ACTION_OPEN_CALIBRATION)
+  {
+    drawTouchMenu(TOUCH_MENU_CALIBRATION);
+    return false;
+  }
+
+  if (action == MENU_ACTION_OPEN_STORAGE)
+  {
+    drawTouchMenu(TOUCH_MENU_STORAGE);
+    return false;
+  }
+
+  if (action == MENU_ACTION_OPEN_SETTINGS)
+  {
+    drawTouchMenu(TOUCH_MENU_SETTINGS);
+    return false;
+  }
+
+  if (action == MENU_ACTION_OPEN_COMPONENTS)
+  {
+    drawTouchMenu(TOUCH_MENU_COMPONENTS);
+    return false;
+  }
+
+  if (action >= MENU_ACTION_MODE_OFF && action <= MENU_ACTION_MODE_SGRAM)
+  {
+    int new_mode = 3;
+    if (action == MENU_ACTION_MODE_OFF)
+      new_mode = -1;
+    else if (action == MENU_ACTION_MODE_TEXT)
+      new_mode = 0;
+    else if (action == MENU_ACTION_MODE_WAVE)
+      new_mode = 1;
+    else if (action == MENU_ACTION_MODE_FFT)
+      new_mode = 2;
+
+    bool changed = (new_mode != current_mode);
+    current_mode = new_mode;
+    closeTouchMenu();
+    return changed;
+  }
+
+  if (action >= MENU_ACTION_UDP_VX && action <= MENU_ACTION_UDP_BZ)
+  {
+    int idx = (int)action - (int)MENU_ACTION_UDP_VX;
+    if (idx >= 0 && idx < 8)
+    {
+      udpStreamEnable[idx] = !udpStreamEnable[idx];
+      setTouchMenuStatus("UDP %d is now %s", idx, udpStreamEnable[idx] ? "ON" : "OFF");
+    }
+    drawTouchMenu(TOUCH_MENU_UDP_STREAMS);
+    return false;
+  }
+
+  if (action == MENU_ACTION_CAL_TOUCH_MENU)
+  {
+    drawTouchMenu(TOUCH_MENU_CALIB_TOUCH);
+    return false;
+  }
+
+  if (action == MENU_ACTION_CAL_MAG_MENU)
+  {
+    drawTouchMenu(TOUCH_MENU_CALIB_MAG);
+    return false;
+  }
+
+  if (action == MENU_ACTION_CAL_TOUCH_5 || action == MENU_ACTION_CAL_TOUCH_9)
+  {
+    NUM_CALIB_POINTS = (action == MENU_ACTION_CAL_TOUCH_5) ? 5 : 9;
+    trigger_touch_calibration = true;
+    setTouchMenuStatus("Touch calibration queued (%d points)", NUM_CALIB_POINTS);
+    closeTouchMenu();
+    return false;
+  }
+
+  if (action == MENU_ACTION_MAG_START)
+  {
+    startMagCalibrationSession();
+    setTouchMenuStatus("Mag calibration started");
+    drawTouchMenu(TOUCH_MENU_CALIB_MAG);
+    return false;
+  }
+
+  if (action == MENU_ACTION_MAG_RESET)
+  {
+    magCalParams.valid = false;
+    magCalParams.offset[0] = magCalParams.offset[1] = magCalParams.offset[2] = 0.0f;
+    magCalParams.scale[0] = magCalParams.scale[1] = magCalParams.scale[2] = 1.0f;
+
+    bool recordingWasEnabled = miniSeedRecordingEnabled;
+    if (recordingWasEnabled)
+    {
+      miniSeedRecordingEnabled = false;
+      miniSeedLogger.setRecordingEnabled(false);
+    }
+
+    LittleFS.remove(MAG_CAL_FILE);
+
+    if (recordingWasEnabled)
+    {
+      miniSeedRecordingEnabled = true;
+      miniSeedLogger.setRecordingEnabled(true);
+    }
+
+    snprintf(magCalSession.message, sizeof(magCalSession.message), "Mag calibration reset");
+    setTouchMenuStatus("Stored mag calibration reset");
+    drawTouchMenu(TOUCH_MENU_CALIB_MAG);
+    return false;
+  }
+
+  if (action == MENU_ACTION_STORAGE_MINISEED)
+  {
+    if (miniSeedRecordingEnabled)
+    {
+      stopMiniSeedRecording("TFT menu toggle off");
+      setTouchMenuStatus("miniSEED recording disabled");
+    }
+    else if (sd_card_ready)
+    {
+      miniSeedRecordingEnabled = true;
+      miniSeedLogger.setRecordingEnabled(true);
+      setTouchMenuStatus("miniSEED recording enabled");
+    }
+    else
+    {
+      setTouchMenuStatus("SD card not ready");
+    }
+    drawTouchMenu(TOUCH_MENU_STORAGE);
+    return false;
+  }
+
+  if (action == MENU_ACTION_STORAGE_FORMAT)
+  {
+    String currentFormat = miniSeedLogger.getFormatString();
+    if (currentFormat == "v2")
+      miniSeedLogger.setFormat(MinISeedLogger::FORMAT_V3);
+    else
+      miniSeedLogger.setFormat(MinISeedLogger::FORMAT_V2);
+
+    setTouchMenuStatus("Format set to %s", miniSeedLogger.getFormatString());
+    drawTouchMenu(TOUCH_MENU_STORAGE);
+    return false;
+  }
+
+  if (action == MENU_ACTION_STORAGE_UNMOUNT)
+  {
+    stopMiniSeedRecording("TFT unmount request");
+    delay(100);
+    sd_card_ready = false;
+    setTouchMenuStatus("SD card unmounted");
+    drawTouchMenu(TOUCH_MENU_STORAGE);
+    return false;
+  }
+
+  if (action == MENU_ACTION_STORAGE_VIEW)
+  {
+    if (!sd_card_ready)
+    {
+      setTouchMenuStatus("SD card not ready");
+      drawTouchMenu(TOUCH_MENU_STORAGE);
+      return false;
+    }
+    // Read directory into static buffer and filter to .mseed/.mse files
+    int raw = sd_spi_read_directory_path(&sd_fs_info, "/data/miniseed", file_list_entries, 64);
+    if (raw < 0)
+    {
+      setTouchMenuStatus("Cannot read /data/miniseed");
+      drawTouchMenu(TOUCH_MENU_STORAGE);
+      return false;
+    }
+    // Compact-filter in place: keep only miniSEED files
+    file_list_count = 0;
+    for (int ei = 0; ei < raw; ei++)
+    {
+      if (file_list_entries[ei].attributes & 0x10)
+        continue; // skip subdirectories
+      const char *fn = file_list_entries[ei].filename;
+      int flen = (int)strlen(fn);
+      bool ok = (flen > 6 && (strcmp(fn + flen - 6, ".mseed") == 0 ||
+                              strcmp(fn + flen - 6, ".MSEED") == 0)) ||
+                (flen > 4 && (strcmp(fn + flen - 4, ".mse") == 0 ||
+                              strcmp(fn + flen - 4, ".MSE") == 0));
+      if (ok)
+      {
+        if (ei != file_list_count)
+          file_list_entries[file_list_count] = file_list_entries[ei];
+        file_list_count++;
+      }
+    }
+    // Sort newest first: descending by FAT date+time, then filename
+    for (int si = 1; si < file_list_count; si++)
+    {
+      dirent_t key = file_list_entries[si];
+      uint32_t kd = ((uint32_t)key.date << 16) | key.time;
+      int sj = si - 1;
+      while (sj >= 0)
+      {
+        uint32_t jd = ((uint32_t)file_list_entries[sj].date << 16) | file_list_entries[sj].time;
+        if (jd > kd || (jd == kd && strcmp(file_list_entries[sj].filename, key.filename) > 0))
+          break;
+        file_list_entries[sj + 1] = file_list_entries[sj];
+        sj--;
+      }
+      file_list_entries[sj + 1] = key;
+    }
+    file_list_page = 0;
+    setTouchMenuStatus("%d file%s", file_list_count, file_list_count == 1 ? "" : "s");
+    drawTouchMenu(TOUCH_MENU_FILE_LIST);
+    return false;
+  }
+
+  if (action == MENU_ACTION_FILE_PAGE_PREV)
+  {
+    if (file_list_page > 0)
+      file_list_page--;
+    drawTouchMenu(TOUCH_MENU_FILE_LIST);
+    return false;
+  }
+
+  if (action == MENU_ACTION_FILE_PAGE_NEXT)
+  {
+    const int FPP = 7;
+    int total_pages = (file_list_count + FPP - 1) / FPP;
+    if (file_list_page < total_pages - 1)
+      file_list_page++;
+    drawTouchMenu(TOUCH_MENU_FILE_LIST);
+    return false;
+  }
+
+  if (action == MENU_ACTION_LOG_DOWN)
+  {
+    if (logVerbosity > 0)
+      logVerbosity--;
+    setTouchMenuStatus("Log level: %d", logVerbosity);
+    drawTouchMenu(TOUCH_MENU_SETTINGS);
+    return false;
+  }
+
+  if (action == MENU_ACTION_LOG_UP)
+  {
+    if (logVerbosity < 4)
+      logVerbosity++;
+    setTouchMenuStatus("Log level: %d", logVerbosity);
+    drawTouchMenu(TOUCH_MENU_SETTINGS);
+    return false;
+  }
+
+  if (action == MENU_ACTION_UNITS_TOGGLE)
+  {
+    tft_use_si_units = !tft_use_si_units;
+    setTouchMenuStatus("Units now: %s", tft_use_si_units ? "SI" : "Raw");
+    drawTouchMenu(TOUCH_MENU_SETTINGS);
+    return false;
+  }
+
+  if (action >= MENU_ACTION_AXIS_VX && action <= MENU_ACTION_AXIS_BR)
+  {
+    const int actionToAxis[] = {
+        RINGBUFFER_VELOCX_RAW,
+        RINGBUFFER_VELOCY_RAW,
+        RINGBUFFER_VELOCR_RAW,
+        RINGBUFFER_ACCELX_RAW,
+        RINGBUFFER_ACCELY_RAW,
+        RINGBUFFER_ACCELZ_RAW,
+        RINGBUFFER_ACCELR_RAW,
+        RINGBUFFER_MAGX_RAW,
+        RINGBUFFER_MAGY_RAW,
+        RINGBUFFER_MAGZ_RAW,
+        RINGBUFFER_MAGR_RAW};
+    int idx = (int)action - (int)MENU_ACTION_AXIS_VX;
+    if (idx >= 0 && idx < (int)(sizeof(actionToAxis) / sizeof(actionToAxis[0])))
+    {
+      display_axis = actionToAxis[idx];
+      closeTouchMenu();
+      return false;
+    }
+  }
+
+  return false;
 }
 
 /**
  * @brief Handles touchscreen input and manages mode switching via a menu.
  *
- * This function polls the touchscreen, applies debouncing, and detects touch events.
- * If a touch is detected, it checks if the touch is within the menu toggle area or on a menu button.
- * When a menu button is pressed, it updates the current mode and hides the menu.
- * The function also manages menu visibility and auto-hides the menu after a timeout.
- * Debug information is printed based on the log verbosity level.
- *
- * @param current_mode Reference to the current mode variable; may be updated if a menu button is pressed.
- * @return true if the mode was changed by a menu button press, false otherwise.
+ * @param current_mode Reference to the current mode variable; may be updated if a menu action changes the mode.
+ * @return true if the display mode was changed, false otherwise.
  */
 bool handleTouchInput(volatile int &current_mode)
 {
   static unsigned long last_touch_time = 0;
-  static bool touch_was_pressed = false;
+  static unsigned long last_touch_pin_poll_ms = 0;
   const unsigned long DEBOUNCE_MS = 200;
+  const unsigned long TOUCH_POLL_MS = 15;
 
-  // Only poll for touch events when IRQ flag is set
-  if (!touch_event_flag)
+  // Auto-hide menu when inactive.
+  if (menu_visible && (millis() - menu_show_time > MENU_TIMEOUT_MS))
+  {
+    closeTouchMenu();
+    return false;
+  }
+
+  // Detect touch either via IRQ callback flag or by polling IRQ pin level.
+  bool has_touch_event = touch_event_flag;
+  unsigned long now_ms = millis();
+  if (!has_touch_event && (now_ms - last_touch_pin_poll_ms) >= TOUCH_POLL_MS)
+  {
+    last_touch_pin_poll_ms = now_ms;
+    has_touch_event = (gpio_get(TOUCH_IRQ) == 0);
+  }
+  if (!has_touch_event)
     return false;
 
-  // Clear the flag and re-enable IRQ for next touch
   touch_event_flag = false;
-  gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true);
 
-  // Debounce after IRQ flag is set (test code style)
   if (millis() - last_touch_time < DEBOUNCE_MS)
   {
     return false;
@@ -5110,54 +5891,40 @@ bool handleTouchInput(volatile int &current_mode)
 
   uint16_t tx = 0, ty = 0;
   bool is_touched = tft.getTouch(&tx, &ty, TOUCH_THRESHOLD);
-
+  restoreNetworkSPIAfterTouch();
   if (!is_touched)
-  {
-    // False trigger - no actual touch detected
     return false;
-  }
 
-  // Create a structure to hold touch coordinates (compatible with existing code)
-  struct
-  {
-    uint16_t x, y, z;
-  } tp;
-  tp.x = tx;
-  tp.y = ty;
-  tp.z = 1000; // Pressure value for touched state
-
-  // Log touch data for debugging
   if (logVerbosity >= LOG_INFO)
   {
-    debugPrintf("Touch event (IRQ): x=%d, y=%d\n", tp.x, tp.y);
+    debugPrintf("Touch event (IRQ): x=%d, y=%d\n", tx, ty);
   }
 
-  // Process touch event (same logic as before)
-  touch_was_pressed = true;
   last_touch_time = millis();
 
-  // Convert touch coordinates to display coordinates
   int display_x, display_y;
-  applyMMSECalibration(tp.x, tp.y, display_x, display_y);
+  applyMMSECalibration(tx, ty, display_x, display_y);
 
   if (logVerbosity >= LOG_INFO)
   {
     debugPrintf("Touch event detected at display coordinates: x=%d, y=%d\n", display_x, display_y);
   }
 
-  // Wake from display-off mode (-1) on any touch: resume to spectrogram (mode 3)
+  if (menu_visible)
+  {
+    menu_show_time = millis();
+  }
+
+  // Wake from display-off mode (-1) on any touch.
   if (current_mode == -1)
   {
     current_mode = 3;
-    menu_visible = false;
-    scrollAddress(saved_scroll_offset); // Restore hardware scroll position
-    disp_column = saved_scroll_offset % waveform_w;
-    tft.fillScreen(TFT_BLACK);
+    closeTouchMenu();
     debugPrintln("Waking display to mode 3 (spectrogram) via touch");
     return true;
   }
 
-  // Check if touch is in the menu toggle area (top-left corner)
+  // Hamburger icon opens top-level menu.
   if (!menu_visible && display_x < 80 && display_y < 20)
   {
     if (logVerbosity >= LOG_INFO)
@@ -5166,71 +5933,36 @@ bool handleTouchInput(volatile int &current_mode)
     return false;
   }
 
-  if (!menu_visible && logVerbosity >= LOG_INFO)
-    debugPrintln("Touch outside menu symbol area", LOG_INFO);
-
-  // If menu is visible, check button touches
-  if (menu_visible)
+  // Badge hitbox (bottom-left) opens component source menu.
+  if (!menu_visible && mode != 0 && display_x < 72 && display_y > (tft.height() - 24))
   {
-    // Calculate the same offset compensation used in drawModeMenu()
-    int touch_origin_x = 0;
-    int touch_origin_y = 0;
-    if (TFT_ROTATION == 1 || TFT_ROTATION == 3)
-    {
-      touch_origin_x = saved_scroll_offset % tft.width();
-    }
-    else
-    {
-      touch_origin_y = saved_scroll_offset % tft.height();
-    }
+    setTouchMenuStatus("Select display source");
+    drawTouchMenu(TOUCH_MENU_COMPONENTS);
+    return false;
+  }
 
-    // Adjust touch coordinates to account for menu offset
-    int adjusted_touch_x = display_x - touch_origin_x;
-    int adjusted_touch_y = display_y - touch_origin_y;
+  if (!menu_visible)
+  {
+    if (logVerbosity >= LOG_INFO)
+      debugPrintln("Touch outside menu symbol area", LOG_INFO);
+    return false;
+  }
 
-    for (int i = 0; i < NUM_MENU_BUTTONS; i++)
+  for (int i = 0; i < touch_menu_button_count; ++i)
+  {
+    TouchMenuButton &btn = touch_menu_buttons[i];
+    if (isTouchInRect(display_x, display_y, btn.x, btn.y, btn.w, btn.h))
     {
-      if (isTouchInButton(adjusted_touch_x, adjusted_touch_y, menu_buttons[i]))
+      if (logVerbosity >= LOG_DEBUG)
       {
-        if (logVerbosity >= LOG_DEBUG)
-          debugPrintf("Menu button pressed: %s (mode %d)\n", menu_buttons[i].label, menu_buttons[i].mode_value);
-        // Mode button pressed
-        int new_mode = menu_buttons[i].mode_value;
-        if (new_mode != current_mode)
-        {
-          current_mode = new_mode;
-          menu_visible = false;
-
-          // Restore scroll position and keep drawing aligned after closing the menu
-          scrollAddress(saved_scroll_offset); // Restore hardware scroll position
-          disp_column = saved_scroll_offset % waveform_w;
-
-          // Clear screen for new mode
-          tft.fillScreen(TFT_BLACK);
-
-          debugPrint("Mode changed to: ");
-          debugPrintf("%d\n", current_mode);
-          return true;
-        }
+        debugPrintf("Touch menu action: %d (%s)\n", (int)btn.action, btn.label);
       }
+      return applyTouchMenuAction(btn.action, current_mode);
     }
-    if (logVerbosity >= LOG_DEBUG)
-      debugPrintln("Touch in menu area but outside buttons", LOG_DEBUG);
   }
 
-  // Auto-hide menu after timeout
-  if (menu_visible && (millis() - menu_show_time > MENU_TIMEOUT_MS))
-  {
-    menu_visible = false;
-    scrollAddress(saved_scroll_offset); // Restore hardware scroll position
-    disp_column = saved_scroll_offset % waveform_w;
-    tft.fillScreen(TFT_BLACK);
-    // Redraw menu indicator after timeout
-    if (current_mode > 0)
-    {
-      drawMenuIndicator(disp_column);
-    }
-  }
+  if (logVerbosity >= LOG_DEBUG)
+    debugPrintln("Touch in menu area but outside buttons", LOG_DEBUG);
 
   return false;
 }
@@ -5550,7 +6282,14 @@ void setup()
     serverInfoPrinted = true;
   }
   setup_dsp();
-  gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, touch_irq_isr);
+  if (use_touch_irq_callback)
+  {
+    gpio_set_irq_enabled_with_callback(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, true, touch_irq_isr);
+  }
+  else
+  {
+    gpio_set_irq_enabled(TOUCH_IRQ, GPIO_IRQ_EDGE_FALL, false);
+  }
 
   tftPrint("---------------------------------------------\n");
   tftPrint("System initialized.\n");
@@ -5597,6 +6336,9 @@ void loop()
   static float accelX_block[UDP_PACKET_SIZE];
   static float accelY_block[UDP_PACKET_SIZE];
   static float accelZ_block[UDP_PACKET_SIZE];
+  static float magX_block[UDP_PACKET_SIZE];
+  static float magY_block[UDP_PACKET_SIZE];
+  static float magZ_block[UDP_PACKET_SIZE];
   static int gyroXraw_block[UDP_PACKET_SIZE];
   static int gyroYraw_block[UDP_PACKET_SIZE];
   static int gyroZraw_block[UDP_PACKET_SIZE];
@@ -5671,6 +6413,13 @@ void loop()
   accelXraw_block[block_idx] = accelData.data[0];
   accelYraw_block[block_idx] = accelData.data[1];
   accelZraw_block[block_idx] = accelData.data[2];
+  float magXCal = 0.0f;
+  float magYCal = 0.0f;
+  float magZCal = 0.0f;
+  applyMagCalibration(magData.magnetic.x, magData.magnetic.y, magData.magnetic.z, magXCal, magYCal, magZCal);
+  magX_block[block_idx] = magXCal;
+  magY_block[block_idx] = magYCal;
+  magZ_block[block_idx] = magZCal;
   gyroXraw_block[block_idx] = gyroData.data[0];
   gyroYraw_block[block_idx] = gyroData.data[1];
   gyroZraw_block[block_idx] = gyroData.data[2];
@@ -5767,15 +6516,38 @@ void loop()
       buffer_feed(current_sample);
       break;
     case RINGBUFFER_ACCELX_RAW:
-      current_sample = accelData.data[0];
+      // Use SI acceleration (m/s^2) converted to milli-(m/s^2) for better dynamic response.
+      current_sample = (int16_t)(accelData.acceleration.x * 1000.0f);
       buffer_feed(current_sample);
       break;
     case RINGBUFFER_ACCELY_RAW:
-      current_sample = accelData.data[1];
+      current_sample = (int16_t)(accelData.acceleration.y * 1000.0f);
       buffer_feed(current_sample);
       break;
     case RINGBUFFER_ACCELZ_RAW:
-      current_sample = accelData.data[2];
+      current_sample = (int16_t)(accelData.acceleration.z * 1000.0f);
+      buffer_feed(current_sample);
+      break;
+    case RINGBUFFER_ACCELR_RAW:
+      // Radial acceleration component in XY plane (analogous to velocity VR).
+      current_sample = (int16_t)(sqrtf(accelData.acceleration.x * accelData.acceleration.x + accelData.acceleration.y * accelData.acceleration.y) * 1000.0f);
+      buffer_feed(current_sample);
+      break;
+    case RINGBUFFER_MAGX_RAW:
+      // Use 0.1 uT resolution so +/-100 uT maps well to display range.
+      current_sample = (int16_t)(magXCal * 10.0f);
+      buffer_feed(current_sample);
+      break;
+    case RINGBUFFER_MAGY_RAW:
+      current_sample = (int16_t)(magYCal * 10.0f);
+      buffer_feed(current_sample);
+      break;
+    case RINGBUFFER_MAGZ_RAW:
+      current_sample = (int16_t)(magZCal * 10.0f);
+      buffer_feed(current_sample);
+      break;
+    case RINGBUFFER_MAGR_RAW:
+      current_sample = (int16_t)(sqrtf(magXCal * magXCal + magYCal * magYCal + magZCal * magZCal) * 10.0f);
       buffer_feed(current_sample);
       break;
     default:
@@ -5908,6 +6680,39 @@ void loop()
         udpPacketsSent[4]++;
       else
         udpPacketsDropped[4]++;
+    }
+    if (udpStreamEnable[5])
+    {
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for magX, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("magX", magX_block, UDP_PACKET_SIZE))
+        udpPacketsSent[5]++;
+      else
+        udpPacketsDropped[5]++;
+    }
+    if (udpStreamEnable[6])
+    {
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for magY, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("magY", magY_block, UDP_PACKET_SIZE))
+        udpPacketsSent[6]++;
+      else
+        udpPacketsDropped[6]++;
+    }
+    if (udpStreamEnable[7])
+    {
+      if (logVerbosity >= LOG_DEBUG)
+      {
+        debugSerialPrintf("Sending UDP stream for magZ, count: %d\n", UDP_PACKET_SIZE);
+      }
+      if (sendSensorUDPStream("magZ", magZ_block, UDP_PACKET_SIZE))
+        udpPacketsSent[7]++;
+      else
+        udpPacketsDropped[7]++;
     }
     block_idx = 0;
     if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
@@ -6390,6 +7195,8 @@ void loop()
   // TIMING BLOCK 6: TOUCH INPUT
   unsigned long touch_input_start = micros();
   bool mode_changed = handleTouchInput(mode);
+  // Ensure touch/TFT transactions cannot hold the shared SPI bus before networking.
+  releaseSPIBus();
   if (logVerbosity >= LOG_INFO && (millis() - last_timing_report) > timing_report_interval)
   {
     debugSerialPrintf("TIMING: Touch Input: %lu us\n", micros() - touch_input_start);
@@ -6507,19 +7314,47 @@ void loop()
   // Mode has changed, reset scrolling and manage display power based on mode
   if (mode != previous_mode)
   {
-    scrollDisplay(0); // Reset scrolling
+    int old_mode = previous_mode;
+    // Fully reset hardware scroll state so mode-local overlays are anchored at left/top.
+    resetHardwareScrollState();
+    menu_visible = false;
+
+    // Touch-driven mode switches can occasionally leave the HTTP listener stale.
+    // Rebind the server sockets once to recover quickly without a full chip reset.
+    if (mode_changed)
+    {
+      releaseSPIBus();
+      if (netMode == NET_WIZNET)
+      {
+        Ethernet.init(WIZNET_SPI_CS);
+        ethServer.begin();
+        ethUdpStream.stop();
+        ethUdpStreamReady = (ethUdpStream.begin(UDP_STREAM_PORT) != 0);
+        debugSerialPrintf("HTTP: Rebound Ethernet server after touch mode switch, UDP %s\n",
+                          ethUdpStreamReady ? "ready" : "FAILED");
+      }
+      else if (netMode == NET_WIFI)
+      {
+        wifiServer.begin();
+        wifiUdpStream.stop();
+        wifiUdpStreamReady = (wifiUdpStream.begin(UDP_STREAM_PORT) != 0);
+        debugSerialPrintf("HTTP: Rebound WiFi server after touch mode switch, UDP %s\n",
+                          wifiUdpStreamReady ? "ready" : "FAILED");
+      }
+    }
+
     if (mode == -1)
     {
       // Entering mode -1: turn off display
-      debugPrintln("Switching to mode -1: turning off display");
+      debugPrintf("Mode change %d -> -1: turning off display\n", old_mode);
       tft.fillScreen(TFT_BLACK);
       disableBacklight();
     }
-    else
+    else if (old_mode == -1)
     {
-      // Leaving mode -1: turn on display
+      // Leaving mode -1: turn display back on
       unsigned long backlight_start = micros();
-      debugPrintf("Leaving mode -1, switching to mode %d: turning on display\n", mode);
+      debugPrintf("Mode change -1 -> %d: turning on display\n", mode);
       /*     setBacklight(1.0); // Use full brightness first to ensure GPIO is set
           delay(10);
           setBacklight(0.25); // Then set to desired brightness
@@ -6529,6 +7364,10 @@ void loop()
       {
         debugSerialPrintf("TIMING: Backlight Setup: %lu us\n", micros() - backlight_start);
       }
+    }
+    else
+    {
+      debugPrintf("Mode change %d -> %d\n", old_mode, mode);
     }
   }
 
@@ -6571,7 +7410,11 @@ void loop()
       }
     }
 
-    if (mode == 0)
+    if (menu_visible)
+    {
+      // Keep full-screen touch menus stable by pausing background mode rendering.
+    }
+    else if (mode == 0)
     {
       // Mode 0: Statistics text mode
       if (!mode_initialized)
@@ -6617,6 +7460,8 @@ void loop()
         int mean = sum / 100;
         int rms = (int)sqrtf(((float)sumsq) / 100);
 
+        snprintf(buf, sizeof(buf), "Source: %s\n", displayAxisCode(display_axis));
+        debugPrint(buf);
         snprintf(buf, sizeof(buf), "Samples: %d\n", total_samples);
         debugPrint(buf);
         snprintf(buf, sizeof(buf), "Mean: %d\n", mean);
@@ -6665,7 +7510,9 @@ void loop()
         disp_column = SCROLL_TOP_FIXED_AREA; // Reset spectrogram column position
         scrollDisplay(0);                    // Reset scrolling
         draw_fft_frequency_axis();           // Draw frequency labels for FFT mode
-        drawMenuIndicator(disp_column);      // Draw menu access indicator
+        for (int i = 0; i < LAST_POINTS_SIZE; ++i)
+          last_points[i] = fft_axis_y;
+        drawMenuIndicator(disp_column); // Draw menu access indicator
         mode_initialized = true;
       }
 
@@ -6686,6 +7533,8 @@ void loop()
 
         sample_to_short(mag_spec, mag_spec_short, npts);
         waveform_display(mag_spec_short, npts, TFT_YELLOW, false); // Don't draw triggers in FFT mode
+        draw_fft_frequency_axis();
+        drawMenuIndicator(disp_column);
 
         last_display_update_mode2 = millis();
       }

@@ -165,6 +165,42 @@
             background: #eef5fc;
             color: #1f4d79;
         }
+
+        .download-status {
+            margin: 8px 0 12px;
+            padding: 10px;
+            border: 1px solid #d6e7f8;
+            border-radius: 6px;
+            background: #f7fbff;
+        }
+
+        .download-status-title {
+            margin: 0 0 6px;
+            color: #1f4d79;
+            font-weight: 600;
+        }
+
+        .download-progress-track {
+            width: 100%;
+            height: 12px;
+            background: #dfe8f3;
+            border-radius: 999px;
+            overflow: hidden;
+            margin: 6px 0;
+        }
+
+        .download-progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #2f80ed, #56ccf2);
+            transition: width 0.2s ease;
+        }
+
+        .download-status-meta {
+            margin: 0;
+            color: #35516b;
+            font-size: 0.88em;
+        }
     </style>
 </head>
 
@@ -263,17 +299,20 @@
             return 1.0 / (Math.abs(factor) * Math.abs(multiplier));
         }
 
-        function parseMiniSeedV2Info(arrayBuffer) {
+        function parseMiniSeedV2Info(arrayBuffer, totalByteLength) {
             const recordSize = 512;
             const byteLength = arrayBuffer.byteLength;
+            const totalBytes = (typeof totalByteLength === 'number' && totalByteLength > 0) ? totalByteLength : byteLength;
             const dataView = new DataView(arrayBuffer);
-            const recordCount = Math.floor(byteLength / recordSize);
+            const recordCount = Math.floor(totalBytes / recordSize);
+            const parsedRecordCount = Math.floor(byteLength / recordSize);
+            const isPartial = byteLength < totalBytes;
 
             const rawRecords = [];
             const channelSet = new Set();
             let parsedRecords = 0;
 
-            for (let rec = 0; rec < recordCount; rec++) {
+            for (let rec = 0; rec < parsedRecordCount; rec++) {
                 const base = rec * recordSize;
                 const quality = String.fromCharCode(dataView.getUint8(base + 6));
                 if (!(quality === 'D' || quality === 'R' || quality === 'Q' || quality === 'M')) {
@@ -353,18 +392,89 @@
             const channels = Array.from(channelSet.values()).sort();
 
             return {
-                byteLength,
+                byteLength: totalBytes,
+                parsedByteLength: byteLength,
                 recordCount,
+                parsedRecordCount,
                 parsedRecords,
                 traces,
                 channels,
                 totalTraces: traces.length,
-                totalChannels: channels.length
+                totalChannels: channels.length,
+                isPartial
+            };
+        }
+
+        function mergePartialScanInfo(headInfo, tailInfo, totalBytes, scannedBytes) {
+            const traceMap = new Map();
+            const channelSet = new Set();
+
+            function ingest(info) {
+                if (!info) return;
+                for (let i = 0; i < info.channels.length; i++) {
+                    channelSet.add(info.channels[i]);
+                }
+                for (let i = 0; i < info.traces.length; i++) {
+                    const t = info.traces[i];
+                    const key = t.traceId;
+                    if (!traceMap.has(key)) {
+                        traceMap.set(key, {
+                            traceId: t.traceId,
+                            channel: t.channel,
+                            records: t.records,
+                            samples: t.samples,
+                            durationSec: t.durationSec,
+                            startMs: t.startMs,
+                            endMs: t.endMs,
+                            rate: t.rate
+                        });
+                        continue;
+                    }
+
+                    const cur = traceMap.get(key);
+                    cur.records += t.records;
+                    cur.samples += t.samples;
+                    if (t.startMs < cur.startMs) cur.startMs = t.startMs;
+                    if (t.endMs > cur.endMs) cur.endMs = t.endMs;
+                    cur.durationSec = (cur.endMs - cur.startMs) / 1000.0;
+                    if ((cur.rate <= 0 || !isFinite(cur.rate)) && t.rate > 0) {
+                        cur.rate = t.rate;
+                    }
+                }
+            }
+
+            ingest(headInfo);
+            ingest(tailInfo);
+
+            const traces = Array.from(traceMap.values()).sort((a, b) => {
+                const c = a.traceId.localeCompare(b.traceId);
+                return c !== 0 ? c : a.startMs - b.startMs;
+            });
+            const channels = Array.from(channelSet.values()).sort();
+
+            return {
+                byteLength: totalBytes,
+                parsedByteLength: scannedBytes,
+                recordCount: Math.floor(totalBytes / 512),
+                parsedRecordCount: (headInfo ? headInfo.parsedRecordCount : 0) + (tailInfo ? tailInfo.parsedRecordCount : 0),
+                parsedRecords: (headInfo ? headInfo.parsedRecords : 0) + (tailInfo ? tailInfo.parsedRecords : 0),
+                traces,
+                channels,
+                totalTraces: traces.length,
+                totalChannels: channels.length,
+                isPartial: scannedBytes < totalBytes
             };
         }
 
         function fmtDate(ms) {
-            return new Date(ms).toISOString();
+            const d = new Date(ms);
+            const yyyy = d.getFullYear();
+            const mm = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            const hh = String(d.getHours()).padStart(2, '0');
+            const mi = String(d.getMinutes()).padStart(2, '0');
+            const ss = String(d.getSeconds()).padStart(2, '0');
+            return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
         }
 
         function fmtDuration(sec) {
@@ -375,29 +485,144 @@
             return m + ' min ' + s.toFixed(1) + ' s';
         }
 
-        async function buildAdvancedInfoHtml(file) {
-            const response = await fetch('/mseedfile?file=' + encodeURIComponent(file.name));
-            if (!response.ok) {
-                throw new Error('File fetch failed (' + response.status + ')');
+        function decodeHexToArrayBuffer(hex, absoluteOffsetForError) {
+            const hexLen = hex.length;
+            if ((hexLen % 2) !== 0) {
+                throw new Error('Invalid hex payload length at offset ' + absoluteOffsetForError);
             }
-            const arrayBuffer = await response.arrayBuffer();
-            const info = parseMiniSeedV2Info(arrayBuffer);
+
+            const out = new Uint8Array(hexLen / 2);
+            for (let i = 0, j = 0; i < out.length; i++, j += 2) {
+                const c1 = hex.charCodeAt(j);
+                const c2 = hex.charCodeAt(j + 1);
+
+                const hi = (c1 >= 48 && c1 <= 57) ? (c1 - 48)
+                    : ((c1 >= 65 && c1 <= 70) ? (c1 - 55)
+                        : ((c1 >= 97 && c1 <= 102) ? (c1 - 87) : -1));
+                const lo = (c2 >= 48 && c2 <= 57) ? (c2 - 48)
+                    : ((c2 >= 65 && c2 <= 70) ? (c2 - 55)
+                        : ((c2 >= 97 && c2 <= 102) ? (c2 - 87) : -1));
+
+                if (hi < 0 || lo < 0) {
+                    throw new Error('Invalid hex payload content at offset ' + absoluteOffsetForError);
+                }
+
+                out[i] = (hi << 4) | lo;
+            }
+
+            return out.buffer;
+        }
+
+        async function fetchRangeViaMseedChunk(fileName, offset, totalBytes, statusCallback) {
+            const encodedName = encodeURIComponent(fileName);
+            const chunkSize = 48 * 1024;
+            const maxRetriesPerChunk = 5;
+            const out = new Uint8Array(totalBytes);
+            let written = 0;
+
+            while (written < totalBytes) {
+                const absoluteOffset = offset + written;
+                const want = Math.min(chunkSize, totalBytes - written);
+                const url = '/mseedfile?file=' + encodedName + '&offset=' + absoluteOffset + '&bytes=' + want + '&ts=' + Date.now();
+
+                let payload = null;
+                let lastError = null;
+                for (let attempt = 1; attempt <= maxRetriesPerChunk; attempt++) {
+                    try {
+                        const response = await fetch(url, { cache: 'no-store' });
+                        if (!response.ok) {
+                            throw new Error('Chunk fetch failed (' + response.status + ') at offset ' + absoluteOffset);
+                        }
+                        payload = await response.json();
+                        if (!payload.ok) {
+                            throw new Error(payload.error || ('Chunk payload error at offset ' + absoluteOffset));
+                        }
+                        break;
+                    } catch (err) {
+                        lastError = err;
+                        if (attempt < maxRetriesPerChunk) {
+                            await new Promise(resolve => setTimeout(resolve, attempt * 250));
+                        }
+                    }
+                }
+
+                if (!payload) {
+                    throw new Error((lastError && lastError.message) ? lastError.message : ('Chunk fetch failed at offset ' + absoluteOffset));
+                }
+
+                const hex = payload.hex || '';
+                const decodedBuffer = decodeHexToArrayBuffer(hex, absoluteOffset);
+                const decoded = new Uint8Array(decodedBuffer);
+                const got = decoded.length;
+                if (got <= 0) {
+                    throw new Error('Empty chunk at offset ' + absoluteOffset);
+                }
+
+                const limit = Math.min(got, totalBytes - written);
+                out.set(decoded.subarray(0, limit), written);
+
+                written += limit;
+
+                if (typeof statusCallback === 'function') {
+                    statusCallback(written, totalBytes);
+                }
+
+                // Short chunks can be valid when endpoint-side caps are lower
+                // than requested size. Progress is tracked by actual received bytes.
+            }
+
+            return out.buffer;
+        }
+
+        async function buildAdvancedInfoHtml(file) {
+            const MAX_METADATA_BYTES = 256 * 1024; // 256 KB fast partial scan budget
+            const usePartial = file.size > MAX_METADATA_BYTES;
+            let info;
+
+            if (!usePartial) {
+                const arrayBuffer = await fetchRangeViaMseedChunk(file.name, 0, file.size);
+                info = parseMiniSeedV2Info(arrayBuffer, file.size);
+            } else {
+                const headBytes = Math.floor(MAX_METADATA_BYTES / 2);
+                const tailBytes = MAX_METADATA_BYTES - headBytes;
+                const tailOffset = file.size > tailBytes ? (file.size - tailBytes) : 0;
+
+                const rangeResults = await Promise.all([
+                    fetchRangeViaMseedChunk(file.name, 0, headBytes),
+                    fetchRangeViaMseedChunk(file.name, tailOffset, tailBytes)
+                ]);
+                const headBuffer = rangeResults[0];
+                const tailBuffer = rangeResults[1];
+                const headInfo = parseMiniSeedV2Info(headBuffer, file.size);
+                const tailInfo = parseMiniSeedV2Info(tailBuffer, file.size);
+
+                info = mergePartialScanInfo(headInfo, tailInfo, file.size, headBuffer.byteLength + tailBuffer.byteLength);
+            }
 
             let html = "<div class='file-info'>";
             html += "<h3>Parsed miniSEED Information</h3>";
             html += "<div class='stats-grid'>";
             html += "<div class='stats-card'><strong>Records (raw)</strong><br>" + info.recordCount + "</div>";
+            html += "<div class='stats-card'><strong>Records (scanned)</strong><br>" + info.parsedRecordCount + "</div>";
             html += "<div class='stats-card'><strong>Records (parsed)</strong><br>" + info.parsedRecords + "</div>";
             html += "<div class='stats-card'><strong>Number of Traces</strong><br>" + info.totalTraces + "</div>";
             html += "<div class='stats-card'><strong>Number of Channels</strong><br>" + info.totalChannels + "</div>";
             html += "</div>";
 
+            if (info.isPartial) {
+                const parsedMB = (info.parsedByteLength / (1024 * 1024)).toFixed(2);
+                const totalMB = (file.size / (1024 * 1024)).toFixed(2);
+                html += "<p class='info'>Large file optimization active: scanned " + parsedMB + " MB of " + totalMB + " MB. " +
+                    "Trace/channel metadata is representative and may be incomplete for the full file. End times are derived from file tail scan.</p>";
+            }
+
             html += "<p><strong>Included Channels:</strong> <span class='mono'>" + (info.channels.length ? info.channels.join(', ') : 'none detected') + "</span></p>";
 
             if (info.traces.length > 0) {
                 html += "<h4>Trace Durations</h4>";
+                html += "<p class='info'>Times shown in browser local timezone.</p>";
                 html += "<table class='trace-table'>";
-                html += "<thead><tr><th>Trace ID</th><th>Channel</th><th>Records</th><th>Duration</th><th>Start (UTC)</th><th>End (UTC)</th><th>Rate (Hz)</th></tr></thead><tbody>";
+                html += "<thead><tr><th>Trace ID</th><th>Channel</th><th>Records</th><th>Duration</th><th>Start (Local)</th><th>End (Local)</th><th>Rate (Hz)</th></tr></thead><tbody>";
                 for (let i = 0; i < info.traces.length; i++) {
                     const t = info.traces[i];
                     const rateText = t.rate > 0 ? t.rate.toFixed(2) : 'n/a';
@@ -471,9 +696,134 @@
             }
         }
 
-        function downloadFile(index) {
+        async function downloadFile(index) {
             const file = files[index];
-            window.location.href = '/mseedfile?file=' + encodeURIComponent(file.name);
+            if (!file) {
+                showError('Selected file not found.');
+                return;
+            }
+
+            const content = document.getElementById('content');
+            const statusId = 'downloadStatus';
+            let statusEl = document.getElementById(statusId);
+            if (!statusEl) {
+                statusEl = document.createElement('div');
+                statusEl.id = statusId;
+                statusEl.className = 'download-status';
+                content.insertBefore(statusEl, content.firstChild);
+            }
+
+            statusEl.innerHTML = '';
+            const titleEl = document.createElement('p');
+            titleEl.className = 'download-status-title';
+            titleEl.textContent = 'Preparing download...';
+            statusEl.appendChild(titleEl);
+
+            const progressTrackEl = document.createElement('div');
+            progressTrackEl.className = 'download-progress-track';
+            const progressFillEl = document.createElement('div');
+            progressFillEl.className = 'download-progress-fill';
+            progressTrackEl.appendChild(progressFillEl);
+            statusEl.appendChild(progressTrackEl);
+
+            const metaEl = document.createElement('p');
+            metaEl.className = 'download-status-meta mono';
+            statusEl.appendChild(metaEl);
+
+            function updateDownloadStatus(message, doneBytes) {
+                const safeDone = Math.max(0, Math.min(doneBytes || 0, file.size));
+                const percent = file.size > 0 ? (safeDone * 100.0 / file.size) : 0;
+                const elapsedSec = Math.max(0.001, (performance.now() - startedAtMs) / 1000.0);
+                const kbps = (safeDone / 1024.0) / elapsedSec;
+                progressFillEl.style.width = percent.toFixed(1) + '%';
+                titleEl.textContent = message;
+                metaEl.textContent =
+                    safeDone + ' / ' + file.size + ' bytes (' + percent.toFixed(1) + '%) | ' + kbps.toFixed(1) + ' kB/s';
+            }
+
+            const chunkSize = 48 * 1024;
+            const maxRetriesPerChunk = 5;
+            const encodedName = encodeURIComponent(file.name);
+            const chunks = [];
+            let offset = 0;
+            const startedAtMs = performance.now();
+
+            try {
+                updateDownloadStatus('Download started', 0);
+
+                while (offset < file.size) {
+                    const want = Math.min(chunkSize, file.size - offset);
+                    const url = '/mseedfile?file=' + encodedName + '&offset=' + offset + '&bytes=' + want + '&ts=' + Date.now();
+                    let arrayBuffer = null;
+                    let lastError = null;
+
+                    for (let attempt = 1; attempt <= maxRetriesPerChunk; attempt++) {
+                        try {
+                            const response = await fetch(url, { cache: 'no-store' });
+                            if (!response.ok) {
+                                throw new Error('Chunk fetch failed (' + response.status + ') at offset ' + offset);
+                            }
+                            const payload = await response.json();
+                            if (!payload.ok) {
+                                throw new Error(payload.error || ('Chunk payload error at offset ' + offset));
+                            }
+                            const hex = payload.hex || '';
+                            const hexLen = hex.length;
+                            if ((hexLen % 2) !== 0) {
+                                throw new Error('Invalid hex payload length at offset ' + offset);
+                            }
+                            const out = new Uint8Array(hexLen / 2);
+                            for (let i = 0; i < out.length; i++) {
+                                const hi = parseInt(hex.charAt(i * 2), 16);
+                                const lo = parseInt(hex.charAt(i * 2 + 1), 16);
+                                if (!Number.isFinite(hi) || !Number.isFinite(lo)) {
+                                    throw new Error('Invalid hex payload content at offset ' + offset);
+                                }
+                                out[i] = (hi << 4) | lo;
+                            }
+                            arrayBuffer = out.buffer;
+                            break;
+                        } catch (err) {
+                            lastError = err;
+                            if (attempt < maxRetriesPerChunk) {
+                                updateDownloadStatus('Retrying chunk at offset ' + offset + ' (attempt ' + (attempt + 1) + '/' + maxRetriesPerChunk + ')', offset);
+                                await new Promise(resolve => setTimeout(resolve, attempt * 250));
+                            }
+                        }
+                    }
+
+                    if (!arrayBuffer) {
+                        throw new Error((lastError && lastError.message) ? lastError.message : ('Chunk fetch failed at offset ' + offset));
+                    }
+
+                    const got = arrayBuffer.byteLength;
+                    if (got <= 0) {
+                        throw new Error('Empty chunk at offset ' + offset);
+                    }
+
+                    chunks.push(arrayBuffer);
+                    offset += got;
+                    updateDownloadStatus('Download in progress', offset);
+
+                    if (got < want && offset < file.size) {
+                        throw new Error('Short chunk at offset ' + (offset - got) + ' (' + got + '/' + want + ' bytes)');
+                    }
+                }
+
+                const blob = new Blob(chunks, { type: 'application/octet-stream' });
+                const link = document.createElement('a');
+                const blobUrl = URL.createObjectURL(blob);
+                link.href = blobUrl;
+                link.download = file.name;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(blobUrl);
+
+                updateDownloadStatus('Download complete', offset);
+            } catch (error) {
+                updateDownloadStatus('Download failed: ' + error.message, offset);
+            }
         }
 
         async function deleteTraceFile(index, returnToListAfterDelete = false) {

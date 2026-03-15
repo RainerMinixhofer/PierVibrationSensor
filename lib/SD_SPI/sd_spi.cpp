@@ -2677,6 +2677,7 @@ int sd_spi_read_from_handle(file_handle_t *handle, uint8_t *buffer, uint32_t siz
     uint32_t bytes_remaining = handle->file_size - handle->position;
     uint32_t bytes_to_read = (size < bytes_remaining) ? size : bytes_remaining;
     uint32_t bytes_read = 0;
+    uint8_t sector_buffer[512];
 
     while (bytes_read < bytes_to_read && handle->current_cluster < 0x0FFFFFF0)
     {
@@ -2695,16 +2696,25 @@ int sd_spi_read_from_handle(file_handle_t *handle, uint8_t *buffer, uint32_t siz
         // Read data sector by sector
         while (bytes_to_read_cluster > 0 && sector_in_cluster < handle->fs_info->sectors_per_cluster)
         {
-            uint8_t sector_buffer[512];
-            if (!sd_spi_read_block(cluster_sector + sector_in_cluster, sector_buffer))
-                return -1;
-
             uint32_t bytes_available = handle->fs_info->bytes_per_sector - byte_in_sector;
             uint32_t bytes_to_copy = (bytes_to_read_cluster < bytes_available)
                                          ? bytes_to_read_cluster
                                          : bytes_available;
 
-            memcpy(buffer + bytes_read, sector_buffer + byte_in_sector, bytes_to_copy);
+            // Fast path: fully aligned sector read goes directly into caller buffer.
+            // This avoids an extra 512-byte memcpy per sector during sequential downloads.
+            if (byte_in_sector == 0 && bytes_to_copy == handle->fs_info->bytes_per_sector)
+            {
+                if (!sd_spi_read_block(cluster_sector + sector_in_cluster, buffer + bytes_read))
+                    return -1;
+            }
+            else
+            {
+                if (!sd_spi_read_block(cluster_sector + sector_in_cluster, sector_buffer))
+                    return -1;
+                memcpy(buffer + bytes_read, sector_buffer + byte_in_sector, bytes_to_copy);
+            }
+
             bytes_read += bytes_to_copy;
             bytes_to_read_cluster -= bytes_to_copy;
             handle->position += bytes_to_copy;

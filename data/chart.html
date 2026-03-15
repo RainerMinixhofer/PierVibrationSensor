@@ -38,7 +38,7 @@
     }
 
     .chart-box {
-      margin-bottom: 40px;
+      margin-bottom: 18px;
     }
 
     #mac-field {
@@ -242,6 +242,9 @@
       <option value="3" selected>Info</option>
       <option value="4">Debug</option>
     </select>
+    <button id="timingToggleBtn" class="stream-btn disabled" onclick="toggleTimingLogs()"
+      title="Enable or disable serial TIMING: debug lines"
+      style="margin-left:8px; padding:4px 10px; font-size:0.9em;">Timing: OFF</button>
   </div>
   <div style="display: flex; align-items: flex-start;">
     <div style="margin-right: 20px;">
@@ -364,9 +367,12 @@
         <!-- VELOCITY_CHART_START -->
         <div class="chart-box">
           <div id="velocChart" style="width:100%;height:300px;"></div>
+          <div id="miniSeedRecDuration" style="margin-top: 8px; color: #555; font-size: 13px;">
+            miniSEED recording runtime: --
+          </div>
         </div>
         <!-- VELOCITY_CHART_END -->
-        <div class="pot-card" style="max-width: 900px; margin-top: 10px;">
+        <div class="pot-card" style="max-width: 900px; margin-top: 4px;">
           <h3 style="margin: 5px 0;">AD620 Gain/Offset Tuning</h3>
           <small style="color: #666; display: block; margin-bottom: 4px;">
             ADS ch0 uses pot ch0, ADS ch7 uses pot ch1.
@@ -473,6 +479,7 @@
 
     let miniSeedRecording = false;
     let miniSeedFormat = 'v2';
+    let timingLogsEnabled = false;
     let activeVelocLogStart = null;
     let velocLogIntervals = [];
     let lastVelocSampleTime = null;
@@ -499,6 +506,28 @@
       dataPollTimer = setTimeout(fetchData, dataPollIntervalMs);
     }
 
+    function setSDMountButtonState(isMounted, busy = false) {
+      const btn = document.getElementById('unmountBtn');
+      if (!btn) {
+        return;
+      }
+
+      btn.disabled = !!busy;
+      if (busy) {
+        btn.textContent = isMounted ? 'Unmounting...' : 'Mounting...';
+        btn.style.background = '#999';
+        return;
+      }
+
+      if (isMounted) {
+        btn.textContent = 'Unmount SD Card';
+        btn.style.background = '#ff9800';
+      } else {
+        btn.textContent = 'Mount SD Card';
+        btn.style.background = '#4caf50';
+      }
+    }
+
     function vecLength(v) {
       return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     }
@@ -508,7 +537,15 @@
       if (len < 1e-8) {
         return null;
       }
-      return { x: v.x / len, y: v.y / len, z: v.z / len };
+      return {
+        x: v.x / len,
+        y: v.y / len,
+        z: v.z / len
+      };
+    }
+
+    function vecDot(a, b) {
+      return a.x * b.x + a.y * b.y + a.z * b.z;
     }
 
     function vecCross(a, b) {
@@ -517,10 +554,6 @@
         y: a.z * b.x - a.x * b.z,
         z: a.x * b.y - a.y * b.x
       };
-    }
-
-    function vecDot(a, b) {
-      return a.x * b.x + a.y * b.y + a.z * b.z;
     }
 
     function worldFromBody(bodyVec, state) {
@@ -533,18 +566,15 @@
 
     function projectPoint(p, width, height) {
       // Camera south of scene looking North.
-      // World coords: x = South, y = East, z = Up (gravity = -z).
-      // Screen mapping: East (y) -> right, Up (z) -> screen-up, South (x) = depth toward viewer.
-      // Use weak perspective to avoid a strongly distorted box while preserving
-      // a small depth cue from South-axis movement.
+      // A small depth cue from South-axis movement.
       const camDist = 8.0;
       const focal = 130;
       const perspectiveStrength = 0.35; // 0 = orthographic, 1 = full perspective
       const depth = Math.max(0.6, camDist - p.x * perspectiveStrength);
       const s = focal / depth;
       return {
-        x: width * 0.5 + p.y * s,  // East  -> screen right
-        y: height * 0.58 - p.z * s,  // Up    -> screen up  (gravity=-z is screen-down)
+        x: width * 0.5 + p.y * s, // East -> screen right
+        y: height * 0.58 - p.z * s, // Up -> screen up (gravity=-z is screen-down)
         depth: depth
       };
     }
@@ -901,6 +931,120 @@
       }
     }
 
+    function setTimingButtonState(enabled) {
+      timingLogsEnabled = !!enabled;
+      const btn = document.getElementById('timingToggleBtn');
+      if (!btn) {
+        return;
+      }
+
+      if (timingLogsEnabled) {
+        btn.classList.remove('disabled');
+        btn.classList.add('enabled');
+        btn.textContent = 'Timing: ON';
+      } else {
+        btn.classList.remove('enabled');
+        btn.classList.add('disabled');
+        btn.textContent = 'Timing: OFF';
+      }
+    }
+
+    function parseTimingStateFromResponse(text) {
+      const match = String(text || '').match(/timingLogs\s*=\s*([01])/i);
+      if (match) {
+        setTimingButtonState(match[1] === '1');
+      }
+    }
+
+    function refreshTimingLogsState() {
+      fetch('/settiming')
+        .then(response => response.text())
+        .then(result => {
+          parseTimingStateFromResponse(result);
+        })
+        .catch(error => {
+          console.error('Error fetching timing log state:', error);
+        });
+    }
+
+    function toggleTimingLogs() {
+      const nextState = !timingLogsEnabled;
+      setTimingButtonState(nextState);
+      fetch('/settiming?enable=' + (nextState ? 1 : 0))
+        .then(response => response.text())
+        .then(result => {
+          parseTimingStateFromResponse(result);
+        })
+        .catch(error => {
+          console.error('Error toggling timing logs:', error);
+          setTimingButtonState(!nextState);
+        });
+    }
+
+    function formatMiniSeedDuration(seconds) {
+      const sec = Number(seconds);
+      if (!Number.isFinite(sec) || sec < 0) {
+        return '--';
+      }
+
+      const whole = Math.floor(sec);
+      if (whole < 60) {
+        return whole + ' s';
+      }
+      if (whole < 3600) {
+        const mm = Math.floor(whole / 60);
+        const ss = whole % 60;
+        return String(mm).padStart(2, '0') + ':' + String(ss).padStart(2, '0');
+      }
+
+      const hh = Math.floor(whole / 3600);
+      const mm = Math.floor((whole % 3600) / 60);
+      return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+    }
+
+    function formatMiniSeedTimestamp(epochSeconds, tzOffsetSeconds) {
+      const epoch = Number(epochSeconds);
+      const tz = Number(tzOffsetSeconds);
+      if (!Number.isFinite(epoch) || epoch <= 0) {
+        return '--';
+      }
+
+      const adjustedMs = (epoch + (Number.isFinite(tz) ? tz : 0)) * 1000;
+      const d = new Date(adjustedMs);
+      const yyyy = d.getUTCFullYear();
+      const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(d.getUTCDate()).padStart(2, '0');
+      const hh = String(d.getUTCHours()).padStart(2, '0');
+      const mi = String(d.getUTCMinutes()).padStart(2, '0');
+      const ss = String(d.getUTCSeconds()).padStart(2, '0');
+      return yyyy + '-' + mm + '-' + dd + ' ' + hh + ':' + mi + ':' + ss;
+    }
+
+    function updateMiniSeedDuration(recording, seconds, lastDurationSeconds, lastStartEpoch, lastEndEpoch, tzOffsetSeconds) {
+      const el = document.getElementById('miniSeedRecDuration');
+      if (!el) {
+        return;
+      }
+
+      if (recording) {
+        el.textContent = 'miniSEED recording runtime: ' + formatMiniSeedDuration(seconds);
+        return;
+      }
+
+      const hasLastData = Number.isFinite(Number(lastDurationSeconds)) && Number(lastDurationSeconds) >= 0 &&
+        (Number(lastStartEpoch) > 0 || Number(lastEndEpoch) > 0);
+      if (!hasLastData) {
+        el.textContent = 'miniSEED recording runtime: --';
+        return;
+      }
+
+      el.textContent =
+        'miniSEED last recording: ' +
+        formatMiniSeedDuration(lastDurationSeconds) +
+        ' | start: ' + formatMiniSeedTimestamp(lastStartEpoch, tzOffsetSeconds) +
+        ' | end: ' + formatMiniSeedTimestamp(lastEndEpoch, tzOffsetSeconds);
+    }
+
     function redrawVelocLogBands() {
       const axis = velocChart.xAxis[0];
       if (!axis) {
@@ -996,6 +1140,7 @@
       miniSeedRecording = !miniSeedRecording;
       const selectedFormat = document.getElementById('miniseedFormat').value;
       setMiniSeedButtonState(miniSeedRecording);
+      updateMiniSeedDuration(miniSeedRecording, 0);
       fetch('/miniseed?enable=' + (miniSeedRecording ? 1 : 0) + '&format=' + selectedFormat)
         .then(response => response.json())
         .then(result => {
@@ -1008,11 +1153,13 @@
 
           setMiniSeedButtonState(miniSeedRecording);
           updateVelocBg(miniSeedRecording);
+          updateMiniSeedDuration(miniSeedRecording, 0);
         })
         .catch(error => {
           console.error('Error toggling miniSEED:', error);
           miniSeedRecording = !miniSeedRecording;
           setMiniSeedButtonState(miniSeedRecording);
+          updateMiniSeedDuration(miniSeedRecording, 0);
         });
     }
 
@@ -1037,41 +1184,39 @@
 
     function unmountSDCard() {
       const btn = document.getElementById('unmountBtn');
-      btn.disabled = true;
-      btn.textContent = "Unmounting...";
-      btn.style.background = "#999";
+      const wasMounted = !!btn && btn.textContent.indexOf('Unmount') === 0;
+      setSDMountButtonState(wasMounted, true);
 
       fetch('/sdunmount')
         .then(response => response.json())
         .then(result => {
-          console.log('SD unmount result:', result);
+          console.log('SD mount toggle result:', result);
           if (result.success) {
-            btn.textContent = "✓ SD Card Unmounted";
-            btn.style.background = "#4caf50";
-            miniSeedRecording = false;
-            setMiniSeedButtonState(false);
-            updateVelocBg(false);
-            alert('SD card safely unmounted. You can now remove it.');
+            const isMounted = !!result.sdCardReady;
+            setSDMountButtonState(isMounted, false);
+            if (!isMounted) {
+              miniSeedRecording = false;
+              setMiniSeedButtonState(false);
+              updateVelocBg(false);
+              updateMiniSeedDuration(false, 0);
+            }
+            alert(result.message || (isMounted ? 'SD card mounted successfully.' : 'SD card safely unmounted.'));
           } else {
-            btn.textContent = "✗ Unmount Failed";
-            btn.style.background = "#f44336";
+            btn.textContent = wasMounted ? '✗ Unmount Failed' : '✗ Mount Failed';
+            btn.style.background = '#f44336';
             alert('Error: ' + (result.message || 'Unknown error'));
             setTimeout(() => {
-              btn.disabled = false;
-              btn.textContent = "Unmount SD Card";
-              btn.style.background = "#ff9800";
+              setSDMountButtonState(wasMounted, false);
             }, 3000);
           }
         })
         .catch(error => {
           console.error('Error unmounting SD card:', error);
-          btn.textContent = "✗ Network Error";
-          btn.style.background = "#f44336";
-          alert('Network error during unmount');
+          btn.textContent = '✗ Network Error';
+          btn.style.background = '#f44336';
+          alert('Network error while toggling SD card state');
           setTimeout(() => {
-            btn.disabled = false;
-            btn.textContent = "Unmount SD Card";
-            btn.style.background = "#ff9800";
+            setSDMountButtonState(wasMounted, false);
           }, 3000);
         });
     }
@@ -1207,8 +1352,7 @@
       },
       xAxis: {
         type: 'datetime',
-        tickPixelInterval: 150,
-        plotBands: []
+        tickPixelInterval: 150
       },
       yAxis: {
         title: {
@@ -1227,7 +1371,7 @@
       },
       series: [
         { name: 'Veloc X', data: [], color: 'blue' },
-        { name: 'Veloc Y', data: [], color: 'purple' }
+        { name: 'Veloc Y', data: [], color: 'red' }
       ]
     });
 
@@ -1235,15 +1379,15 @@
       const referenceTime = lastVelocSampleTime || Date.now();
 
       if (recording === velocBgRecordingState) {
+        if (recording && activeVelocLogStart === null) {
+          activeVelocLogStart = referenceTime;
+        }
         return;
       }
 
       velocBgRecordingState = recording;
-
       if (recording) {
-        if (activeVelocLogStart === null) {
-          activeVelocLogStart = referenceTime;
-        }
+        activeVelocLogStart = referenceTime;
       } else if (activeVelocLogStart !== null) {
         velocLogIntervals.push({
           start: activeVelocLogStart,
@@ -1394,10 +1538,25 @@
 
           updateUdpStreamsFromData(d);
 
+          if (d.sdCardReady !== undefined) {
+            setSDMountButtonState(!!d.sdCardReady, false);
+          }
+
           if (d.miniSeedRecording !== undefined) {
             miniSeedRecording = !!d.miniSeedRecording;
             setMiniSeedButtonState(miniSeedRecording);
             updateVelocBg(miniSeedRecording);
+          }
+
+          if (d.miniSeedRecordingSeconds !== undefined || d.miniSeedRecording !== undefined) {
+            updateMiniSeedDuration(
+              miniSeedRecording,
+              d.miniSeedRecordingSeconds,
+              d.miniSeedLastDurationSeconds,
+              d.miniSeedLastStartEpoch,
+              d.miniSeedLastEndEpoch,
+              d.tzoffset
+            );
           }
 
           if (d.miniSeedFormat) {
@@ -1424,6 +1583,7 @@
         .then(response => response.text())
         .then(result => {
           console.log('Log level set:', result);
+          parseTimingStateFromResponse(result);
         })
         .catch(error => {
           console.error('Error setting log level:', error);
@@ -1451,6 +1611,7 @@
     if (udpStatusLinkEl && window.location && window.location.host) {
       udpStatusLinkEl.href = 'http://' + window.location.host + '/udpstatus';
     }
+    refreshTimingLogsState();
     magCalAction('status');
     scheduleNextFetch();
   </script>

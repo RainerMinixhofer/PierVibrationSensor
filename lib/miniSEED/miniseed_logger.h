@@ -69,6 +69,16 @@ public:
     bool recordSample(const char *channel, int32_t sample, uint16_t sample_rate, time_t timestamp);
 
     /**
+     * @brief Record a sample with sub-second epoch precision.
+     * @param channel Channel code (e.g., "VEL_X", "VEL_Y")
+     * @param sample Raw 32-bit integer sample
+     * @param sample_rate Sampling rate in Hz
+     * @param timestamp_epoch Unix epoch seconds including fractional part
+     * @return true if recording successful
+     */
+    bool recordSample(const char *channel, int32_t sample, uint16_t sample_rate, double timestamp_epoch);
+
+    /**
      * @brief Batch record multiple samples (more efficient)
      * @param channel Channel code
      * @param samples Array of samples

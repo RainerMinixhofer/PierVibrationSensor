@@ -28,7 +28,8 @@ enum LogLevel
   LOG_INFO = 3,
   LOG_DEBUG = 4
 };
-int logVerbosity = LOG_INFO; // Set global log verbosity here
+int logVerbosity = LOG_INFO;            // Set global log verbosity here
+bool timingSerialOutputEnabled = false; // Runtime switch for TIMING: serial lines
 
 #include <Arduino.h>
 #include "pico/stdlib.h"     // <-- Add this include for Pico SDK functions
@@ -485,10 +486,14 @@ volatile uint32_t udpPacketsSent[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 volatile uint32_t udpPacketsDropped[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 // --- miniSEED Recording Control (Raspberry Shake compatible data format) ---
-MinISeedLogger miniSeedLogger;                  ///< miniSEED logger for Raspberry Shake compatible data storage
-fs_info_t sd_fs_info;                           ///< Global filesystem info for miniSEED file I/O
-volatile bool miniSeedRecordingEnabled = false; ///< Global flag to control miniSEED recording
-volatile bool sd_card_ready = false;            ///< Global flag indicating SD card is mounted and ready
+MinISeedLogger miniSeedLogger;                     ///< miniSEED logger for Raspberry Shake compatible data storage
+fs_info_t sd_fs_info;                              ///< Global filesystem info for miniSEED file I/O
+volatile bool miniSeedRecordingEnabled = false;    ///< Global flag to control miniSEED recording
+volatile uint32_t miniSeedRecordingStartMs = 0;    ///< Millis timestamp when current miniSEED recording session started
+volatile uint32_t miniSeedLastDurationSeconds = 0; ///< Duration in seconds of the last completed miniSEED recording
+volatile time_t miniSeedLastStartEpoch = 0;        ///< Unix epoch seconds for the start of the last completed recording
+volatile time_t miniSeedLastEndEpoch = 0;          ///< Unix epoch seconds for the end of the last completed recording
+volatile bool sd_card_ready = false;               ///< Global flag indicating SD card is mounted and ready
 
 static void stopMiniSeedRecording(const char *reason)
 {
@@ -498,10 +503,76 @@ static void stopMiniSeedRecording(const char *reason)
     Serial.println(reason);
   }
 
+  if (miniSeedRecordingEnabled || miniSeedRecordingStartMs != 0)
+  {
+    const uint32_t stopMs = millis();
+    const uint32_t startMs = miniSeedRecordingStartMs;
+    uint32_t elapsedSeconds = 0;
+    if (startMs > 0 && stopMs >= startMs)
+    {
+      elapsedSeconds = (stopMs - startMs) / 1000UL;
+    }
+
+    miniSeedLastDurationSeconds = elapsedSeconds;
+
+    const time_t stopEpoch = time(nullptr);
+    if (stopEpoch > 0)
+    {
+      miniSeedLastEndEpoch = stopEpoch;
+      miniSeedLastStartEpoch = stopEpoch - (time_t)elapsedSeconds;
+    }
+    else
+    {
+      miniSeedLastStartEpoch = 0;
+      miniSeedLastEndEpoch = 0;
+    }
+  }
+
   // Disable first to prevent new writes, then close buffered data immediately.
   miniSeedRecordingEnabled = false;
+  miniSeedRecordingStartMs = 0;
+
+  bool closed = false;
+  for (int attempt = 0; attempt < 3; ++attempt)
+  {
+    if (miniSeedLogger.closeFile())
+    {
+      closed = true;
+      break;
+    }
+
+    // Short backoff for transient SD/FAT contention before retrying final flush.
+    delay(20);
+  }
+
   miniSeedLogger.setRecordingEnabled(false);
-  miniSeedLogger.closeFile();
+
+  if (!closed)
+  {
+    Serial.println("WARNING: miniSEED close/flush failed after retries; tail data may be incomplete");
+  }
+}
+
+static double currentEpochSecondsPrecise()
+{
+  static time_t anchorEpochSeconds = 0;
+  static unsigned long anchorMillis = 0;
+
+  const time_t nowSeconds = time(nullptr);
+  const unsigned long nowMillis = millis();
+
+  if (nowSeconds <= 0)
+  {
+    return (double)nowMillis / 1000.0;
+  }
+
+  if (anchorEpochSeconds == 0 || nowSeconds != anchorEpochSeconds)
+  {
+    anchorEpochSeconds = nowSeconds;
+    anchorMillis = nowMillis;
+  }
+
+  return (double)anchorEpochSeconds + ((double)(nowMillis - anchorMillis) / 1000.0);
 }
 
 // --- Display Mode and State ---
@@ -764,6 +835,12 @@ inline void debugSerialPrintln(double val) { Serial.println(val); }
 inline void debugSerialPrintln(char val) { Serial.println(val); }
 inline void debugSerialPrintf(const char *fmt, ...)
 {
+  // Keep regular logs, but allow suppressing noisy timing traces at runtime.
+  if (!timingSerialOutputEnabled && fmt && strncmp(fmt, "TIMING:", 7) == 0)
+  {
+    return;
+  }
+
   char buffer[256];
   va_list args;
   va_start(args, fmt);
@@ -1049,24 +1126,35 @@ static void log_wiznet_spi_speed(const char *tag)
 // SD CARD FUNCTIONS
 // ============================================================================
 
-void initSDCard()
+static bool mountSDCard(String *statusMessage = nullptr, bool verbose = true)
 {
-  Serial.println("\n=== SD Card Initialization ===");
-  debugSerialPrintln("Initializing SD card...");
+  if (verbose)
+  {
+    Serial.println("\n=== SD Card Initialization ===");
+    debugSerialPrintln("Initializing SD card...");
+  }
 
   // Initialize LittleFS
   if (!LittleFS.begin())
   {
     debugSerialPrintln("Failed to mount LittleFS!");
-    return;
+    if (statusMessage)
+      *statusMessage = "Failed to mount LittleFS";
+    return false;
   }
-  debugSerialPrintln("LittleFS mounted successfully.");
+  if (verbose)
+  {
+    debugSerialPrintln("LittleFS mounted successfully.");
+  }
 
   // Initialize SD card via low-level SPI driver (proven working method from test suite)
-  Serial.println("Attempting SD card initialization...");
-  Serial.println("NOTE: This may take 10-30 seconds if no SD card is inserted.");
-  Serial.println("Please wait - system will continue automatically after timeout.");
-  Serial.flush();
+  if (verbose)
+  {
+    Serial.println("Attempting SD card initialization...");
+    Serial.println("NOTE: This may take 10-30 seconds if no SD card is inserted.");
+    Serial.println("Please wait - system will continue automatically after timeout.");
+    Serial.flush();
+  }
 
   unsigned long sd_start = millis();
   bool sd_card_available = sd_spi_init();
@@ -1075,48 +1163,65 @@ void initSDCard()
   if (!sd_card_available)
   {
     debugSerialPrintf("SD card initialization failed after %lu ms (no card inserted or card error)\n", init_time);
-    debugSerialPrintln("Continuing without SD card support...");
-    Serial.flush();
-    return;
+    if (verbose)
+    {
+      debugSerialPrintln("Continuing without SD card support...");
+      Serial.flush();
+    }
+    if (statusMessage)
+      *statusMessage = "SD card initialization failed";
+    return false;
   }
 
-  debugSerialPrintf("SD card detected in %lu ms\n", init_time);
+  if (verbose)
+  {
+    debugSerialPrintf("SD card detected in %lu ms\n", init_time);
+  }
 
   // Get card status
   uint8_t status = sd_spi_get_status();
-  Serial.print("Card Status: 0x");
-  Serial.println(status, HEX);
+  if (verbose)
+  {
+    Serial.print("Card Status: 0x");
+    Serial.println(status, HEX);
+  }
 
   // Get and display card type
   const char *card_type_str = sd_spi_get_card_type_string();
-  Serial.print("Card Type: ");
-  Serial.println(card_type_str);
+  if (verbose)
+  {
+    Serial.print("Card Type: ");
+    Serial.println(card_type_str);
+  }
 
   // Read OCR for card capacity information
   uint32_t ocr = 0;
   if (sd_spi_read_ocr(&ocr))
   {
-    Serial.println("\nOCR (Operating Conditions Register):");
-    Serial.print("  Power Up Status: ");
-    Serial.println((ocr & 0x80000000) ? "Complete" : "Busy");
-
-    // Determine card capacity type
-    Serial.print("  Card Capacity Status: ");
-    if (ocr & 0x40000000)
+    if (verbose)
     {
-      uint64_t capacity = sd_spi_get_capacity();
-      if (capacity > (32LL * 1024 * 1024 * 1024))
+      Serial.println("\nOCR (Operating Conditions Register):");
+      Serial.print("  Power Up Status: ");
+      Serial.println((ocr & 0x80000000) ? "Complete" : "Busy");
+
+      // Determine card capacity type
+      Serial.print("  Card Capacity Status: ");
+      if (ocr & 0x40000000)
       {
-        Serial.println("SDXC (>32GB)");
+        uint64_t capacity = sd_spi_get_capacity();
+        if (capacity > (32LL * 1024 * 1024 * 1024))
+        {
+          Serial.println("SDXC (>32GB)");
+        }
+        else
+        {
+          Serial.println("SDHC (2GB-32GB)");
+        }
       }
       else
       {
-        Serial.println("SDHC (2GB-32GB)");
+        Serial.println("SDSC (<2GB)");
       }
-    }
-    else
-    {
-      Serial.println("SDSC (<2GB)");
     }
   }
 
@@ -1126,98 +1231,112 @@ void initSDCard()
 
   if (!fs_identified)
   {
-    Serial.println("Failed to identify filesystem!");
-    return;
+    if (verbose)
+    {
+      Serial.println("Failed to identify filesystem!");
+    }
+    if (statusMessage)
+      *statusMessage = "Failed to identify SD filesystem";
+    return false;
   }
 
   // Display filesystem information
   const char *fs_type = sd_spi_get_fs_type_string(fs_info.type);
-  Serial.print("\nFile System Type: ");
-  Serial.println(fs_type);
-
-  Serial.println("Filesystem Details:");
-  Serial.print("  Bytes per Sector: ");
-  Serial.println(fs_info.bytes_per_sector);
-  Serial.print("  Sectors per Cluster: ");
-  Serial.println(fs_info.sectors_per_cluster);
-  Serial.print("  FAT Count: ");
-  Serial.println(fs_info.fat_count);
-  Serial.print("  Cluster Count: ");
-  Serial.println(fs_info.cluster_count);
-
-  // Calculate and display filesystem size
-  uint64_t fs_size = (uint64_t)fs_info.total_sectors * fs_info.bytes_per_sector;
-  Serial.print("  Total Size: ");
-  if (fs_size >= (1024LL * 1024 * 1024))
+  if (verbose)
   {
-    Serial.print(fs_size / (1024LL * 1024 * 1024));
-    Serial.println(" GB");
-  }
-  else if (fs_size >= (1024 * 1024))
-  {
-    Serial.print(fs_size / (1024 * 1024));
-    Serial.println(" MB");
-  }
-  else
-  {
-    Serial.print(fs_size / 1024);
-    Serial.println(" KB");
-  }
+    Serial.print("\nFile System Type: ");
+    Serial.println(fs_type);
 
-  // Read and display root directory
-  Serial.println("\nReading Root Directory:");
+    Serial.println("Filesystem Details:");
+    Serial.print("  Bytes per Sector: ");
+    Serial.println(fs_info.bytes_per_sector);
+    Serial.print("  Sectors per Cluster: ");
+    Serial.println(fs_info.sectors_per_cluster);
+    Serial.print("  FAT Count: ");
+    Serial.println(fs_info.fat_count);
+    Serial.print("  Cluster Count: ");
+    Serial.println(fs_info.cluster_count);
+
+    // Calculate and display filesystem size
+    uint64_t fs_size = (uint64_t)fs_info.total_sectors * fs_info.bytes_per_sector;
+    Serial.print("  Total Size: ");
+    if (fs_size >= (1024LL * 1024 * 1024))
+    {
+      Serial.print(fs_size / (1024LL * 1024 * 1024));
+      Serial.println(" GB");
+    }
+    else if (fs_size >= (1024 * 1024))
+    {
+      Serial.print(fs_size / (1024 * 1024));
+      Serial.println(" MB");
+    }
+    else
+    {
+      Serial.print(fs_size / 1024);
+      Serial.println(" KB");
+    }
+
+    // Read and display root directory
+    Serial.println("\nReading Root Directory:");
+  }
 
   dirent_t directory[32];
   int entry_count = sd_spi_read_directory(&fs_info, directory, 32);
 
   if (entry_count < 0)
   {
-    Serial.println("Failed to read directory!");
-    return;
-  }
-
-  Serial.print("Found ");
-  Serial.print(entry_count);
-  Serial.println(" entries:");
-
-  if (entry_count == 0)
-  {
-    Serial.println("  (empty directory)");
-  }
-  else
-  {
-    // Display directory entries
-    for (int i = 0; i < entry_count && i < 32; i++)
+    if (verbose)
     {
-      Serial.print("  ");
-      Serial.print(i + 1);
-      Serial.print(". ");
-      Serial.print(directory[i].filename);
+      Serial.println("Failed to read directory!");
+    }
+    if (statusMessage)
+      *statusMessage = "Failed to read SD root directory";
+    return false;
+  }
 
-      // Pad filename for alignment
-      int name_len = strlen(directory[i].filename);
-      if (name_len < 35)
-      {
-        for (int j = name_len; j < 35; j++)
-          Serial.print(" ");
-      }
-      else
-      {
-        Serial.println();
-        Serial.print("     ");
-      }
+  if (verbose)
+  {
+    Serial.print("Found ");
+    Serial.print(entry_count);
+    Serial.println(" entries:");
 
-      // Display attributes and size
-      Serial.print(" [");
-      if (directory[i].attributes & 0x10)
-        Serial.print("DIR");
-      else
+    if (entry_count == 0)
+    {
+      Serial.println("  (empty directory)");
+    }
+    else
+    {
+      // Display directory entries
+      for (int i = 0; i < entry_count && i < 32; i++)
       {
-        Serial.print("FILE ");
-        Serial.print(directory[i].file_size);
-        Serial.print("B");
+        Serial.print("  ");
+        Serial.print(i + 1);
+        Serial.print(". ");
+        Serial.print(directory[i].filename);
+
+        int name_len = strlen(directory[i].filename);
+        if (name_len < 35)
+        {
+          for (int j = name_len; j < 35; j++)
+            Serial.print(" ");
+        }
+        else
+        {
+          Serial.println();
+          Serial.print("     ");
+        }
+
+        Serial.print(" [");
+        if (directory[i].attributes & 0x10)
+          Serial.print("DIR");
+        else
+        {
+          Serial.print("FILE ");
+          Serial.print(directory[i].file_size);
+          Serial.print("B");
+        }
+        Serial.println("]");
       }
-      Serial.println("]");
     }
   }
 
@@ -1228,49 +1347,71 @@ void initSDCard()
   sd_card_ready = true;
 
   // Create directory structure for miniSEED data logging
-  Serial.println("\nCreating directory structure for miniSEED logging...");
+  if (verbose)
+  {
+    Serial.println("\nCreating directory structure for miniSEED logging...");
+  }
 
   // Create /data directory
   if (sd_spi_directory_exists(&fs_info, "/data"))
   {
-    Serial.println("  /data directory already exists");
+    if (verbose)
+      Serial.println("  /data directory already exists");
   }
   else
   {
     if (sd_spi_create_directory(&fs_info, "/data"))
     {
-      Serial.println("  Created /data directory");
+      if (verbose)
+        Serial.println("  Created /data directory");
     }
     else
     {
-      Serial.println("  WARNING: Failed to create /data directory");
+      if (verbose)
+        Serial.println("  WARNING: Failed to create /data directory");
     }
   }
 
   // Create /data/miniseed directory
   if (sd_spi_directory_exists(&fs_info, "/data/miniseed"))
   {
-    Serial.println("  /data/miniseed directory already exists");
+    if (verbose)
+      Serial.println("  /data/miniseed directory already exists");
   }
   else
   {
     if (sd_spi_create_directory(&fs_info, "/data/miniseed"))
     {
-      Serial.println("  Created /data/miniseed directory");
+      if (verbose)
+        Serial.println("  Created /data/miniseed directory");
     }
     else
     {
-      Serial.println("  WARNING: Failed to create /data/miniseed directory");
+      if (verbose)
+        Serial.println("  WARNING: Failed to create /data/miniseed directory");
     }
   }
 
   // Initialize miniSEED logger with hierarchical directory support
   miniSeedLogger.init(&sd_fs_info, "PIER1", "XX", "/data/miniseed");
 
-  Serial.println("miniSEED recording will write files to /data/miniseed directory");
-  Serial.println("=== SD Card and Filesystem Ready ===");
+  if (verbose)
+  {
+    Serial.println("miniSEED recording will write files to /data/miniseed directory");
+    Serial.println("=== SD Card and Filesystem Ready ===");
+  }
 
   debugSerialPrintln("miniSEED logger ready");
+
+  if (statusMessage)
+    *statusMessage = "SD card mounted successfully";
+
+  return true;
+}
+
+void initSDCard()
+{
+  (void)mountSDCard(nullptr, true);
 }
 
 void disableSDCard()
@@ -1648,7 +1789,32 @@ void serveSetLogLevel(Stream &client, const String &req)
   client.println("Content-Type: text/plain");
   client.println("Connection: close");
   client.println();
-  client.printf("OK logVerbosity=%d\n", logVerbosity);
+  client.printf("OK logVerbosity=%d timingLogs=%d\n", logVerbosity,
+                timingSerialOutputEnabled ? 1 : 0);
+}
+
+/*
+Handler for enabling/disabling TIMING serial output via HTTP
+Usage: /settiming?enable=1 or /settiming?enable=0
+*/
+void serveSetTiming(Stream &client, const String &req)
+{
+  int enableIdx = req.indexOf("enable=");
+  if (enableIdx != -1)
+  {
+    String enableStr = req.substring(enableIdx + 7);
+    int endIdx = 0;
+    while (endIdx < enableStr.length() && (isdigit(enableStr.charAt(endIdx)) || enableStr.charAt(endIdx) == '-'))
+      endIdx++;
+    enableStr = enableStr.substring(0, endIdx);
+    timingSerialOutputEnabled = (enableStr.toInt() != 0);
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/plain");
+  client.println("Connection: close");
+  client.println();
+  client.printf("OK timingLogs=%d\n", timingSerialOutputEnabled ? 1 : 0);
 }
 
 /**
@@ -1723,30 +1889,46 @@ void serveMinISeedControl(Stream &client, const String &req)
 }
 
 /**
- * @brief Handler for safely unmounting SD card via HTTP
+ * @brief Handler for toggling SD card mount state via HTTP
  * @param client Output stream for HTTP response
  * @param req Request string (unused)
  */
 void serveSDUnmount(Stream &client, const String &req)
 {
-  debugSerialPrintln("HTTP: SD Card unmount requested");
+  debugSerialPrintln("HTTP: SD Card mount toggle requested");
 
-  bool success = true;
+  bool success = false;
   String message = "";
+  bool mountedState = sd_card_ready;
 
-  // Always stop recording and close immediately before unmount.
-  stopMiniSeedRecording("SD unmount request");
+  if (sd_card_ready)
+  {
+    // Always stop recording and close immediately before unmount.
+    stopMiniSeedRecording("SD unmount request");
 
-  // Stop SD-backed operations. SD_SPI is stateless, so no explicit unmount call is needed.
-  debugSerialPrintln("  Releasing SD card for safe removal...");
+    // Stop SD-backed operations. SD_SPI is stateless, so no explicit unmount call is needed.
+    debugSerialPrintln("  Releasing SD card for safe removal...");
 
-  // Small delay to ensure all operations complete
-  delay(100);
+    // Small delay to ensure all operations complete
+    delay(100);
 
-  sd_card_ready = false;
+    sd_card_ready = false;
+    success = true;
+    mountedState = false;
 
-  debugSerialPrintln("  SD card safely unmounted");
-  message = "SD card safely unmounted. You can now remove it.";
+    debugSerialPrintln("  SD card safely unmounted");
+    message = "SD card safely unmounted. You can now remove it.";
+  }
+  else
+  {
+    debugSerialPrintln("  Attempting to mount SD card...");
+    success = mountSDCard(&message, true);
+    mountedState = success;
+    if (!success && message.length() == 0)
+    {
+      message = "Failed to mount SD card";
+    }
+  }
 
   // Send JSON response
   client.println("HTTP/1.1 200 OK");
@@ -1757,7 +1939,11 @@ void serveSDUnmount(Stream &client, const String &req)
   client.print(success ? "true" : "false");
   client.print(",\"message\":\"");
   client.print(message);
-  client.print("\",\"miniSeedRecording\":false,\"sdCardReady\":false,\"miniSeedFormat\":\"");
+  client.print("\",\"miniSeedRecording\":");
+  client.print(miniSeedRecordingEnabled ? "true" : "false");
+  client.print(",\"sdCardReady\":");
+  client.print(mountedState ? "true" : "false");
+  client.print(",\"miniSeedFormat\":\"");
   client.print(miniSeedLogger.getFormatString());
   client.println("\"}");
 }
@@ -1860,24 +2046,34 @@ void serveMseedFileList(Stream &client, const String &req)
   client.println("]}");
 }
 
+void serveMseedChunk(Stream &client, const String &req);
+
 /**
  * @brief Handler for serving a specific mseed file via HTTP
  * @param client Output stream for HTTP response
- * @param req Request string containing filename parameter
+ * @param req Request string containing filename/offset/bytes parameters
  */
-void serveMseedFile(Stream &client, const String &req)
+void serveMseedFile(Client &client, const String &req)
 {
-  debugSerialPrintln("HTTP: Serving mseed file");
+  // /mseedfile now uses the robust JSON-hex chunk transport.
+  serveMseedChunk(client, req);
+}
 
-  // Extract filename parameter
+/**
+ * @brief Serve a miniSEED chunk as JSON-hex payload for robust browser downloads
+ * @param client Output stream for HTTP response
+ * @param req Request string containing file/offset/bytes parameters
+ */
+void serveMseedChunk(Stream &client, const String &req)
+{
   int fileIdx = req.indexOf("file=");
   if (fileIdx == -1)
   {
     client.println("HTTP/1.1 400 Bad Request");
-    client.println("Content-Type: text/html");
+    client.println("Content-Type: application/json");
     client.println("Connection: close");
     client.println();
-    client.println("<html><body><h2>Error: Missing file parameter</h2></body></html>");
+    client.println("{\"ok\":false,\"error\":\"Missing file parameter\"}");
     return;
   }
 
@@ -1888,87 +2084,140 @@ void serveMseedFile(Stream &client, const String &req)
   int spaceIdx = filename.indexOf(' ');
   if (spaceIdx != -1)
     filename = filename.substring(0, spaceIdx);
-
-  // URL decode filename (basic implementation)
   filename.replace("%20", " ");
   filename.replace("%2F", "/");
 
-  debugSerialPrintf("  Requested file: %s\n", filename.c_str());
+  uint32_t requestedOffset = 0;
+  int offsetIdx = req.indexOf("offset=");
+  if (offsetIdx != -1)
+  {
+    String offsetToken = req.substring(offsetIdx + 7);
+    int offsetEnd = offsetToken.indexOf('&');
+    if (offsetEnd != -1)
+      offsetToken = offsetToken.substring(0, offsetEnd);
+    int offsetSpace = offsetToken.indexOf(' ');
+    if (offsetSpace != -1)
+      offsetToken = offsetToken.substring(0, offsetSpace);
+    bool numeric = offsetToken.length() > 0;
+    for (unsigned int i = 0; i < offsetToken.length() && numeric; i++)
+    {
+      char c = offsetToken.charAt(i);
+      if (c < '0' || c > '9')
+        numeric = false;
+    }
+    if (numeric)
+      requestedOffset = (uint32_t)offsetToken.toInt();
+  }
+
+  uint32_t requestedBytes = 49152;
+  int bytesIdx = req.indexOf("bytes=");
+  if (bytesIdx != -1)
+  {
+    String bytesToken = req.substring(bytesIdx + 6);
+    int bytesEnd = bytesToken.indexOf('&');
+    if (bytesEnd != -1)
+      bytesToken = bytesToken.substring(0, bytesEnd);
+    int bytesSpace = bytesToken.indexOf(' ');
+    if (bytesSpace != -1)
+      bytesToken = bytesToken.substring(0, bytesSpace);
+    bool numeric = bytesToken.length() > 0;
+    for (unsigned int i = 0; i < bytesToken.length() && numeric; i++)
+    {
+      char c = bytesToken.charAt(i);
+      if (c < '0' || c > '9')
+        numeric = false;
+    }
+    if (numeric)
+      requestedBytes = (uint32_t)bytesToken.toInt();
+  }
+
+  if (requestedBytes == 0)
+    requestedBytes = 1;
+  if (requestedBytes > 49152)
+    requestedBytes = 49152;
 
   if (!sd_card_ready)
   {
     client.println("HTTP/1.1 503 Service Unavailable");
-    client.println("Content-Type: text/html");
+    client.println("Content-Type: application/json");
     client.println("Connection: close");
     client.println();
-    client.println("<html><body><h2>Error: SD card not ready</h2></body></html>");
+    client.println("{\"ok\":false,\"error\":\"SD card not ready\"}");
     return;
   }
 
-  // Build full path
   String fullPath = "/data/miniseed/" + filename;
-
   uint32_t fileSize = 0;
   if (!sd_spi_get_file_size(&sd_fs_info, fullPath.c_str(), &fileSize))
   {
     client.println("HTTP/1.1 404 Not Found");
-    client.println("Content-Type: text/html");
+    client.println("Content-Type: application/json");
     client.println("Connection: close");
     client.println();
-    client.println("<html><body><h2>Error: File not found</h2></body></html>");
+    client.println("{\"ok\":false,\"error\":\"File not found\"}");
     return;
   }
 
-  // Send file with appropriate headers
+  uint32_t startOffset = requestedOffset;
+  if (startOffset > fileSize)
+    startOffset = fileSize;
+
+  uint32_t bytesAvailable = fileSize - startOffset;
+  uint32_t bytesToRead = requestedBytes;
+  if (bytesToRead > bytesAvailable)
+    bytesToRead = bytesAvailable;
+
+  static uint8_t buf[49152];
+  int n = 0;
+  if (bytesToRead > 0)
+  {
+    releaseSPIBus();
+    n = sd_spi_read_file_chunk(&sd_fs_info, fullPath.c_str(), startOffset, buf, bytesToRead);
+    if (n < 0)
+      n = 0;
+  }
+
+  static const char hexDigits[] = "0123456789ABCDEF";
+
   client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: application/octet-stream");
-  client.print("Content-Disposition: attachment; filename=\"");
-  client.print(filename);
-  client.println("\"");
-  client.print("Content-Length: ");
-  client.println((unsigned long)fileSize);
+  client.println("Content-Type: application/json");
+  client.println("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+  client.println("Pragma: no-cache");
+  client.println("Expires: 0");
   client.println("Connection: close");
   client.println();
 
-  // Open file with optimized handle for sequential reading
-  file_handle_t file_handle;
-  if (!sd_spi_open_file(&sd_fs_info, fullPath.c_str(), &file_handle))
+  client.print("{\"ok\":true,\"file\":\"");
+  client.print(filename);
+  client.print("\",\"offset\":");
+  client.print((unsigned long)startOffset);
+  client.print(",\"fileSize\":");
+  client.print((unsigned long)fileSize);
+  client.print(",\"bytes\":");
+  client.print(n);
+  client.print(",\"hex\":\"");
+
+  char hexOut[256];
+  int hexPos = 0;
+  for (int i = 0; i < n; i++)
   {
-    debugSerialPrintln("  ERROR: Failed to open file handle");
-    return;
+    uint8_t b = buf[i];
+    hexOut[hexPos++] = hexDigits[(b >> 4) & 0x0F];
+    hexOut[hexPos++] = hexDigits[b & 0x0F];
+
+    if (hexPos >= (int)sizeof(hexOut) - 2)
+    {
+      client.write((const uint8_t *)hexOut, (size_t)hexPos);
+      hexPos = 0;
+      yield();
+    }
+  }
+  if (hexPos > 0)
+  {
+    client.write((const uint8_t *)hexOut, (size_t)hexPos);
   }
 
-  // Stream file content in larger chunks for much better performance
-  // Use 4KB buffer (8x larger than before) for 8x fewer SD operations
-  const uint32_t bufSize = 4096;
-  static uint8_t buf[4096]; // Static to avoid stack overflow
-  uint32_t totalSent = 0;
-  unsigned long startTime = millis();
-
-  while (totalSent < fileSize)
-  {
-    int n = sd_spi_read_from_handle(&file_handle, buf, bufSize);
-    if (n <= 0)
-      break;
-
-    client.write(buf, n);
-    totalSent += (uint32_t)n;
-  }
-
-  sd_spi_close_file(&file_handle);
-
-  unsigned long duration = millis() - startTime;
-  if (totalSent != fileSize)
-  {
-    debugSerialPrintf("  WARNING: Sent %lu/%lu bytes for %s\n", (unsigned long)totalSent,
-                      (unsigned long)fileSize, fullPath.c_str());
-  }
-  else
-  {
-    float throughput = (totalSent / 1024.0f) / (duration / 1000.0f);
-    debugSerialPrintf("  File sent successfully: %lu bytes in %lu ms (%.1f KB/s)\n",
-                      (unsigned long)totalSent, duration, throughput);
-  }
+  client.println("\"}");
 }
 
 /**
@@ -3906,7 +4155,21 @@ void serveSensorData(Stream &client)
   float magXCal = 0.0f;
   float magYCal = 0.0f;
   float magZCal = 0.0f;
+  uint32_t miniSeedRecordingSeconds = 0;
   applyMagCalibration(magData.magnetic.x, magData.magnetic.y, magData.magnetic.z, magXCal, magYCal, magZCal);
+
+  if (miniSeedRecordingEnabled)
+  {
+    if (miniSeedRecordingStartMs == 0)
+    {
+      miniSeedRecordingStartMs = millis();
+    }
+    miniSeedRecordingSeconds = (uint32_t)((millis() - miniSeedRecordingStartMs) / 1000UL);
+  }
+  else
+  {
+    miniSeedRecordingStartMs = 0;
+  }
 
   // Send JSON in parts to avoid stack issues with large snprintf
   client.print("{");
@@ -3988,6 +4251,14 @@ void serveSensorData(Stream &client)
   client.print((unsigned long)highchartsLastReport);
   client.print(",\"miniSeedRecording\":");
   client.print(miniSeedRecordingEnabled ? "true" : "false");
+  client.print(",\"miniSeedRecordingSeconds\":");
+  client.print((unsigned long)miniSeedRecordingSeconds);
+  client.print(",\"miniSeedLastDurationSeconds\":");
+  client.print((unsigned long)miniSeedLastDurationSeconds);
+  client.print(",\"miniSeedLastStartEpoch\":");
+  client.print((long)miniSeedLastStartEpoch);
+  client.print(",\"miniSeedLastEndEpoch\":");
+  client.print((long)miniSeedLastEndEpoch);
   client.print(",\"miniSeedFormat\":\"");
   client.print(miniSeedLogger.getFormatString());
   client.print("\"");
@@ -6431,7 +6702,7 @@ void loop()
   // Data format: int32_t with standardized units for seismic compatibility
   if (miniSeedRecordingEnabled && sd_card_ready)
   {
-    time_t now = time(nullptr);
+    const double nowEpoch = currentEpochSecondsPrecise();
 
     static uint32_t record_err_count = 0;
     static unsigned long last_record_warning = 0;
@@ -6441,9 +6712,9 @@ void loop()
     // Scaling: 1 count ≈ 0.596 nV per LSB (from ADS1256 datasheet with Vref=2.5V, PGA=1)
     // Raw counts preserve full ADC resolution for post-processing calibration
     // Direct call on Core 0 - no queue, no cross-core races.
-    if (!miniSeedLogger.recordSample("VEL_X", (int32_t)adcValue0, 500, now))
+    if (!miniSeedLogger.recordSample("VEL_X", (int32_t)adcValue0, 500, nowEpoch))
       record_ok = false;
-    if (!miniSeedLogger.recordSample("VEL_Y", (int32_t)adcValue7, 500, now))
+    if (!miniSeedLogger.recordSample("VEL_Y", (int32_t)adcValue7, 500, nowEpoch))
       record_ok = false;
 
     if (icmDetected && icm_read_counter == 0) // Record IMU data every 5th sample (40 Hz)
@@ -6455,11 +6726,11 @@ void loop()
       int32_t acc_y_ug = (int32_t)(accelData.acceleration.y * 1000000.0f / 9.80665f);
       int32_t acc_z_ug = (int32_t)(accelData.acceleration.z * 1000000.0f / 9.80665f);
 
-      if (!miniSeedLogger.recordSample("ACC_X", acc_x_ug, 100, now))
+      if (!miniSeedLogger.recordSample("ACC_X", acc_x_ug, 100, nowEpoch))
         record_ok = false;
-      if (!miniSeedLogger.recordSample("ACC_Y", acc_y_ug, 100, now))
+      if (!miniSeedLogger.recordSample("ACC_Y", acc_y_ug, 100, nowEpoch))
         record_ok = false;
-      if (!miniSeedLogger.recordSample("ACC_Z", acc_z_ug, 100, now))
+      if (!miniSeedLogger.recordSample("ACC_Z", acc_z_ug, 100, nowEpoch))
         record_ok = false;
 
       // GYRO channels: Convert from rad/s to milli-degrees/s (mdps)
@@ -6468,25 +6739,25 @@ void loop()
       int32_t gyro_y_mdps = (int32_t)(gyroData.gyro.y * 57295.8f);
       int32_t gyro_z_mdps = (int32_t)(gyroData.gyro.z * 57295.8f);
 
-      if (!miniSeedLogger.recordSample("GYRO_X", gyro_x_mdps, 100, now))
+      if (!miniSeedLogger.recordSample("GYRO_X", gyro_x_mdps, 100, nowEpoch))
         record_ok = false;
-      if (!miniSeedLogger.recordSample("GYRO_Y", gyro_y_mdps, 100, now))
+      if (!miniSeedLogger.recordSample("GYRO_Y", gyro_y_mdps, 100, nowEpoch))
         record_ok = false;
-      if (!miniSeedLogger.recordSample("GYRO_Z", gyro_z_mdps, 100, now))
+      if (!miniSeedLogger.recordSample("GYRO_Z", gyro_z_mdps, 100, nowEpoch))
         record_ok = false;
-    }
 
-    // Track and log recording errors
-    if (!record_ok)
-    {
-      record_err_count++;
-      // Log warnings every 5 seconds to avoid spam
-      if (millis() - last_record_warning > 5000)
+      // Track and log recording errors
+      if (!record_ok)
       {
-        debugSerialPrintf("WARNING: miniSEED recordSample failed (%lu errors).\n",
-                          (unsigned long)record_err_count);
-        last_record_warning = millis();
-        record_err_count = 0;
+        record_err_count++;
+        // Log warnings every 5 seconds to avoid spam
+        if (millis() - last_record_warning > 5000)
+        {
+          debugSerialPrintf("WARNING: miniSEED recordSample failed (%lu errors).\n",
+                            (unsigned long)record_err_count);
+          last_record_warning = millis();
+          record_err_count = 0;
+        }
       }
     }
   }
@@ -6907,6 +7178,11 @@ void loop()
           debugSerialPrintln("HTTP: /setloglevel");
           serveSetLogLevel(client, req);
         }
+        else if (req.indexOf("GET /settiming") == 0)
+        {
+          debugSerialPrintln("HTTP: /settiming");
+          serveSetTiming(client, req);
+        }
         else if (req.indexOf("GET /touchcalibrate") == 0)
         {
           debugSerialPrintln("HTTP: /touchcalibrate");
@@ -7093,6 +7369,11 @@ void loop()
         {
           debugSerialPrintln("HTTP: /setloglevel");
           serveSetLogLevel(client, req);
+        }
+        else if (req.indexOf("GET /settiming") == 0)
+        {
+          debugSerialPrintln("HTTP: /settiming");
+          serveSetTiming(client, req);
         }
         else if (req.indexOf("GET /touchcalibrate") == 0)
         {

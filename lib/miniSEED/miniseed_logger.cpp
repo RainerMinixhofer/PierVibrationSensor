@@ -283,28 +283,15 @@ bool MinISeedLogger::writeRecordV2(const char *filename, const int32_t *samples,
         return false;
 
     // Fill miniSEED header (48 bytes)
-    // Sequence number (positions 0-5): use per-channel counter for better
-    // compatibility with readers that segment by stream-local sequence continuity.
+    // Use one monotonic sequence across the physical file. Some readers are
+    // tolerant of per-stream counters, but stricter readers can split traces
+    // when interleaved channel records reuse sequence numbers.
+    if (record_sequence == 0 || record_sequence > 999999)
+        record_sequence = 1;
     uint32_t seq = record_sequence;
-    int seq_idx = findChannelBuffer(channel);
-    if (seq_idx >= 0)
-    {
-        if (channel_buffers[seq_idx].record_sequence == 0 || channel_buffers[seq_idx].record_sequence > 999999)
-            channel_buffers[seq_idx].record_sequence = 1;
-        seq = channel_buffers[seq_idx].record_sequence;
-        channel_buffers[seq_idx].record_sequence++;
-        if (channel_buffers[seq_idx].record_sequence > 999999)
-            channel_buffers[seq_idx].record_sequence = 1;
-    }
-    else
-    {
-        if (record_sequence == 0 || record_sequence > 999999)
-            record_sequence = 1;
-        seq = record_sequence;
-        record_sequence++;
-        if (record_sequence > 999999)
-            record_sequence = 1;
-    }
+    record_sequence++;
+    if (record_sequence > 999999)
+        record_sequence = 1;
     snprintf((char *)record, 7, "%06lu", (unsigned long)seq);
 
     // Data quality (position 6): 'D' for good data
@@ -515,6 +502,12 @@ bool MinISeedLogger::writeRecordToFile(const char *filename, const int32_t *samp
 bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
                                   uint16_t sample_rate, time_t timestamp)
 {
+    return recordSample(channel, sample, sample_rate, (double)timestamp);
+}
+
+bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
+                                  uint16_t sample_rate, double timestamp_epoch)
+{
     if (!channel || channel[0] == '\0' || !recording_enabled)
         return false;
 
@@ -527,8 +520,10 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
 
     ChannelBuffer &cb = channel_buffers[idx];
 
+    time_t timestamp_seconds = (time_t)floor(timestamp_epoch);
+
     // Fast day tracking without expensive calendar conversion for every sample.
-    int current_day = (int)(timestamp / 86400);
+    int current_day = (int)(timestamp_seconds / 86400);
 
     // Check if we need to create a new filename (first sample OR day changed)
     if (cb.filename[0] == '\0' || cb.current_day != current_day)
@@ -543,7 +538,7 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
         // NOTE: All channels for a given day write to the same file.
         // This is standard miniSEED format - one daily file contains multiple traces (channels).
         // Each 512-byte record includes channel identification in the SEED header.
-        struct tm *tm_info = gmtime(&timestamp);
+        struct tm *tm_info = gmtime(&timestamp_seconds);
         if (!tm_info)
             return false;
 
@@ -562,7 +557,7 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
     if (cb.sample_count == 0)
     {
         const double sample_period = 1.0 / (double)sample_rate;
-        double incoming_time = (double)timestamp;
+        double incoming_time = timestamp_epoch;
         const uint16_t previous_rate = cb.sample_rate;
 
         cb.sample_rate = sample_rate;
@@ -594,7 +589,7 @@ bool MinISeedLogger::recordSample(const char *channel, int32_t sample,
             if (!flushChannel(idx))
                 return false;
             cb.sample_rate = sample_rate;
-            cb.start_time_epoch = (double)timestamp;
+            cb.start_time_epoch = timestamp_epoch;
             cb.samples_emitted = 0;
             cb.next_record_start_0001 = (int64_t)llround(cb.start_time_epoch * 10000.0);
             cb.next_expected_time = cb.start_time_epoch + sample_period;
@@ -692,6 +687,11 @@ bool MinISeedLogger::flush()
 bool MinISeedLogger::closeFile()
 {
     bool result = flush();
+
+    // Preserve channel buffers when flush fails so callers can retry without
+    // losing unwritten tail samples.
+    if (!result)
+        return false;
 
     // Reset sequence for next recording session.
     record_sequence = 1;
